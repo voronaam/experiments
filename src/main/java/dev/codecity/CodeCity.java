@@ -1,6 +1,6 @@
 package dev.codecity;
 
-import dev.codecity.analysis.JavaAnalyzer;
+import dev.codecity.analysis.SourceAnalyzer;
 import dev.codecity.desktop.DesktopApp;
 import dev.codecity.github.GitHubInfo;
 import dev.codecity.github.GitHubRepo;
@@ -22,7 +22,7 @@ import java.util.Optional;
 public final class CodeCity {
 
     private static final String USAGE = """
-            CodeCity — explore a Java code base as an interactive 3D city
+            CodeCity — explore a Java, TypeScript or Rust code base as an interactive 3D city
 
             Usage: codecity [options] [path | github-url]
 
@@ -41,7 +41,8 @@ public final class CodeCity {
               --export FILE     write a self-contained HTML file and exit
               -h, --help        show this help
 
-            Metaphor: packages are districts, classes are buildings.
+            Metaphor: packages / directories / modules are districts; classes, interfaces, structs,
+            traits and enums are buildings (plus one "module" building per file of free functions).
               height    = number of methods     (switchable: LOC, complexity, attributes)
               footprint = number of attributes
               colour    = git churn / complexity / recency / authors / open PRs / type kind
@@ -84,13 +85,13 @@ public final class CodeCity {
         }
         GitHubInfo github = opts.github() ? loadGitHub(opts.root()) : null;
 
-        JavaAnalyzer analyzer = new JavaAnalyzer();
+        SourceAnalyzer analyzer = new SourceAnalyzer();
         System.out.println("Analysing " + opts.root() + " …");
         Options o = opts;
         CityModel model = CityModel.build(analyzer, o.root(), o.includeTests(), o.git(), github);
         printSummary(model);
         if (model.types().isEmpty()) {
-            System.err.println("No Java types found under " + opts.root());
+            System.err.println("No Java, TypeScript or Rust types found under " + opts.root());
         }
 
         if (opts.export() != null) {
@@ -109,7 +110,7 @@ public final class CodeCity {
         System.out.println("CodeCity is live at " + server.url() + "  (Ctrl+C to stop)");
 
         if (opts.watch()) {
-            SourceWatcher watcher = new SourceWatcher(o.root(), () -> {
+            SourceWatcher watcher = new SourceWatcher(o.root(), analyzer::isSource, () -> {
                 try {
                     CityModel next = CityModel.build(analyzer, o.root(), o.includeTests(), o.git(), github);
                     server.update(next);
@@ -186,7 +187,7 @@ public final class CodeCity {
     }
 
     /** Native window mode: no HTTP server and no browser; blocks until the window is closed. */
-    private static void runDesktop(Options o, JavaAnalyzer analyzer, CityModel model, GitHubInfo github)
+    private static void runDesktop(Options o, SourceAnalyzer analyzer, CityModel model, GitHubInfo github)
             throws IOException {
         if (!DesktopApp.displayAvailable()) {
             System.err.println("error: no graphical display found (DISPLAY / WAYLAND_DISPLAY unset). "
@@ -194,7 +195,7 @@ public final class CodeCity {
             System.exit(1);
         }
         if (o.watch()) {
-            SourceWatcher watcher = new SourceWatcher(o.root(), () -> {
+            SourceWatcher watcher = new SourceWatcher(o.root(), analyzer::isSource, () -> {
                 try {
                     CityModel next = CityModel.build(analyzer, o.root(), o.includeTests(), o.git(), github);
                     DesktopApp.update(next);
@@ -233,9 +234,12 @@ public final class CodeCity {
 
     private static void printSummary(CityModel model) {
         var a = model.analysis();
-        long packages = a.types().stream().map(t -> t.module() + ":" + t.packageName()).distinct().count();
-        System.out.printf("  %d files, %d types, %d packages%s%s — %d ms%n",
-                a.files(), a.types().size(), packages,
+        var stats = model.stats();
+        String languages = stats.languages().entrySet().stream()
+                .map(e -> e.getKey().displayName + " " + e.getValue())
+                .collect(java.util.stream.Collectors.joining(", "));
+        System.out.printf("  %d files, %d types%s, %d packages%s%s — %d ms%n",
+                a.files(), a.types().size(), languages.isEmpty() ? "" : " (" + languages + ")", stats.packages(),
                 a.failedFiles() > 0 ? ", " + a.failedFiles() + " with parse errors" : "",
                 a.history().isEmpty() ? "" : ", git history for " + a.history().size() + " files",
                 model.buildMillis());

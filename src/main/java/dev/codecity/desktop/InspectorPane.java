@@ -63,7 +63,8 @@ final class InspectorPane extends ScrollPane {
         Label name = new Label(t.name());
         name.getStyleClass().add("inspector-title");
         name.setWrapText(true);
-        Label pkg = new Label((t.packageName().isEmpty() ? "(default package)" : t.packageName())
+        String noPackage = t.language() == dev.codecity.analysis.Language.JAVA ? "(default package)" : "(root)";
+        Label pkg = new Label((t.packageName().isEmpty() ? noPackage : t.packageName())
                 + (t.module().isEmpty() ? "" : " · " + t.module()));
         pkg.getStyleClass().add("mono-muted");
         pkg.setWrapText(true);
@@ -77,7 +78,9 @@ final class InspectorPane extends ScrollPane {
         Label kind = new Label(t.kind());
         kind.getStyleClass().add("badge");
         kind.setStyle("-fx-background-color: " + Look.hex(Look.kind(t.kind())) + "; -fx-text-fill: white;");
-        HBox badges = new HBox(6, kind);
+        Label language = new Label(t.language().displayName);
+        language.getStyleClass().add("badge");
+        HBox badges = new HBox(6, kind, language);
         if (t.test()) {
             Label test = new Label("test");
             test.getStyleClass().add("badge");

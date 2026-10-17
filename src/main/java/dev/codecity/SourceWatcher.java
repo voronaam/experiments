@@ -1,6 +1,6 @@
 package dev.codecity;
 
-import dev.codecity.analysis.JavaAnalyzer;
+import dev.codecity.analysis.SourceAnalyzer;
 
 import java.io.IOException;
 import java.nio.file.ClosedWatchServiceException;
@@ -25,13 +25,14 @@ import static java.nio.file.StandardWatchEventKinds.ENTRY_DELETE;
 import static java.nio.file.StandardWatchEventKinds.ENTRY_MODIFY;
 import static java.nio.file.StandardWatchEventKinds.OVERFLOW;
 
-/** Watches the source tree and invokes a callback (debounced) whenever Java files change. */
+/** Watches the source tree and invokes a callback (debounced) whenever source files change. */
 public final class SourceWatcher implements AutoCloseable {
 
     private static final long DEBOUNCE_MS = 400;
 
     private final Path root;
     private final Runnable onChange;
+    private final java.util.function.Predicate<Path> isSource;
     private final WatchService watcher;
     private final Map<WatchKey, Path> keys = new ConcurrentHashMap<>();
     private final ScheduledExecutorService debouncer = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -41,8 +42,9 @@ public final class SourceWatcher implements AutoCloseable {
     });
     private ScheduledFuture<?> pending;
 
-    public SourceWatcher(Path root, Runnable onChange) throws IOException {
+    public SourceWatcher(Path root, java.util.function.Predicate<Path> isSource, Runnable onChange) throws IOException {
         this.root = root;
+        this.isSource = isSource;
         this.onChange = onChange;
         this.watcher = FileSystems.getDefault().newWatchService();
     }
@@ -56,7 +58,7 @@ public final class SourceWatcher implements AutoCloseable {
         Files.walkFileTree(dir, new SimpleFileVisitor<>() {
             @Override
             public FileVisitResult preVisitDirectory(Path d, BasicFileAttributes attrs) throws IOException {
-                if (!d.equals(root) && JavaAnalyzer.isIgnoredDir(d)) {
+                if (!d.equals(root) && SourceAnalyzer.isIgnoredDir(d)) {
                     return FileVisitResult.SKIP_SUBTREE;
                 }
                 keys.put(d.register(watcher, ENTRY_CREATE, ENTRY_DELETE, ENTRY_MODIFY), d);
@@ -89,14 +91,14 @@ public final class SourceWatcher implements AutoCloseable {
                 if (child == null) {
                     continue;
                 }
-                if (event.kind() == ENTRY_CREATE && Files.isDirectory(child) && !JavaAnalyzer.isIgnoredDir(child)) {
+                if (event.kind() == ENTRY_CREATE && Files.isDirectory(child) && !SourceAnalyzer.isIgnoredDir(child)) {
                     try {
                         registerTree(child);
                     } catch (IOException ignored) {
                         // directory vanished again
                     }
                     relevant = true;
-                } else if (child.getFileName().toString().endsWith(".java") || event.kind() == ENTRY_DELETE) {
+                } else if (isSource.test(child) || event.kind() == ENTRY_DELETE) {
                     relevant = true;
                 }
             }

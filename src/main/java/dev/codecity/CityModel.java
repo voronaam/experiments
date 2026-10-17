@@ -3,7 +3,8 @@ package dev.codecity;
 import dev.codecity.analysis.Analysis;
 import dev.codecity.analysis.FileHistory;
 import dev.codecity.analysis.GitHistory;
-import dev.codecity.analysis.JavaAnalyzer;
+import dev.codecity.analysis.Language;
+import dev.codecity.analysis.SourceAnalyzer;
 import dev.codecity.analysis.MethodInfo;
 import dev.codecity.analysis.TypeInfo;
 import dev.codecity.github.GitHubInfo;
@@ -43,7 +44,9 @@ public final class CityModel {
                            int[] deps, int[] incoming, int[] prs, List<MethodInfo> methods) {
     }
 
-    public record Stats(int files, int failedFiles, int types, long packages, int methods, int loc) {
+    /** @param languages type count per language, most common first */
+    public record Stats(int files, int failedFiles, int types, long packages, int methods, int loc,
+                        Map<Language, Integer> languages) {
     }
 
     private final String name;
@@ -63,14 +66,15 @@ public final class CityModel {
         this.buildings = resolve(analysis, layout, github);
         List<TypeInfo> types = analysis.types();
         this.stats = new Stats(analysis.files(), analysis.failedFiles(), types.size(),
-                types.stream().map(t -> t.module() + ":" + t.packageName()).distinct().count(),
+                types.stream().map(t -> t.language() + ":" + t.module() + ":" + t.packageName()).distinct().count(),
                 types.stream().mapToInt(TypeInfo::nom).sum(),
-                types.stream().mapToInt(TypeInfo::loc).sum());
+                types.stream().mapToInt(TypeInfo::loc).sum(),
+                languageCounts(types));
         this.buildMillis = buildMillis;
     }
 
     /** @param github GitHub context for permalinks and pull requests, or null */
-    public static CityModel build(JavaAnalyzer analyzer, Path root, boolean includeTests, boolean useGit,
+    public static CityModel build(SourceAnalyzer analyzer, Path root, boolean includeTests, boolean useGit,
                                   GitHubInfo github) throws IOException {
         long start = System.nanoTime();
         Analysis parsed = analyzer.analyze(root, includeTests);
@@ -125,6 +129,15 @@ public final class CityModel {
 
     public long buildMillis() {
         return buildMillis;
+    }
+
+    private static Map<Language, Integer> languageCounts(List<TypeInfo> types) {
+        Map<Language, Integer> counts = new java.util.EnumMap<>(Language.class);
+        types.forEach(t -> counts.merge(t.language(), 1, Integer::sum));
+        Map<Language, Integer> sorted = new java.util.LinkedHashMap<>();
+        counts.entrySet().stream().sorted(Map.Entry.<Language, Integer>comparingByValue().reversed())
+                .forEach(e -> sorted.put(e.getKey(), e.getValue()));
+        return sorted;
     }
 
     /** The model as served to the web viewer; computed on first use. */
@@ -201,8 +214,10 @@ public final class CityModel {
                 .field("types", stats.types())
                 .field("packages", stats.packages())
                 .field("methods", stats.methods())
-                .field("loc", stats.loc())
-                .endObject();
+                .field("loc", stats.loc());
+        w.name("languages").beginObject();
+        stats.languages().forEach((lang, n) -> w.field(lang.id, n));
+        w.endObject().endObject();
 
         if (github != null) {
             writeGitHub(w, github);
@@ -228,6 +243,7 @@ public final class CityModel {
             FileHistory h = b.history();
             w.beginObject()
                     .field("id", t.fqn())
+                    .field("lang", t.language().id)
                     .field("name", t.name())
                     .field("pkg", t.packageName())
                     .field("module", t.module())

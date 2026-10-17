@@ -27,7 +27,7 @@ class JavaAnalyzerTest {
     }
 
     private Analysis analyze() throws IOException {
-        return new JavaAnalyzer().analyze(root, true);
+        return new SourceAnalyzer().analyze(root, true);
     }
 
     @Test
@@ -105,7 +105,7 @@ class JavaAnalyzerTest {
     @Test
     void reusesParsesForUnchangedFiles() throws IOException {
         write("src/main/java/a/A.java", "package a; class A {}");
-        JavaAnalyzer analyzer = new JavaAnalyzer();
+        SourceAnalyzer analyzer = new SourceAnalyzer();
         TypeInfo first = analyzer.analyze(root, true).types().getFirst();
         TypeInfo second = analyzer.analyze(root, true).types().getFirst();
         assertTrue(first == second, "expected cached instance");

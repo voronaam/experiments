@@ -5,16 +5,21 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * One class, interface, enum, record or annotation found in the code base — a building in the city.
+ * One type found in the code base — a building in the city. Depending on the language this is a class, interface,
+ * enum, record, struct, trait, type alias, or a "module": the free functions of one file.
  *
- * @param fqn        fully qualified name, e.g. {@code com.acme.Order.Line}
+ * @param language    source language
+ * @param packageName the district path in the language's own notation ({@code com.acme}, {@code src/ui},
+ *                    {@code net::http}); split with {@link Language#separator}
+ * @param fqn        unique id, e.g. {@code com.acme.Order.Line}, {@code src/ui/App.tsx:App}, {@code shop::cart::Cart}
  * @param name       name relative to its package, e.g. {@code Order.Line}
- * @param module     build module the file lives in ("" for single-module projects)
+ * @param module     build module / package.json project / crate the file belongs to ("" when there is only one)
  * @param loc        non-blank, non-comment lines inside the declaration
  * @param noa        number of attributes (fields, record components, enum constants)
  * @param references raw type names referenced in the body, resolved later against the project
  */
 public record TypeInfo(
+        Language language,
         String fqn,
         String name,
         String packageName,
@@ -30,6 +35,27 @@ public record TypeInfo(
         Set<String> references,
         List<String> explicitImports,
         List<String> wildcardImports) {
+
+    /** The package split into district segments. */
+    public java.util.List<String> packageSegments() {
+        if (packageName.isEmpty()) {
+            return java.util.List.of();
+        }
+        return java.util.List.of(packageName.split(java.util.regex.Pattern.quote(language.separator)));
+    }
+
+    /**
+     * Copy with methods, references and lines from elsewhere added — used to merge Rust {@code impl} blocks, which may
+     * live in other files, into the type they implement. The declaration's own line range is unchanged.
+     */
+    public TypeInfo withMembers(List<MethodInfo> moreMethods, Set<String> moreReferences, int moreLoc) {
+        List<MethodInfo> m = new java.util.ArrayList<>(methods);
+        m.addAll(moreMethods);
+        Set<String> r = new java.util.HashSet<>(references);
+        r.addAll(moreReferences);
+        return new TypeInfo(language, fqn, name, packageName, module, kind, file, line, endLine,
+                loc + moreLoc, noa, test, List.copyOf(m), Set.copyOf(r), explicitImports, wildcardImports);
+    }
 
     public int nom() {
         return methods.size();

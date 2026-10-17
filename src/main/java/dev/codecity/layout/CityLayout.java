@@ -43,6 +43,8 @@ public final class CityLayout {
         final Map<String, Node> children = new TreeMap<>();
         final List<TypeInfo> types = new ArrayList<>();
         boolean module;
+        /** How this district's name joins with a collapsed child's: ".", "/" or "::". */
+        String separator = ".";
         double w;
         double d;
         List<Item> items = List.of();
@@ -95,13 +97,18 @@ public final class CityLayout {
                 node = node.children.computeIfAbsent("module:" + module, k -> new Node(module, k));
                 node.module = true;
             }
-            String pkg = t.packageName().isEmpty() ? "(default)" : t.packageName();
+            List<String> segments = t.packageSegments();
+            if (segments.isEmpty()) {
+                segments = List.of(t.language() == dev.codecity.analysis.Language.JAVA ? "(default)" : "(root)");
+            }
+            String sep = t.language().separator;
             String path = node.id.isEmpty() ? "" : node.id + "/";
             String fqn = "";
-            for (String segment : pkg.split("\\.")) {
-                fqn = fqn.isEmpty() ? segment : fqn + "." + segment;
+            for (String segment : segments) {
+                fqn = fqn.isEmpty() ? segment : fqn + sep + segment;
                 String id = path + fqn;
                 node = node.children.computeIfAbsent(segment, k -> new Node(k, id));
+                node.separator = sep;
             }
             node.types.add(t);
         }
@@ -119,7 +126,8 @@ public final class CityLayout {
                 if (only.module) {
                     break;
                 }
-                Node joined = new Node(c.label + "." + only.label, only.id);
+                Node joined = new Node(c.label + only.separator + only.label, only.id);
+                joined.separator = only.separator;
                 joined.children.putAll(only.children);
                 joined.types.addAll(only.types);
                 c = joined;

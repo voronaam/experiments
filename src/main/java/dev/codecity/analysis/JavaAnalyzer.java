@@ -29,16 +29,8 @@ import com.github.javaparser.ast.stmt.SwitchEntry;
 import com.github.javaparser.ast.stmt.WhileStmt;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 
-import java.io.IOException;
-import java.nio.charset.MalformedInputException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.FileVisitResult;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.SimpleFileVisitor;
-import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -47,117 +39,47 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
-import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * Parses Java sources with JavaParser and extracts the classic CodeCity metrics per type.
- * Parsed files are cached by modification time so watch-mode re-analysis only re-parses what changed.
- */
-public final class JavaAnalyzer {
-
-    public static final Set<String> IGNORED_DIRS = Set.of(
-            ".git", ".hg", ".svn", ".idea", ".gradle", ".mvn", "target", "build", "out", "node_modules");
-
-    private static final Set<String> TEST_DIRS = Set.of("test", "tests", "it", "androidTest", "testFixtures");
-
-    private record FileResult(List<TypeInfo> types, boolean failed) {
-    }
-
-    private record CacheEntry(long modified, long size, FileResult result) {
-    }
-
-    private final Map<Path, CacheEntry> cache = new ConcurrentHashMap<>();
+/** Java support: parses sources with JavaParser and extracts the classic CodeCity metrics per type. */
+public final class JavaAnalyzer implements LanguageSupport {
 
     private final ThreadLocal<JavaParser> parsers = ThreadLocal.withInitial(() -> new JavaParser(
             new ParserConfiguration()
                     .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_25)
                     .setAttributeComments(false)));
 
-    public Analysis analyze(Path root, boolean includeTests) throws IOException {
-        List<Path> files = findSources(root);
-        cache.keySet().retainAll(new HashSet<>(files));
+    @Override
+    public Language language() {
+        return Language.JAVA;
+    }
 
-        List<FileResult> results = files.parallelStream().map(f -> parseCached(root, f)).toList();
+    @Override
+    public boolean accepts(Path file) {
+        return file.getFileName().toString().endsWith(".java");
+    }
 
-        List<TypeInfo> types = new ArrayList<>();
-        int failed = 0;
-        for (FileResult r : results) {
-            if (r.failed()) {
-                failed++;
-            }
-            for (TypeInfo t : r.types()) {
-                if (includeTests || !t.test()) {
-                    types.add(t);
-                }
-            }
-        }
-        // Same FQN can occur in several modules (or as a test fixture); keep the first so the index stays unique.
+    @Override
+    public Linked link(Path root, List<ParsedFile> files) {
+        // The same FQN can occur in several modules (or as a test fixture); keep the first so the index stays unique.
         Map<String, TypeInfo> byFqn = new TreeMap<>();
-        for (TypeInfo t : types) {
-            byFqn.putIfAbsent(t.fqn(), t);
+        for (ParsedFile f : files) {
+            for (TypeInfo t : f.types()) {
+                byFqn.putIfAbsent(t.fqn(), t);
+            }
         }
         List<TypeInfo> unique = new ArrayList<>(byFqn.values());
-        return new Analysis(root, unique, resolveDependencies(unique, byFqn), Map.of(), files.size(), failed);
+        return new Linked(unique, resolveDependencies(unique, byFqn));
     }
 
-    private static List<Path> findSources(Path root) throws IOException {
-        List<Path> files = new ArrayList<>();
-        Files.walkFileTree(root, new SimpleFileVisitor<>() {
-            @Override
-            public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
-                if (!dir.equals(root) && isIgnoredDir(dir)) {
-                    return FileVisitResult.SKIP_SUBTREE;
-                }
-                return FileVisitResult.CONTINUE;
-            }
-
-            @Override
-            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-                if (attrs.isRegularFile() && file.getFileName().toString().endsWith(".java")) {
-                    files.add(file);
-                }
-                return FileVisitResult.CONTINUE;
-            }
-
-            @Override
-            public FileVisitResult visitFileFailed(Path file, IOException exc) {
-                return FileVisitResult.CONTINUE;
-            }
-        });
-        files.sort(Comparator.naturalOrder());
-        return files;
-    }
-
-    public static boolean isIgnoredDir(Path dir) {
-        String name = dir.getFileName() == null ? "" : dir.getFileName().toString();
-        return IGNORED_DIRS.contains(name) || (name.startsWith(".") && name.length() > 1);
-    }
-
-    private FileResult parseCached(Path root, Path file) {
-        try {
-            long modified = Files.getLastModifiedTime(file).toMillis();
-            long size = Files.size(file);
-            CacheEntry cached = cache.get(file);
-            if (cached != null && cached.modified() == modified && cached.size() == size) {
-                return cached.result();
-            }
-            FileResult result = parse(root, file);
-            cache.put(file, new CacheEntry(modified, size, result));
-            return result;
-        } catch (IOException | RuntimeException e) {
-            return new FileResult(List.of(), true);
-        }
-    }
-
-    private FileResult parse(Path root, Path file) throws IOException {
-        String code = read(file);
+    @Override
+    public ParsedFile parse(Path root, Path file, String code) {
         ParseResult<CompilationUnit> parsed = parsers.get().parse(code);
         Optional<CompilationUnit> unit = parsed.getResult();
         if (unit.isEmpty()) {
-            return new FileResult(List.of(), true);
+            return new ParsedFile(file, List.of(), null, true);
         }
         CompilationUnit cu = unit.get();
-        String[] lines = code.split("\\R", -1);
+        String[] lines = SourceText.lines(code);
         Path relative = root.relativize(file);
         String module = moduleOf(relative);
         boolean test = isTest(relative);
@@ -187,21 +109,14 @@ public final class JavaAnalyzer {
             int begin = td.getBegin().map(p -> p.line).orElse(1);
             int end = td.getEnd().map(p -> p.line).orElse(begin);
             types.add(new TypeInfo(
-                    fqn.get(), name, pkg, module, kindOf(td), file, begin, end,
-                    countLoc(lines, begin, end), countAttributes(td), test,
+                    Language.JAVA, fqn.get(), name, pkg, module, kindOf(td), file, begin, end,
+                    SourceText.countLoc(lines, begin, end), countAttributes(td), test,
                     methodsOf(td, lines), referencesOf(td),
                     List.copyOf(explicitImports), List.copyOf(wildcardImports)));
         }
-        return new FileResult(types, !parsed.isSuccessful());
+        return new ParsedFile(file, types, null, !parsed.isSuccessful());
     }
 
-    private static String read(Path file) throws IOException {
-        try {
-            return Files.readString(file, StandardCharsets.UTF_8);
-        } catch (MalformedInputException e) {
-            return Files.readString(file, StandardCharsets.ISO_8859_1);
-        }
-    }
 
     /** "core/api" for {@code core/api/src/main/java/...}; "" when sources sit directly under the root. */
     static String moduleOf(Path relative) {
@@ -217,14 +132,11 @@ public final class JavaAnalyzer {
     }
 
     static boolean isTest(Path relative) {
-        for (Path p : relative.getParent() == null ? List.<Path>of() : relative.getParent()) {
-            if (TEST_DIRS.contains(p.toString())) {
-                return true;
-            }
-        }
         String name = relative.getFileName().toString();
-        return name.endsWith("Test.java") || name.endsWith("Tests.java") || name.endsWith("IT.java");
+        return SourceText.inTestDirectory(relative)
+                || name.endsWith("Test.java") || name.endsWith("Tests.java") || name.endsWith("IT.java");
     }
+
 
     private static String kindOf(TypeDeclaration<?> td) {
         if (td instanceof ClassOrInterfaceDeclaration c) {
@@ -262,7 +174,7 @@ public final class JavaAnalyzer {
             if (member instanceof CallableDeclaration<?> c) {
                 int begin = c.getBegin().map(p -> p.line).orElse(0);
                 int end = c.getEnd().map(p -> p.line).orElse(begin);
-                methods.add(new MethodInfo(c.getNameAsString(), begin, countLoc(lines, begin, end),
+                methods.add(new MethodInfo(c.getNameAsString(), begin, SourceText.countLoc(lines, begin, end),
                         complexity(c), c.getParameters().size()));
             }
         }
@@ -284,35 +196,6 @@ public final class JavaAnalyzer {
             }
         });
         return cx[0];
-    }
-
-    /** Non-blank lines in [begin, end] that are not purely comments. */
-    static int countLoc(String[] lines, int begin, int end) {
-        int loc = 0;
-        boolean inBlock = false;
-        for (int i = Math.max(begin, 1) - 1; i < Math.min(end, lines.length); i++) {
-            String s = lines[i].strip();
-            if (inBlock) {
-                int close = s.indexOf("*/");
-                if (close < 0) {
-                    continue;
-                }
-                inBlock = false;
-                s = s.substring(close + 2).strip();
-            }
-            if (s.startsWith("/*")) {
-                int close = s.indexOf("*/", 2);
-                if (close < 0) {
-                    inBlock = true;
-                    continue;
-                }
-                s = s.substring(close + 2).strip();
-            }
-            if (!s.isEmpty() && !s.startsWith("//")) {
-                loc++;
-            }
-        }
-        return loc;
     }
 
     private static Set<String> referencesOf(TypeDeclaration<?> td) {

@@ -29,6 +29,11 @@ final class Look {
         KINDS.put("enum", Color.web("#e3a63b"));
         KINDS.put("record", Color.web("#d46fa8"));
         KINDS.put("annotation", Color.web("#8a9aaa"));
+        KINDS.put("struct", Color.web("#4f86c6"));
+        KINDS.put("trait", Color.web("#26a69a"));
+        KINDS.put("union", Color.web("#c98a3a"));
+        KINDS.put("type", Color.web("#b7a3e0"));
+        KINDS.put("module", Color.web("#7c8ba1"));
     }
 
     static final Color OUT = Color.web("#f97316");

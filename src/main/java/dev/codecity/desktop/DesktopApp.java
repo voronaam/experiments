@@ -113,7 +113,7 @@ public final class DesktopApp extends Application {
     private final ComboBox<Look.HeightMetric> heightBox = new ComboBox<>();
     private final ComboBox<Look.ColorMetric> colorBox = new ComboBox<>();
     private final VBox legend = new VBox(3);
-    private final CheckBox testsBox = new CheckBox("Test classes");
+    private final CheckBox testsBox = new CheckBox("Test code");
     private final CheckBox labelsBox = new CheckBox("District labels");
     private final CheckBox beaconsBox = new CheckBox("Open-PR beacons");
     private final Button themeButton = new Button();
@@ -261,9 +261,9 @@ public final class DesktopApp extends Application {
             runSearch(search.getText());
         }
         if (live) {
-            toast("City rebuilt · " + Look.fmt(next.buildings().size()) + " classes");
+            toast("City rebuilt · " + Look.fmt(next.buildings().size()) + " types");
         } else if (next.buildings().isEmpty()) {
-            toast("No Java types found in this source tree");
+            toast("No Java, TypeScript or Rust types found here");
         }
     }
 
@@ -357,7 +357,7 @@ public final class DesktopApp extends Application {
         HBox brand = new HBox(10, logo(), new VBox(0, styled(new Label("CodeCity"), "brand-name"), styled(projectName, "project")));
         brand.setAlignment(Pos.CENTER_LEFT);
 
-        search.setPromptText("Search classes…   ( / )");
+        search.setPromptText("Search types…   ( / )");
         search.getStyleClass().add("search");
         search.setPrefWidth(440);
         search.textProperty().addListener((o, a, b) -> runSearch(b));
@@ -521,7 +521,19 @@ public final class DesktopApp extends Application {
             link.setOnAction(e -> getHostServices().showDocument(gh.repo().webUrl()));
             stats.getChildren().add(link);
         }
-        stats.getChildren().addAll(chip(s.types(), "classes"), chip(s.packages(), "packages"),
+        if (!s.languages().isEmpty()) {
+            int total = s.languages().values().stream().mapToInt(Integer::intValue).sum();
+            String label = s.languages().entrySet().stream()
+                    .map(e -> s.languages().size() > 1
+                            ? e.getKey().displayName + " " + Math.round(100.0 * e.getValue() / total) + "%"
+                            : e.getKey().displayName)
+                    .collect(java.util.stream.Collectors.joining(" · "));
+            Label lang = styled(new Label(label), "chip-label");
+            HBox chip = new HBox(lang);
+            chip.getStyleClass().add("chip");
+            stats.getChildren().add(chip);
+        }
+        stats.getChildren().addAll(chip(s.types(), "types"), chip(s.packages(), "packages"),
                 chip(s.methods(), "methods"), chip(s.loc(), "LOC"));
         if (s.failedFiles() > 0) {
             Node warn = chip(s.failedFiles(), "parse errors");
@@ -545,7 +557,12 @@ public final class DesktopApp extends Application {
         Look.ColorMetric m = scale.metric();
         if (m == Look.ColorMetric.KIND) {
             FlowPane swatches = new FlowPane(10, 4);
+            java.util.Set<String> present = new java.util.HashSet<>();
+            model.buildings().forEach(b -> present.add(b.type().kind()));
             Look.KINDS.forEach((kind, color) -> {
+                if (!present.contains(kind)) {
+                    return;
+                }
                 Rectangle sw = new Rectangle(10, 10, color);
                 sw.setArcWidth(4);
                 sw.setArcHeight(4);

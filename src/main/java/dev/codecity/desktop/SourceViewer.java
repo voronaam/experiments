@@ -24,6 +24,19 @@ import java.util.Set;
 /** A native source window with lightweight Java highlighting; the selected type's lines are marked. */
 final class SourceViewer {
 
+    private static final Set<String> TS_KEYWORDS = Set.of(
+            "abstract", "any", "as", "async", "await", "boolean", "break", "case", "catch", "class", "const",
+            "constructor", "continue", "declare", "default", "delete", "do", "else", "enum", "export", "extends",
+            "false", "finally", "for", "from", "function", "get", "if", "implements", "import", "in", "instanceof",
+            "interface", "keyof", "let", "namespace", "never", "new", "null", "number", "of", "private", "protected",
+            "public", "readonly", "return", "set", "static", "string", "super", "switch", "this", "throw", "true",
+            "try", "type", "typeof", "undefined", "unknown", "var", "void", "while", "yield", "satisfies");
+    private static final Set<String> RUST_KEYWORDS = Set.of(
+            "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false",
+            "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+            "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while",
+            "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64",
+            "bool", "char", "str");
     private static final Set<String> KEYWORDS = Set.of(
             "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class", "const", "continue",
             "default", "do", "double", "else", "enum", "extends", "final", "finally", "float", "for", "goto", "if",
@@ -46,7 +59,11 @@ final class SourceViewer {
         } catch (IOException e) {
             code = "// unable to read " + b.type().file() + ": " + e.getMessage();
         }
-        List<List<Token>> lines = highlight(code);
+        List<List<Token>> lines = highlight(code, switch (b.type().language()) {
+            case JAVA -> KEYWORDS;
+            case TYPESCRIPT -> TS_KEYWORDS;
+            case RUST -> RUST_KEYWORDS;
+        });
         int first = b.type().line();
         int last = b.type().endLine();
         int digits = String.valueOf(lines.size()).length();
@@ -105,6 +122,10 @@ final class SourceViewer {
 
     /** Splits source into styled tokens per line; block comments and text blocks may span lines. */
     static List<List<Token>> highlight(String code) {
+        return highlight(code, KEYWORDS);
+    }
+
+    static List<List<Token>> highlight(String code, Set<String> keywords) {
         List<List<Token>> lines = new ArrayList<>();
         List<Token> line = new ArrayList<>();
         String mode = null; // "comment" or "string" for constructs that continue onto the next line
@@ -155,6 +176,16 @@ final class SourceViewer {
                 mode = "string";
                 line.add(new Token("\"\"\"", "string"));
                 i += 3;
+            } else if (c == '\'' && i + 2 < n && Character.isJavaIdentifierStart(code.charAt(i + 1))
+                    && code.charAt(i + 2) != '\'') {
+                // a Rust lifetime such as 'a or 'static, not a character literal
+                flush(plain, line);
+                int j = i + 1;
+                while (j < n && Character.isJavaIdentifierPart(code.charAt(j))) {
+                    j++;
+                }
+                line.add(new Token(code.substring(i, j), "annotation"));
+                i = j;
             } else if (c == '"' || c == '\'') {
                 flush(plain, line);
                 int j = i + 1;
@@ -178,7 +209,7 @@ final class SourceViewer {
                     j++;
                 }
                 String word = code.substring(i, j);
-                if (KEYWORDS.contains(word)) {
+                if (keywords.contains(word)) {
                     flush(plain, line);
                     line.add(new Token(word, "keyword"));
                 } else if (word.length() > 1 && word.equals(word.toUpperCase()) && Character.isLetter(word.charAt(0))) {

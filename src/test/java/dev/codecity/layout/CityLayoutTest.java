@@ -18,7 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class CityLayoutTest {
 
     private static TypeInfo type(String pkg, String name, int noa) {
-        return new TypeInfo(pkg + "." + name, name, pkg, "", "class", Path.of(name + ".java"), 1, 10, 10, noa, false,
+        return new TypeInfo(dev.codecity.analysis.Language.JAVA, pkg + "." + name, name, pkg, "", "class", Path.of(name + ".java"), 1, 10, 10, noa, false,
                 List.of(new MethodInfo("m", 2, 3, 1, 0)), Set.of(), List.of(), List.of());
     }
 

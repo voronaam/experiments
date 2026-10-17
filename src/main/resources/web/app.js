@@ -17,9 +17,10 @@ const fmt = (n) => (n >= 10000 ? (n / 1000).toFixed(n >= 100000 ? 0 : 1) + 'k' :
 
 const RAMP = ['#2b6cb0', '#2a9fc0', '#34c3a5', '#8fd67a', '#e8e15b', '#f6b343', '#ef7d34', '#dc3f2e', '#a3123a'];
 const KINDS = {
-  class: '#6b8fc7', abstract: '#9a86d8', interface: '#2fb7a5',
-  enum: '#e3a63b', record: '#d46fa8', annotation: '#8a9aaa',
+  class: '#6b8fc7', abstract: '#9a86d8', interface: '#2fb7a5', enum: '#e3a63b', record: '#d46fa8',
+  annotation: '#8a9aaa', struct: '#4f86c6', trait: '#26a69a', union: '#c98a3a', type: '#b7a3e0', module: '#7c8ba1',
 };
+const LANGUAGES = { java: 'Java', typescript: 'TypeScript', rust: 'Rust' };
 const DAY = 86400;
 const nowSec = () => Date.now() / 1000;
 
@@ -477,7 +478,7 @@ function renderStats() {
   $('#project-name').textContent = name;
   document.title = `${name} · CodeCity`;
   const chips = [
-    [fmt(stats.types), 'classes'],
+    [fmt(stats.types), 'types'],
     [fmt(stats.packages), 'packages'],
     [fmt(stats.methods), 'methods'],
     [fmt(stats.loc), 'LOC'],
@@ -486,6 +487,12 @@ function renderStats() {
   if (gh) {
     const prs = gh.pulls ? ` · ${gh.pulls.length}${gh.pullsSource?.startsWith('all') ? '' : '+'} PRs` : '';
     chips.unshift(`<a class="chip gh" href="${esc(gh.url)}" target="_blank" rel="noopener" title="Open on GitHub${gh.pullsSource ? ' · ' + esc(gh.pullsSource) : ''}">${GH_MARK}<b>${esc(gh.owner)}/${esc(gh.repo)}</b><span>${prs}</span></a>`);
+  }
+  const langs = Object.entries(stats.languages || {});
+  if (langs.length) {
+    const total = langs.reduce((n, [, c]) => n + c, 0);
+    const label = langs.map(([l, c]) => langs.length > 1 ? `${LANGUAGES[l] || l} ${Math.round((c / total) * 100)}%` : (LANGUAGES[l] || l)).join(' · ');
+    chips.unshift(`<span class="chip"><span>${esc(label)}</span></span>`);
   }
   if (stats.failedFiles) chips.push(`<span class="chip warn" title="Files with syntax errors were partially analysed"><b>${stats.failedFiles}</b><span>parse errors</span></span>`);
   $('#stats').innerHTML = chips.join('');
@@ -515,7 +522,8 @@ function populateSelects() {
 function renderLegend({ categorical, lo, hi, metric }) {
   const el = $('#legend');
   if (categorical) {
-    el.innerHTML = `<div class="swatches">${Object.entries(KINDS).map(([k, c]) => `<span class="sw"><i style="background:${c}"></i>${k}</span>`).join('')}</div>`;
+    const present = new Set(state.city.buildings.map((b) => b.kind));
+    el.innerHTML = `<div class="swatches">${Object.entries(KINDS).filter(([k]) => present.has(k)).map(([k, c]) => `<span class="sw"><i style="background:${c}"></i>${k}</span>`).join('')}</div>`;
     return;
   }
   const show = (v) => (metric.unit === 'd' ? `${Math.round(v)}d ago` : Number.isInteger(v) ? fmt(v) : v.toFixed(1));
@@ -583,11 +591,12 @@ function renderInspector() {
   const inc = state.incoming[i].filter((j) => visible(state.city.buildings[j]));
   el.innerHTML = `
     <div class="head">
-      <div><h2>${esc(b.name)}</h2><div class="pkg">${esc(b.pkg || '(default package)')}${b.module ? ' · ' + esc(b.module) : ''}</div></div>
+      <div><h2>${esc(b.name)}</h2><div class="pkg">${esc(b.pkg || (b.lang === 'java' ? '(default package)' : '(root)'))}${b.module ? ' · ' + esc(b.module) : ''}</div></div>
       <button class="close" id="inspector-close" aria-label="Close">✕</button>
     </div>
     <div class="badges">
       <span class="badge kind" style="background:${KINDS[b.kind] || KINDS.class}">${b.kind}</span>
+      <span class="badge">${LANGUAGES[b.lang] || b.lang}</span>
       ${b.test ? '<span class="badge">test</span>' : ''}
     </div>
     <div class="metrics">
@@ -641,7 +650,7 @@ async function openSource(i) {
     const lines = src.code.split('\n').length;
     $('#code-gutter').textContent = Array.from({ length: lines }, (_, k) => k + 1).join('\n');
     const code = $('#code');
-    if (window.hljs) code.innerHTML = window.hljs.highlight(src.code, { language: 'java', ignoreIllegals: true }).value;
+    if (window.hljs) code.innerHTML = window.hljs.highlight(src.code, { language: b.lang || 'java', ignoreIllegals: true }).value;
     else code.textContent = src.code;
     const LINE = 20, PAD = 10;
     const band = $('#code-band');
@@ -930,7 +939,7 @@ function renderResults() {
   resultsEl.innerHTML = results.length
     ? results.map((i, k) => `<li data-idx="${i}" class="${k === activeResult ? 'active' : ''}"><span class="r-name">${esc(buildings[i].name)}</span><span class="r-pkg">${esc(buildings[i].pkg)}</span></li>`).join('')
       + (state.matches.size > results.length ? `<li class="r-empty">${state.matches.size - results.length} more highlighted in the city</li>` : '')
-    : '<li class="r-empty">No matching classes</li>';
+    : '<li class="r-empty">No matching types</li>';
   resultsEl.hidden = false;
   resultsEl.querySelectorAll('li[data-idx]').forEach((li) => li.addEventListener('mousedown', (e) => {
     e.preventDefault();
@@ -1039,7 +1048,7 @@ function listenForUpdates() {
       buildCity(city, { previousHeights: heights.cur.slice() });
       populateSelects();
       updateColors();
-      toast(`City rebuilt · ${fmt(city.stats.types)} classes`);
+      toast(`City rebuilt · ${fmt(city.stats.types)} types`);
     } catch (e) {
       toast(`Update failed: ${e.message}`);
     }
@@ -1076,7 +1085,7 @@ async function main() {
     $('#loading').classList.add('done');
     listenForUpdates();
     loop();
-    if (!city.buildings.length) toast('No Java types found in this source tree');
+    if (!city.buildings.length) toast('No Java, TypeScript or Rust types found here');
   } catch (e) {
     const el = $('#loading');
     el.classList.add('error');
