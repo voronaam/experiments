@@ -1,0 +1,74 @@
+{
+  "name": "codecity",
+  "description": "Interactive 3D software city for Java, TypeScript and Rust code bases (D edition)",
+  "license": "MIT",
+  "targetType": "executable",
+  "targetPath": "bin",
+  "targetName": "codecity",
+  "stringImportPaths": [
+    "../src/main/resources/web"
+  ],
+  "preBuildCommands": [
+    "$PACKAGE_DIR/scripts/build-native.sh"
+  ],
+  "dflags-ldc": [
+    "-mcpu=x86-64-v2"
+  ],
+  "buildTypes": {
+    "release": {
+      "buildOptions": [
+        "releaseMode",
+        "optimize",
+        "inline"
+      ]
+    }
+  },
+  "configurations": [
+    {
+      "name": "gui",
+      "versions": [
+        "CodeCityGui"
+      ],
+      "sourceFiles": [
+        "third_party/build/libcodecity_parsers.a",
+        "third_party/build/libcodecity_gui.a"
+      ],
+      "libs-posix": [
+        "dl",
+        "pthread",
+        "m"
+      ],
+      "stringImportPaths": [
+        "third_party/fonts"
+      ]
+    },
+    {
+      "name": "cli",
+      "excludedSourceFiles": [
+        "source/codecity/gui/*"
+      ],
+      "preBuildCommands": [
+        "CODECITY_NO_GUI=1 $PACKAGE_DIR/scripts/build-native.sh"
+      ],
+      "sourceFiles": [
+        "third_party/build/libcodecity_parsers.a"
+      ]
+    },
+    {
+      "name": "unittest",
+      "excludedSourceFiles": [
+        "source/codecity/gui/app.d",
+        "source/codecity/gui/renderer.d",
+        "source/codecity/gui/gl.d",
+        "source/codecity/gui/imgui.d",
+        "source/codecity/gui/glfw.d"
+      ],
+      "preBuildCommands": [
+        "CODECITY_NO_GUI=1 $PACKAGE_DIR/scripts/build-native.sh"
+      ],
+      "sourceFiles": [
+        "third_party/build/libcodecity_parsers.a"
+      ]
+    }
+  ]
+}

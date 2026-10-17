@@ -36,7 +36,8 @@ public final class GitHistory {
             Path topPath = Path.of(topLevel).toRealPath();
 
             Process log = new ProcessBuilder("git", "-C", root.toString(), "-c", "core.quotepath=off",
-                    "log", "--no-merges", "--no-renames", "--format=%x1e%at%x1f%aE", "--name-only", "--", "*.java")
+                    "log", "--no-merges", "--no-renames", "--format=%x1e%at%x1f%aE", "--name-only", "--",
+                    "*.java", "*.ts", "*.tsx", "*.mts", "*.cts", "*.rs")
                     .redirectError(ProcessBuilder.Redirect.DISCARD).start();
             Map<String, Acc> files = new HashMap<>();
             try (BufferedReader in = new BufferedReader(

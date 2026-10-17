@@ -1,0 +1,5 @@
+bin/
+third_party/
+.dub/
+*.o
+codecity-test-*

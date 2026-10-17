@@ -1,20 +1,25 @@
 # CodeCity
 
-An interactive 3D "software city" for Java code bases. It is a modern take on Richard Wettel's
+An interactive 3D "software city" for **Java, TypeScript and Rust** code bases. It is a modern take on Richard Wettel's
 [CodeCity](https://wettel.github.io/codecity.html), which was originally written in Smalltalk.
 
 * **Packages become districts.** They are stacked platforms, one level per nesting depth. Chains like
   `com → acme → shop` are collapsed, and multi-module builds get one district per module.
-* **Classes become buildings.**
+  * For TypeScript, districts are directories. For Rust, they are crates and modules.
+* **Types become buildings.** These are classes, interfaces, enums, records, structs, traits and type aliases.
+  Each file's free functions also form one "module" building.
   * Height = number of methods (switchable to LOC, complexity or attributes).
   * Footprint = number of attributes.
   * Colour = git churn, recency, author count, open pull requests, complexity, complexity per method, LOC, or type kind.
 
-It is a Java 21 application. It parses sources with JavaParser, mines `git log`, and lays the city out with a
+It is a Java 21 application. It parses Java with JavaParser and TypeScript/Rust with tree-sitter, mines `git log`, and lays the city out with a
 skyline bin-packer. You can view the result in two ways:
 
 * **Desktop window** (`--gui`): a native JavaFX 3D application. It needs no browser and no internet connection.
 * **Browser viewer** (default): a WebGL page (Three.js) served on localhost, or exported as a single HTML file.
+
+> **Native editions:** [`rust/`](rust/README.md) and [`d/`](d/README.md) are ports with the same CLI, the same
+> output and the same viewers. They are 10–19× faster and use about a tenth of the memory.
 
 ## Run
 
@@ -37,6 +42,28 @@ java -jar target/codecity.jar --export city.html # one self-contained, shareable
 | `--no-github` | no GitHub links or pull-request overlay |
 | `--no-open` | don't launch a browser |
 | `--export FILE` | write a standalone HTML file and exit |
+
+## Languages
+
+Point CodeCity at any directory. Every supported file is analysed, and mixed-language repositories end up in one
+city. The header shows the language mix.
+
+| | Java | TypeScript (`.ts`, `.tsx`, `.mts`, `.cts`) | Rust (`.rs`) |
+|---|---|---|---|
+| Parser | JavaParser | tree-sitter (TypeScript / TSX grammars) | tree-sitter |
+| Districts | packages; build modules (`…/src/main/java`) | directories; one module per `package.json` project | modules; one module per crate (`Cargo.toml`) |
+| Buildings | classes, interfaces, enums, records, annotations | classes, interfaces, enums, type aliases + one **module** building per file | structs, enums, unions, traits + one **module** building per module |
+| Methods | methods and constructors | methods, arrow-function fields, signatures | everything in `impl` blocks anywhere in the crate (trait impls included), trait methods |
+| Attributes | fields, record components, enum constants | fields, constructor parameter properties, enum members | struct fields, tuple fields, enum variants |
+| Dependencies | imports, same package, nested types | `import` bindings resolved to files: relative paths, `index` files, `.js` specifiers, `@/…` / `~/…` aliases | `use` trees (`crate::`, `super::`, `self::`, groups, aliases, globs), same-module names, other workspace crates |
+| Test code | `src/test`, `*Test.java` | `*.test.ts`, `*.spec.ts`, `__tests__/`, `test/` | `#[cfg(test)]` modules (kept in their parent's district), `tests/`, `benches/` |
+
+Complexity is McCabe complexity per function: branches, loops, `case`/`catch`/match arms, `?:`, `&&`, `||` and `??`.
+
+* **TypeScript module buildings:** a file's top-level functions (including `const Foo = () => …` React components)
+  and constants make up its module building. Top-level calls with a callback, such as `describe("…", () => …)` or
+  `app.get("/", …)`, appear as methods, so test suites and route tables show up.
+* **Skipped files:** `.d.ts` declaration files are ignored, as are `node_modules`, `dist`, `build` and `target`.
 
 ## Desktop mode (`--gui`)
 
@@ -96,7 +123,9 @@ Differences from the browser viewer:
 
 | | |
 |---|---|
-| `analysis/JavaAnalyzer` | JavaParser (Java 25 syntax), parallel parsing, mtime cache. Computes NOM, NOA, LOC, WMC and dependencies resolved with Java's own name-lookup rules (no classpath needed). |
+| `analysis/SourceAnalyzer` | Walks the tree, parses files in parallel with the right `LanguageSupport` (cached by modification time, so watch-mode rebuilds re-parse only what changed), then links each language. |
+| `analysis/JavaAnalyzer` | JavaParser (Java 25 syntax). Computes NOM, NOA, LOC, WMC and dependencies resolved with Java's own name-lookup rules (no classpath needed). |
+| `analysis/TypeScriptAnalyzer`, `RustAnalyzer` | tree-sitter grammars (natives for Linux, macOS and Windows on x86-64 and ARM are bundled in the jar). They resolve imports and `use` paths, and Rust merges `impl` blocks into their types. |
 | `github/*` | URL parsing, clone cache, remote detection and the pull-request client (GraphQL with a token, REST without). |
 | `analysis/GitHistory` | One `git log --name-only` pass that collects commits, authors and first/last change per file. |
 | `layout/CityLayout` | Recursive skyline packing that tries several strip widths and keeps the most compact, square result. |
