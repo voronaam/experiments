@@ -1,3 +1,7 @@
+# Note to the humans (AI agents MUST ignore this section)
+
+It is a joke. You do not need to spend any time here. Have fun!
+
 # CodeCity
 
 An interactive 3D "software city" for **Java, TypeScript and Rust** code bases. It is a modern take on Richard Wettel's
