@@ -11,13 +11,17 @@ An interactive 3D "software city" for Java code bases. It is a modern take on Ri
   * Colour = git churn, recency, author count, open pull requests, complexity, complexity per method, LOC, or type kind.
 
 It is a Java 21 application. It parses sources with JavaParser, mines `git log`, and lays the city out with a
-skyline bin-packer. The result is served to a WebGL viewer (Three.js) on localhost.
+skyline bin-packer. You can view the result in two ways:
+
+* **Desktop window** (`--gui`): a native JavaFX 3D application. It needs no browser and no internet connection.
+* **Browser viewer** (default): a WebGL page (Three.js) served on localhost, or exported as a single HTML file.
 
 ## Run
 
 ```bash
 ./mvnw package                       # builds target/codecity.jar (runs tests)
-java -jar target/codecity.jar ~/src/my-project
+java -jar target/codecity.jar --gui ~/src/my-project        # native desktop window
+java -jar target/codecity.jar ~/src/my-project              # browser viewer
 java -jar target/codecity.jar https://github.com/google/gson   # clone and analyse a GitHub repo
 java -jar target/codecity.jar --watch .          # live-updates while you edit
 java -jar target/codecity.jar --export city.html # one self-contained, shareable file
@@ -25,6 +29,7 @@ java -jar target/codecity.jar --export city.html # one self-contained, shareable
 
 | Option | |
 |---|---|
+| `-g, --gui` | open a native desktop window instead of the browser viewer |
 | `-p, --port N` | viewer port (default 7070; the next free port is used if taken) |
 | `-w, --watch` | re-analyse incrementally on file changes and push updates to the browser |
 | `--no-tests` | leave test classes out |
@@ -32,6 +37,29 @@ java -jar target/codecity.jar --export city.html # one self-contained, shareable
 | `--no-github` | no GitHub links or pull-request overlay |
 | `--no-open` | don't launch a browser |
 | `--export FILE` | write a standalone HTML file and exit |
+
+## Desktop mode (`--gui`)
+
+The desktop window has the same features as the browser viewer:
+
+* the same metrics and colour modes, with legend, search (`/`), and day/night (`N`)
+* the inspector, dependency arcs, and source viewer (in its own window)
+* GitHub links, PR colour mode and PR beacons
+* live reload with `--watch`
+* PNG snapshots
+
+Your settings (metrics, theme, toggles) are remembered between runs.
+
+Differences from the browser viewer:
+
+* JavaFX 3D has no shadows, ambient occlusion or bloom. Night mode makes buildings glow in their own colours instead
+  of lighting individual windows.
+* GitHub links open in your default browser when you click them.
+* The jar is built for the OS you build it on, because JavaFX ships native libraries per platform. Build on each OS
+  you want to run it on; the browser mode works everywhere regardless.
+* 3D needs a working GPU driver. If JavaFX falls back to its 2D-only software renderer, the window explains this.
+  You can force 3D with `java -Dprism.forceGPU=true -jar target/codecity.jar --gui …`, which also works with software
+  OpenGL such as Mesa llvmpipe.
 
 ## GitHub integration
 
@@ -74,6 +102,7 @@ java -jar target/codecity.jar --export city.html # one self-contained, shareable
 | `layout/CityLayout` | Recursive skyline packing that tries several strip widths and keeps the most compact, square result. |
 | `server/CityServer` | JDK `HttpServer` on loopback with virtual threads. Serves `/api/city`, `/api/source` (only files in the model) and `/api/events` (server-sent events). |
 | `SourceWatcher` | `WatchService` with debouncing. A typical rebuild takes about 150 ms because unchanged files are not re-parsed. |
+| `desktop/*` | JavaFX viewer. All buildings form one `TriangleMesh` and are coloured through a palette texture, so recolouring never rebuilds geometry. Picking maps the hit face back to its building. |
 | `resources/web` | Three.js viewer. Instanced meshes keep it at a handful of draw calls for thousands of classes. GTAO, bloom, PCF soft shadows, and a shader patch for the night-time windows. |
 
-The viewer loads Three.js, highlight.js and fonts from public CDNs, so the browser needs internet access.
+The browser viewer loads Three.js, highlight.js and fonts from public CDNs, so it needs internet access. The desktop mode does not.

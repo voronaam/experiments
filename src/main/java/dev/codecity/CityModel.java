@@ -21,18 +21,51 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/** An analysed and laid-out city, ready to be served as JSON. Immutable; watch mode swaps in a new instance. */
+/**
+ * An analysed and laid-out city, consumed by both the web viewer (as JSON) and the desktop viewer (as objects).
+ * Immutable; watch mode swaps in a new instance.
+ */
 public final class CityModel {
 
     private static final int MAX_METHODS = 300;
 
-    private final Analysis analysis;
-    private final String json;
-    private final long buildMillis;
+    /**
+     * One building, fully resolved: the type, where it stands, its history and its edges.
+     *
+     * @param file     path relative to the analysed root, with forward slashes
+     * @param history  git history of its file, or null
+     * @param deps     indices of buildings this type uses
+     * @param incoming indices of buildings that use this type
+     * @param prs      indices into {@link GitHubInfo#pulls()} of open PRs touching its file
+     * @param methods  methods sorted by complexity, then size (capped)
+     */
+    public record Building(int index, TypeInfo type, CityLayout.Lot lot, String file, FileHistory history,
+                           int[] deps, int[] incoming, int[] prs, List<MethodInfo> methods) {
+    }
 
-    private CityModel(Analysis analysis, String json, long buildMillis) {
+    public record Stats(int files, int failedFiles, int types, long packages, int methods, int loc) {
+    }
+
+    private final String name;
+    private final Analysis analysis;
+    private final CityLayout.Result layout;
+    private final GitHubInfo github;
+    private final List<Building> buildings;
+    private final Stats stats;
+    private final long buildMillis;
+    private volatile String json;
+
+    private CityModel(String name, Analysis analysis, CityLayout.Result layout, GitHubInfo github, long buildMillis) {
+        this.name = name;
         this.analysis = analysis;
-        this.json = json;
+        this.layout = layout;
+        this.github = github;
+        this.buildings = resolve(analysis, layout, github);
+        List<TypeInfo> types = analysis.types();
+        this.stats = new Stats(analysis.files(), analysis.failedFiles(), types.size(),
+                types.stream().map(t -> t.module() + ":" + t.packageName()).distinct().count(),
+                types.stream().mapToInt(TypeInfo::nom).sum(),
+                types.stream().mapToInt(TypeInfo::loc).sum());
         this.buildMillis = buildMillis;
     }
 
@@ -46,61 +79,133 @@ public final class CityModel {
                 parsed.files(), parsed.failedFiles());
         String name = root.getFileName() == null ? root.toString() : root.getFileName().toString();
         CityLayout.Result layout = CityLayout.layout(name, analysis.types());
-        String json = toJson(name, analysis, layout, github);
-        return new CityModel(analysis, json, (System.nanoTime() - start) / 1_000_000);
+        return new CityModel(name, analysis, layout, github, (System.nanoTime() - start) / 1_000_000);
+    }
+
+    public String name() {
+        return name;
     }
 
     public Analysis analysis() {
         return analysis;
     }
 
-    public String json() {
-        return json;
+    public List<TypeInfo> types() {
+        return analysis.types();
+    }
+
+    public List<Building> buildings() {
+        return buildings;
+    }
+
+    public List<CityLayout.District> districts() {
+        return layout.districts();
+    }
+
+    public double width() {
+        return layout.width();
+    }
+
+    public double depth() {
+        return layout.depth();
+    }
+
+    public boolean hasGit() {
+        return !analysis.history().isEmpty();
+    }
+
+    /** GitHub context, or null when the code is not hosted on GitHub. */
+    public GitHubInfo github() {
+        return github;
+    }
+
+    public Stats stats() {
+        return stats;
     }
 
     public long buildMillis() {
         return buildMillis;
     }
 
-    public List<TypeInfo> types() {
-        return analysis.types();
+    /** The model as served to the web viewer; computed on first use. */
+    public String json() {
+        String j = json;
+        if (j == null) {
+            j = toJson();
+            json = j;
+        }
+        return j;
     }
 
-    private static String toJson(String name, Analysis analysis, CityLayout.Result layout, GitHubInfo github) {
+    private static List<Building> resolve(Analysis analysis, CityLayout.Result layout, GitHubInfo github) {
         List<TypeInfo> types = analysis.types();
         Map<String, Integer> index = new HashMap<>();
         for (int i = 0; i < types.size(); i++) {
             index.put(types.get(i).fqn(), i);
         }
-        long packages = types.stream().map(t -> t.module() + ":" + t.packageName()).distinct().count();
-
-        JsonWriter w = new JsonWriter().beginObject()
-                .field("name", name)
-                .field("root", analysis.root().toString())
-                .field("generatedAt", Instant.now().toString())
-                .field("hasGit", !analysis.history().isEmpty())
-                .field("platform", CityLayout.PLATFORM)
-                .field("width", layout.width())
-                .field("depth", layout.depth());
-
-        w.name("stats").beginObject()
-                .field("files", analysis.files())
-                .field("failedFiles", analysis.failedFiles())
-                .field("types", types.size())
-                .field("packages", packages)
-                .field("methods", types.stream().mapToInt(TypeInfo::nom).sum())
-                .field("loc", types.stream().mapToInt(TypeInfo::loc).sum())
-                .endObject();
-
         Map<String, List<Integer>> pullsByPath = new HashMap<>();
-        if (github != null) {
-            writeGitHub(w, github);
-            List<PullRequest> pulls = github.pulls() == null ? List.of() : github.pulls();
+        if (github != null && github.pulls() != null) {
+            List<PullRequest> pulls = github.pulls();
             for (int i = 0; i < pulls.size(); i++) {
                 for (String file : pulls.get(i).files()) {
                     pullsByPath.computeIfAbsent(file, k -> new ArrayList<>()).add(i);
                 }
             }
+        }
+        List<int[]> deps = new ArrayList<>();
+        List<List<Integer>> incoming = new ArrayList<>();
+        for (int i = 0; i < types.size(); i++) {
+            incoming.add(new ArrayList<>());
+        }
+        for (int i = 0; i < types.size(); i++) {
+            int[] out = analysis.dependencies().getOrDefault(types.get(i).fqn(), Set.of()).stream()
+                    .map(index::get).filter(j -> j != null).mapToInt(Integer::intValue).toArray();
+            deps.add(out);
+            for (int j : out) {
+                incoming.get(j).add(i);
+            }
+        }
+        List<Building> result = new ArrayList<>(types.size());
+        for (int i = 0; i < types.size(); i++) {
+            TypeInfo t = types.get(i);
+            String file = analysis.root().relativize(t.file()).toString().replace('\\', '/');
+            String repoPath = github == null ? file : github.prefix() + file;
+            List<MethodInfo> methods = t.methods().stream()
+                    .sorted(Comparator.comparingInt(MethodInfo::complexity).reversed()
+                            .thenComparing(Comparator.comparingInt(MethodInfo::loc).reversed()))
+                    .limit(MAX_METHODS)
+                    .toList();
+            result.add(new Building(i, t, layout.lots().get(t.fqn()), file,
+                    analysis.history().get(t.file().toAbsolutePath().normalize()),
+                    deps.get(i),
+                    incoming.get(i).stream().mapToInt(Integer::intValue).toArray(),
+                    pullsByPath.getOrDefault(repoPath, List.of()).stream().mapToInt(Integer::intValue).toArray(),
+                    methods));
+        }
+        return List.copyOf(result);
+    }
+
+    private String toJson() {
+        JsonWriter w = new JsonWriter().beginObject()
+                .field("name", name)
+                .field("root", analysis.root().toString())
+                .field("generatedAt", Instant.now().toString())
+                .field("hasGit", hasGit())
+                .field("platform", CityLayout.PLATFORM)
+                .field("width", layout.width())
+                .field("depth", layout.depth());
+
+        w.name("stats").beginObject()
+                .field("files", stats.files())
+                .field("failedFiles", stats.failedFiles())
+                .field("types", stats.types())
+                .field("packages", stats.packages())
+                .field("methods", stats.methods())
+                .field("loc", stats.loc())
+                .endObject();
+
+        if (github != null) {
+            writeGitHub(w, github);
         }
 
         w.name("districts").beginArray();
@@ -117,9 +222,10 @@ public final class CityModel {
         w.endArray();
 
         w.name("buildings").beginArray();
-        for (TypeInfo t : types) {
-            CityLayout.Lot lot = layout.lots().get(t.fqn());
-            FileHistory h = analysis.history().get(t.file().toAbsolutePath().normalize());
+        for (Building b : buildings) {
+            TypeInfo t = b.type();
+            CityLayout.Lot lot = b.lot();
+            FileHistory h = b.history();
             w.beginObject()
                     .field("id", t.fqn())
                     .field("name", t.name())
@@ -127,7 +233,7 @@ public final class CityModel {
                     .field("module", t.module())
                     .field("kind", t.kind())
                     .field("test", t.test())
-                    .field("file", analysis.root().relativize(t.file()).toString().replace('\\', '/'))
+                    .field("file", b.file())
                     .field("line", t.line())
                     .field("endLine", t.endLine())
                     .field("x", lot.x()).field("z", lot.z()).field("y", lot.y())
@@ -143,30 +249,23 @@ public final class CityModel {
                         .field("last", h.lastCommit())
                         .field("first", h.firstCommit());
             }
-            if (github != null) {
-                String repoPath = github.prefix() + analysis.root().relativize(t.file()).toString().replace('\\', '/');
-                List<Integer> prs = pullsByPath.get(repoPath);
-                if (prs != null) {
-                    w.name("prs").beginArray();
-                    prs.forEach(w::value);
-                    w.endArray();
+            if (b.prs().length > 0) {
+                w.name("prs").beginArray();
+                for (int p : b.prs()) {
+                    w.value(p);
                 }
+                w.endArray();
             }
             w.name("methods").beginArray();
-            t.methods().stream()
-                    .sorted(Comparator.comparingInt(MethodInfo::complexity).reversed()
-                            .thenComparing(Comparator.comparingInt(MethodInfo::loc).reversed()))
-                    .limit(MAX_METHODS)
-                    .forEach(m -> w.beginArray()
-                            .value(m.name()).value(m.line()).value(m.loc()).value(m.complexity()).value(m.parameters())
-                            .endArray());
+            for (MethodInfo m : b.methods()) {
+                w.beginArray()
+                        .value(m.name()).value(m.line()).value(m.loc()).value(m.complexity()).value(m.parameters())
+                        .endArray();
+            }
             w.endArray();
             w.name("deps").beginArray();
-            for (String dep : analysis.dependencies().getOrDefault(t.fqn(), Set.of())) {
-                Integer target = index.get(dep);
-                if (target != null) {
-                    w.value(target);
-                }
+            for (int d : b.deps()) {
+                w.value(d);
             }
             w.endArray();
             w.endObject();

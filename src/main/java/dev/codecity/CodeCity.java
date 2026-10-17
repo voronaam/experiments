@@ -1,6 +1,7 @@
 package dev.codecity;
 
 import dev.codecity.analysis.JavaAnalyzer;
+import dev.codecity.desktop.DesktopApp;
 import dev.codecity.github.GitHubInfo;
 import dev.codecity.github.GitHubRepo;
 import dev.codecity.github.PullRequests;
@@ -30,6 +31,7 @@ public final class CodeCity {
                                   https://github.com/google/gson
                                   https://github.com/owner/repo/tree/branch
                                   github:owner/repo[@branch]
+              -g, --gui         open a native desktop window instead of the browser viewer
               -p, --port N      port for the local viewer (default: 7070)
               -w, --watch       re-analyse and live-update the viewer when files change
               --no-tests        leave test classes out of the city
@@ -50,9 +52,9 @@ public final class CodeCity {
             """;
 
     record Options(Path root, GitHubRepo remote, int port, boolean watch, boolean includeTests, boolean git,
-                   boolean github, boolean open, Path export) {
+                   boolean github, boolean open, Path export, boolean gui) {
         Options withRoot(Path dir) {
-            return new Options(dir, null, port, watch, includeTests, git, github, open, export);
+            return new Options(dir, null, port, watch, includeTests, git, github, open, export, gui);
         }
     }
 
@@ -97,6 +99,11 @@ public final class CodeCity {
             return;
         }
 
+        if (opts.gui()) {
+            runDesktop(o, analyzer, model, github);
+            return;
+        }
+
         CityServer server = new CityServer(model, opts.port());
         server.start();
         System.out.println("CodeCity is live at " + server.url() + "  (Ctrl+C to stop)");
@@ -125,6 +132,7 @@ public final class CodeCity {
         Path root = null;
         GitHubRepo remote = null;
         boolean github = true;
+        boolean gui = false;
         int port = 7070;
         boolean watch = false;
         boolean tests = true;
@@ -140,6 +148,7 @@ public final class CodeCity {
                 }
                 case "-p", "--port" -> port = Integer.parseInt(require(rest, a));
                 case "-w", "--watch" -> watch = true;
+                case "-g", "--gui" -> gui = true;
                 case "--no-tests" -> tests = false;
                 case "--no-git" -> git = false;
                 case "--no-github" -> github = false;
@@ -162,7 +171,7 @@ public final class CodeCity {
             }
         }
         if (remote != null) {
-            return new Options(null, remote, port, watch, tests, git, github, open, export);
+            return new Options(null, remote, port, watch, tests, git, github, open, export, gui);
         }
         Path dir = root == null ? Path.of(".") : root;
         if (!Files.isDirectory(dir)) {
@@ -173,7 +182,33 @@ public final class CodeCity {
         } catch (IOException e) {
             throw new IllegalArgumentException("cannot resolve " + dir + ": " + e.getMessage());
         }
-        return new Options(dir, null, port, watch, tests, git, github, open, export);
+        return new Options(dir, null, port, watch, tests, git, github, open, export, gui);
+    }
+
+    /** Native window mode: no HTTP server and no browser; blocks until the window is closed. */
+    private static void runDesktop(Options o, JavaAnalyzer analyzer, CityModel model, GitHubInfo github)
+            throws IOException {
+        if (!DesktopApp.displayAvailable()) {
+            System.err.println("error: no graphical display found (DISPLAY / WAYLAND_DISPLAY unset). "
+                    + "Run without --gui to use the browser viewer.");
+            System.exit(1);
+        }
+        if (o.watch()) {
+            SourceWatcher watcher = new SourceWatcher(o.root(), () -> {
+                try {
+                    CityModel next = CityModel.build(analyzer, o.root(), o.includeTests(), o.git(), github);
+                    DesktopApp.update(next);
+                    System.out.printf("↻ rebuilt city: %d types in %d ms%n", next.types().size(), next.buildMillis());
+                } catch (IOException | RuntimeException e) {
+                    System.err.println("rebuild failed: " + e.getMessage());
+                }
+            });
+            watcher.start();
+            System.out.println("Watching for changes …");
+        }
+        System.out.println("Opening the CodeCity window …");
+        DesktopApp.launch(model);
+        System.exit(0);
     }
 
     private static GitHubInfo loadGitHub(Path root) {
@@ -185,7 +220,8 @@ public final class CodeCity {
         System.out.println("GitHub: " + info.repo().webUrl() + " — fetching open pull requests …");
         PullRequests.Result pulls = PullRequests.fetch(info.repo());
         System.out.println("  loaded " + pulls.source());
-        return info.withPulls(pulls.pulls(), pulls.source());
+        // A failed fetch should not look like "no open PRs": leave the PR features off instead.
+        return pulls.source().equals("unavailable") ? info : info.withPulls(pulls.pulls(), pulls.source());
     }
 
     private static String require(List<String> rest, String option) {
