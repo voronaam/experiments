@@ -1,0 +1,5 @@
+target/
+*.html
+!src/main/resources/web/*.html
+.idea/
+*.iml

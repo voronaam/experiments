@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en" data-theme="day">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CodeCity</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+      }
+    }
+  </script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <canvas id="scene" aria-label="3D code city"></canvas>
+  <div id="labels"></div>
+
+  <header class="topbar panel">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect x="5" y="16" width="5" height="11" rx="1" fill="#38bdf8"/><rect x="11.5" y="7" width="5" height="20" rx="1" fill="#f97316"/><rect x="18" y="12" width="4" height="15" rx="1" fill="#facc15"/><rect x="23.5" y="19" width="4" height="8" rx="1" fill="#34d399"/></svg>
+      <div>
+        <div class="brand-name">CodeCity</div>
+        <div class="project" id="project-name">loading…</div>
+      </div>
+    </div>
+    <div class="search">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="search" type="search" placeholder="Search classes…" autocomplete="off" spellcheck="false">
+      <kbd>/</kbd>
+      <ul id="search-results" hidden></ul>
+    </div>
+    <div class="stats" id="stats"></div>
+  </header>
+
+  <aside class="controls panel" id="controls">
+    <section>
+      <label for="height-metric">Height</label>
+      <select id="height-metric"></select>
+    </section>
+    <section>
+      <label for="color-metric">Colour</label>
+      <select id="color-metric"></select>
+      <div id="legend" class="legend"></div>
+    </section>
+    <section class="toggles">
+      <label class="toggle"><input type="checkbox" id="opt-tests" checked><span>Test classes</span></label>
+      <label class="toggle"><input type="checkbox" id="opt-labels" checked><span>District labels</span></label>
+      <label class="toggle" title="Markers above classes touched by open pull requests"><input type="checkbox" id="opt-beacons" checked><span>Open-PR beacons</span></label>
+      <label class="toggle"><input type="checkbox" id="opt-ao" checked><span>Ambient occlusion</span></label>
+    </section>
+    <section class="buttons">
+      <button id="btn-theme" title="Toggle day / night (N)">Night</button>
+      <button id="btn-frame" title="Frame whole city (F)">Frame</button>
+      <button id="btn-snapshot" title="Save a PNG">Snapshot</button>
+    </section>
+  </aside>
+
+  <aside class="inspector panel" id="inspector" hidden></aside>
+
+  <div id="tooltip" class="tooltip" hidden></div>
+  <div id="toast" class="toast" hidden></div>
+
+  <div id="source-modal" class="modal" hidden>
+    <div class="modal-card panel">
+      <header>
+        <span id="source-title"></span>
+        <button id="source-close" aria-label="Close">✕</button>
+      </header>
+      <div class="code-wrap" id="code-wrap">
+        <div class="code-band" id="code-band"></div>
+        <pre class="gutter" id="code-gutter"></pre>
+        <pre class="code"><code id="code" class="language-java"></code></pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="hint">drag to orbit · right-drag to pan · scroll to zoom · click a building · <kbd>F</kbd> frame · <kbd>N</kbd> night · <kbd>Esc</kbd> clear</div>
+  <div id="loading" class="loading"><div class="spinner"></div><span>Building city…</span></div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
