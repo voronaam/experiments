@@ -62,11 +62,7 @@ public final class RustAnalyzer implements LanguageSupport {
      */
     static final String FUNCTIONS = "{fn}";
 
-    private final ThreadLocal<TSParser> parser = ThreadLocal.withInitial(() -> {
-        TSParser p = new TSParser();
-        p.setLanguage(new TreeSitterRust());
-        return p;
-    });
+    private final ThreadLocal<TSParser> parser = ThreadLocal.withInitial(() -> Syntax.parser(TreeSitterRust::new));
     /**
      * Directory → the crate whose {@code Cargo.toml} sits in it, or empty if none does. Shared by the parsing threads
      * and cleared by {@link #link}, so each analysis reads the manifests afresh and a {@code Cargo.toml} added,

@@ -18,9 +18,9 @@ import java.util.concurrent.TimeUnit;
 /**
  * Mines {@code git log} once for per-file churn, author count and recency.
  *
- * <p>This is the "git history" stage of the pipeline. It runs after the analysis, from
- * {@link dev.codecity.CityModel#build}, and is independent of it: the result is keyed by file, and every type declared
- * in a file shares that file's history. It shells out to the {@code git} executable rather than using a library, so
+ * <p>This is the "git history" stage of the pipeline. {@link dev.codecity.CityModel#build} runs it on its own thread
+ * while the sources are analysed, as it is independent of the analysis: the result is keyed by file, and every type
+ * declared in a file shares that file's history. It shells out to the {@code git} executable rather than using a library, so
  * it needs git on the {@code PATH}; without it (or outside a work tree) the city simply has no history metrics.
  *
  * <p>A single {@code git log --name-only} pass is enough because each commit lists every file it touched, so all

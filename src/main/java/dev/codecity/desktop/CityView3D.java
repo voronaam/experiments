@@ -42,7 +42,7 @@ import java.util.function.IntPredicate;
  * The 3D city. All buildings form a single mesh (and all districts another) so thousands of classes stay cheap; each
  * building's colour is a cell in a palette texture, so recolouring never touches geometry.
  *
- * <p>JavaFX's y axis points down, so world heights are negated here.
+ * <p>JavaFX's y axis points down, so the scene is the layout turned 180° about the x axis ({@link #toScene}).
  *
  * <h2>Meshes</h2>
  * Building {@code i} is box {@code i} of the building mesh: points {@code 8i .. 8i+7} and triangles
@@ -57,8 +57,9 @@ import java.util.function.IntPredicate;
  * Districts use the same scheme, except that a palette cell stands for a nesting depth instead of a single district.
  *
  * <h2>Coordinates</h2>
- * Layout coordinates are used unchanged for x and z ({@link CityLayout}: the city is centred on the origin); y is the
- * negated layout height. The camera orbits a target point: its transform chain is
+ * A layout point (x, y, z) ({@link CityLayout}: y up, the city centred on the origin) is drawn at (x, −y, −z)
+ * ({@link #toScene}). That is a half turn about the x axis, not a mirror, so the city looks exactly as in the other
+ * viewers (negating y alone would show its mirror image). The camera orbits a target point: its transform chain is
  * {@code target → yaw → pitch → dolly}, i.e. move to the target, turn around the vertical axis, tilt, then back off
  * along the view axis by the dolly distance. Negative pitch angles look down on the city.
  *
@@ -216,9 +217,9 @@ final class CityView3D {
         // down), so its top never z-fights with the bottom of the lowest platform.
         ground.setTranslateY(0.06);
         ground.setMouseTransparent(true);
-        // Key light from above (positive y is down), fill light from a lower, opposite angle.
-        key.setDirection(new Point3D(-0.45, 1, -0.6));
-        fill.setDirection(new Point3D(0.6, 0.35, 0.8));
+        // Key light from above (positive y is down) and the front right, fill light from a lower, opposite angle.
+        key.setDirection(new Point3D(-0.45, 1, 0.6));
+        fill.setDirection(new Point3D(0.6, 0.35, -0.8));
         buildingMaterial.setSpecularColor(Color.gray(0.18));
         buildingMaterial.setSpecularPower(24);
         districtMaterial.setSpecularColor(Color.BLACK);
@@ -385,14 +386,15 @@ final class CityView3D {
 
     /**
      * Writes the eight corners of box {@code box} into {@code pts} (three floats each), using the corner numbering of
-     * {@link #boxTriangles}. {@code y0}/{@code y1} are world heights (up positive); they are negated here.
+     * {@link #boxTriangles}. Coordinates are layout ones ({@link #toScene}): y and z are negated here, and since that
+     * swaps the ends of each range, the corner numbering takes the smaller scene value (−y1, −z1) first.
      */
     private static void writeBox(float[] pts, int box, double x0, double z0, double x1, double z1, double y0, double y1) {
         for (int k = 0; k < 8; k++) {
             int o = (box * 8 + k) * 3;
             pts[o] = (float) ((k & 1) == 0 ? x0 : x1);
             pts[o + 1] = (float) -((k >> 2) == 1 ? y1 : y0);
-            pts[o + 2] = (float) (((k >> 1) & 1) == 0 ? z0 : z1);
+            pts[o + 2] = (float) -(((k >> 1) & 1) == 0 ? z1 : z0);
         }
     }
 
@@ -590,7 +592,7 @@ final class CityView3D {
             label.setManaged(false);
             label.setMouseTransparent(true);
             labelLayer.getChildren().add(label);
-            labels.add(new LabelAnchor(label, new Point3D(d.x(), -((d.depth() + 1) * CityLayout.PLATFORM + 0.2), front),
+            labels.add(new LabelAnchor(label, toScene(d.x(), (d.depth() + 1) * CityLayout.PLATFORM + 0.2, front),
                     model.districts().indexOf(d)));
         }
     }
@@ -657,7 +659,7 @@ final class CityView3D {
 
     private Point3D topOf(int i) {
         CityLayout.Lot lot = model.buildings().get(i).lot();
-        return new Point3D(lot.x(), -(lot.y() + heightOf(i)), lot.z());
+        return toScene(lot.x(), lot.y() + heightOf(i), lot.z());
     }
 
     /**
@@ -837,12 +839,12 @@ final class CityView3D {
     void flyToBuilding(int i) {
         CityLayout.Lot lot = model.buildings().get(i).lot();
         double h = heightOf(i);
-        flyTo(new Point3D(lot.x(), -(lot.y() + h * 0.5), lot.z()), Math.max(Math.max(h * 1.8, lot.side() * 7), 22));
+        flyTo(toScene(lot.x(), lot.y() + h * 0.5, lot.z()), Math.max(Math.max(h * 1.8, lot.side() * 7), 22));
     }
 
     /** Flies to the top of district {@code d}, backing off by 1.25 × its longer side plus 10 units. */
     void flyToDistrict(CityLayout.District d) {
-        flyTo(new Point3D(d.x(), -(d.depth() + 1) * CityLayout.PLATFORM, d.z()), Math.max(d.w(), d.d()) * 1.25 + 10);
+        flyTo(toScene(d.x(), (d.depth() + 1) * CityLayout.PLATFORM, d.z()), Math.max(d.w(), d.d()) * 1.25 + 10);
     }
 
     /**
@@ -855,6 +857,11 @@ final class CityView3D {
         }
         flight = new Flight(System.nanoTime(), 0.9, new Point3D(target.getX(), target.getY(), target.getZ()), to,
                 -dolly.getZ(), distance, -pitch.getAngle(), Math.max(20, -pitch.getAngle()));
+    }
+
+    /** Scene position of a layout point: a half turn about the x axis (see Coordinates in the class comment). */
+    static Point3D toScene(double x, double y, double z) {
+        return new Point3D(x, -y, -z);
     }
 
     private void setTarget(Point3D p) {
@@ -973,8 +980,8 @@ final class CityView3D {
             CityLayout.Lot lot = model.buildings().get(selected).lot();
             walker.spawn(lot.x(), lot.z() + lot.side() / 2 + Walker.RADIUS + 0.2, 0, world);
         } else {
-            // The orbit camera looks along (sin a, cos a) on the ground; the walker's yaw 0 looks along −z.
-            walker.spawn(target.getX(), target.getZ(), Math.toRadians(yaw.getAngle()) - Math.PI, world);
+            // The orbit camera looks along (sin a, −cos a) on the layout's ground (see placeWalkCamera), so yaw = −a.
+            walker.spawn(target.getX(), -target.getZ(), -Math.toRadians(yaw.getAngle()), world);
         }
         camera.setFieldOfView(Walker.FOV);
         camera.setNearClip(Walker.NEAR);
@@ -1046,13 +1053,13 @@ final class CityView3D {
     }
 
     /**
-     * Turns the orbit chain into an eye: target at the eye (y negated for JavaFX), no dolly. The JavaFX yaw rotation
-     * looks along (sin a, cos a), the walker's yaw along (−sin, −cos), hence the 180°; a positive JavaFX pitch tilts
-     * the view up, as the walker's does.
+     * Turns the orbit chain into an eye: target at the eye, no dolly. The JavaFX yaw rotation looks along
+     * (sin a, cos a) in the scene, i.e. (sin a, −cos a) in the layout, and the walker's yaw along (−sin, −cos), hence
+     * a = −yaw; a positive JavaFX pitch tilts the view up, as the walker's does.
      */
     private void placeWalkCamera() {
-        setTarget(new Point3D(walker.x, -walker.eyeY(), walker.z));
-        yaw.setAngle(Math.toDegrees(walker.yaw) + 180);
+        setTarget(toScene(walker.x, walker.eyeY(), walker.z));
+        yaw.setAngle(-Math.toDegrees(walker.yaw));
         pitch.setAngle(Math.toDegrees(walker.pitch));
         dolly.setZ(0);
     }
@@ -1147,7 +1154,7 @@ final class CityView3D {
                 g.setVisible(h > 0.001);
                 g.setTranslateX(lot.x());
                 g.setTranslateY(-(lot.y() + h + 1.4 + Math.sin(t * 2 + i) * 0.25));
-                g.setTranslateZ(lot.z());
+                g.setTranslateZ(-lot.z());
                 g.setRotationAxis(Rotate.Y_AXIS);
                 g.setRotate(Math.toDegrees(t * 1.2 + i) % 360);
             }

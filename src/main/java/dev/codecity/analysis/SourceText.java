@@ -35,9 +35,8 @@ public final class SourceText {
     /**
      * Splits on {@code \n} only, so index {@code i} is line {@code i + 1} as tree-sitter numbers rows: a lone
      * {@code \r} (classic Mac line ending) does not break the line, and the {@code \r} of a {@code \r\n} stays at the
-     * end of its line, where {@link #countLoc}'s {@code strip()} drops it. JavaParser would also count a lone
-     * {@code \r}, so {@link JavaAnalyzer} hands it the code with those replaced by spaces. The limit of -1 keeps
-     * trailing empty lines, so a file that ends with a newline yields one final empty element.
+     * end of its line, where {@link #countLoc}'s {@code strip()} drops it. The limit of -1 keeps trailing empty
+     * lines, so a file that ends with a newline yields one final empty element.
      */
     public static String[] lines(String code) {
         return code.split("\n", -1);

@@ -25,6 +25,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 
 /**
  * An analysed and laid-out city, consumed by both the web viewer (as JSON) and the desktop viewer (as objects).
@@ -139,9 +141,21 @@ public final class CityModel {
     public static CityModel build(SourceAnalyzer analyzer, Path root, boolean includeTests, boolean useGit,
                                   GitHubInfo github, int historySnapshots) throws IOException {
         long start = System.nanoTime();
-        Analysis parsed = analyzer.analyze(root, includeTests);
-        // The raw log is kept only for the replay, which counts each file's commits up to every snapshot.
-        Map<Path, List<GitHistory.Touch>> touches = useGit ? GitHistory.touches(root) : Map.of();
+        // git log runs on its own thread while the sources are parsed: the two are independent, and git mostly waits
+        // for I/O while parsing keeps the CPU busy. The raw log is kept only for the replay, which counts each file's
+        // commits up to every snapshot.
+        FutureTask<Map<Path, List<GitHistory.Touch>>> gitLog = new FutureTask<>(() -> GitHistory.touches(root));
+        if (useGit) {
+            Thread.ofPlatform().name("git-log").daemon().start(gitLog);
+        }
+        Analysis parsed;
+        try {
+            parsed = analyzer.analyze(root, includeTests);
+        } catch (IOException | RuntimeException e) {
+            gitLog.cancel(true);
+            throw e;
+        }
+        Map<Path, List<GitHistory.Touch>> touches = useGit ? await(gitLog) : Map.of();
         Map<Path, FileHistory> history = GitHistory.summarise(touches);
         // The analyser leaves history empty; add it here so the model has a single, complete Analysis.
         Analysis analysis = new Analysis(root, parsed.types(), parsed.dependencies(), history,
@@ -183,6 +197,23 @@ public final class CityModel {
         });
         return new CityModel(name, analysis, List.copyOf(union.values()), deps, replay,
                 presentCounts(layout, present), github, (System.nanoTime() - start) / 1_000_000);
+    }
+
+    /**
+     * The git log mined in the background, or no history if mining failed unexpectedly ({@link GitHistory} already
+     * turns the expected failures into an empty result) or the waiting thread is interrupted.
+     */
+    private static Map<Path, List<GitHistory.Touch>> await(FutureTask<Map<Path, List<GitHistory.Touch>>> gitLog) {
+        try {
+            return gitLog.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            gitLog.cancel(true);
+            return Map.of();
+        } catch (ExecutionException e) {
+            System.err.println("warning: git history unavailable: " + e.getCause());
+            return Map.of();
+        }
     }
 
     public String name() {

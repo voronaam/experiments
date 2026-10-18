@@ -464,4 +464,22 @@ mod tests {
         assert!(close(w.yaw, -0.25));
         assert!(close(w.pitch, PITCH_LIMIT));
     }
+
+    #[test]
+    fn mouse_and_keys_work_like_a_shooter() {
+        // Mouse right turns the view clockwise seen from above (from -z towards +x), mouse up looks up.
+        let world = world(vec![]);
+        let mut w = at(0.0, 0.0, 0.0, 0.0);
+        w.look(100.0, -100.0);
+        assert!(close(w.yaw, -0.25) && close(w.pitch, 0.25));
+        let [fx, fy, fz] = w.direction();
+        assert!(fx > 0.0 && fy > 0.0 && fz < 0.0);
+        let (fx, fz) = (-w.yaw.sin(), -w.yaw.cos());
+        // D for 1 s moves along the camera's right, forward × up = (-fz, fx) on the ground; W along the view.
+        run(&mut w, &world, Input { right: true, ..Input::default() }, 20);
+        assert!(close(w.x, -3.0 * fz) && close(w.z, 3.0 * fx), "{w:?}");
+        let mut q = at(0.0, 0.0, 0.0, w.yaw);
+        run(&mut q, &world, FORWARD, 20);
+        assert!(close(q.x, 3.0 * fx) && close(q.z, 3.0 * fz), "{q:?}");
+    }
 }

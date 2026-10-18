@@ -13,22 +13,24 @@
   <properties>
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <javaparser.version>3.28.0</javaparser.version>
     <javafx.version>21.0.10</javafx.version>
     <tree-sitter.version>0.26.6</tree-sitter.version>
   </properties>
 
   <dependencies>
-    <dependency>
-      <groupId>com.github.javaparser</groupId>
-      <artifactId>javaparser-core</artifactId>
-      <version>${javaparser.version}</version>
-    </dependency>
-    <!-- TypeScript and Rust parsing: tree-sitter with bundled natives for Linux, macOS and Windows -->
+    <!-- Parsing: tree-sitter with bundled natives for Linux, macOS and Windows. The core library is replaced at run
+         time by CodeCity's optimised build (native/build-tree-sitter.sh, see NativeLibraries); its JNI glue is the
+         binding's, so the build must be redone when tree-sitter.version changes. -->
     <dependency>
       <groupId>io.github.bonede</groupId>
       <artifactId>tree-sitter</artifactId>
       <version>${tree-sitter.version}</version>
+    </dependency>
+    <!-- Grammars: the same versions as the Rust and D editions where the binding publishes them -->
+    <dependency>
+      <groupId>io.github.bonede</groupId>
+      <artifactId>tree-sitter-java</artifactId>
+      <version>0.23.5</version>
     </dependency>
     <dependency>
       <groupId>io.github.bonede</groupId>

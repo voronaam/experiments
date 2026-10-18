@@ -81,6 +81,92 @@ class JavaAnalyzerTest {
     }
 
     @Test
+    void countsJavaSpecificConstructs() throws IOException {
+        write("src/main/java/a/Shapes.java", """
+                package a;
+                public abstract class Shapes {
+                    abstract int area(int... sides);
+                    int kind(Object o, int k) {
+                        Runnable r = () -> { if (k > 0 || k < -1) { } };
+                        return switch (k) {
+                            case 1, 2 -> 1;
+                            case 3 -> o instanceof String s ? 2 : 3;
+                            default -> 0;
+                        };
+                    }
+                    void loops(int[] xs) {
+                        try { do { } while (xs.length > 0); } catch (RuntimeException e) { } finally { }
+                        while (true) { break; }
+                    }
+                    void receiver(Shapes this, int x) {}
+                    { int init = 1; }
+                }
+                interface Consts { int A = 1, B = 2; }
+                enum Color { RED, GREEN; int rgb; Color() {} int value() { return rgb; } }
+                """);
+        Map<String, TypeInfo> types = analyze().types().stream()
+                .collect(Collectors.toMap(TypeInfo::fqn, Function.identity()));
+
+        TypeInfo shapes = types.get("a.Shapes");
+        assertEquals("abstract", shapes.kind());
+        Map<String, MethodInfo> methods = shapes.methods().stream()
+                .collect(Collectors.toMap(MethodInfo::name, Function.identity()));
+        // The initialiser block is not a method; the varargs parameter counts, the receiver parameter does not.
+        assertEquals(Set.of("area", "kind", "loops", "receiver"), methods.keySet());
+        assertEquals(1, methods.get("area").parameters());
+        assertEquals(1, methods.get("receiver").parameters());
+        // kind(): 1 + lambda's if + || + `case 1, 2` + `case 3` + ?: = 6 (default is no decision)
+        assertEquals(6, methods.get("kind").complexity());
+        // loops(): 1 + do + catch + while = 4
+        assertEquals(4, methods.get("loops").complexity());
+
+        assertEquals("interface", types.get("a.Consts").kind());
+        assertEquals(2, types.get("a.Consts").noa());
+        // Two constants and one field; the constructor and method sit in the enum's body declarations.
+        assertEquals(3, types.get("a.Color").noa());
+        assertEquals(2, types.get("a.Color").nom());
+    }
+
+    @Test
+    void collectsQualifiedStaticAndAnnotationReferences() throws IOException {
+        write("src/main/java/a/A.java", """
+                package a;
+                import static b.Util.go;
+                import static b.Consts.*;
+                @b.Marker
+                public class A {
+                    b.Outer . Inner i;
+                    void f() { go(); A.this.hashCode(); Helper.run(); }
+                    class Nested { Object o = A.this; }
+                }
+                """);
+        write("src/main/java/a/Helper.java", "package a; class Helper { static void run() {} }");
+        write("src/main/java/b/Util.java", "package b; public class Util { public static void go() {} }");
+        write("src/main/java/b/Consts.java", "package b; public class Consts {}");
+        write("src/main/java/b/Marker.java", "package b; public @interface Marker {}");
+        write("src/main/java/b/Outer.java", "package b; public class Outer { public class Inner {} }");
+        Analysis analysis = analyze();
+        // Statically imported members name no type; `A.this` is no static access. `b.Outer . Inner` (with spaces)
+        // resolves to the member type, and the scope `b.Outer` is a reference of its own.
+        assertEquals(Set.of("a.Helper", "b.Marker", "b.Outer.Inner", "b.Outer"), analysis.dependencies().get("a.A"));
+    }
+
+    @Test
+    void filesWithSyntaxErrorsAreAnalysedAndCounted() throws IOException {
+        write("src/main/java/a/A.java", "package a; class A { int x; void f( { } }");
+        Analysis analysis = analyze();
+        assertEquals(1, analysis.failedFiles());
+        assertEquals("a.A", analysis.types().getFirst().fqn());
+    }
+
+    @Test
+    void usesTheOptimisedTreeSitterLibrary() {
+        Syntax.parser(org.treesitter.TreeSitterJava::new);
+        String dir = System.getProperty("tree-sitter-lib");
+        assertTrue(dir != null && Files.isDirectory(Path.of(dir, "lib")), "tree-sitter-lib = " + dir);
+    }
+
+    @Test
     void resolvesProjectDependenciesOnly() throws IOException {
         write("src/main/java/a/A.java", """
                 package a;

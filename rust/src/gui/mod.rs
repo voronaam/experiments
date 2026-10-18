@@ -10,7 +10,7 @@
 //! - [`scene::Scene`] owns the GPU side (instanced buildings and districts, shadows, dependency arcs, beacons,
 //!   picking). The app only pushes data into it: heights, colours, selection.
 //! - [`walk`] is the first-person walk mode's movement and collision logic (toggled with G or the Walk button);
-//!   the app feeds it raw winit input ([`RawInput`]) and grabs the cursor while walking ([`Capture`]).
+//!   the app feeds it raw winit input ([`RawInput`]) and captures the cursor while walking ([`Capture`]).
 //! - [`replay`] is the history replay's playback state and interpolation rules (Replay button or R, for a city built
 //!   with `--history`); the app draws its timeline bar and feeds the interpolated heights, sides and colours to the
 //!   scene.
@@ -140,9 +140,9 @@ pub fn run(model: Arc<CityModel>, watch: Option<(PathBuf, Rebuild)>) -> Result<(
                 _ => {}
             }
         }
-        // Raw (unaccelerated, unclamped) mouse motion: keeps coming while the cursor is locked or pinned at an edge.
+        // Raw (unaccelerated, unclamped) mouse motion: keeps coming while the cursor is locked or held at the centre.
         WinitEvent::DeviceEvent { event: DeviceEvent::MouseMotion { delta }, .. } => {
-            if app.walk.is_some() && !app.raw.recentre {
+            if app.walk.is_some() {
                 app.raw.mouse.0 += delta.0 as f32;
                 app.raw.mouse.1 += delta.1 as f32;
             }
@@ -221,11 +221,6 @@ struct RawInput {
     clicks: u32,
     /// The window lost focus since the last frame.
     focus_lost: bool,
-    /// The cursor could not be grabbed: mouse motion is the cursor's offset from the window centre, and the cursor is
-    /// put back there every frame (see [`Capture`]).
-    recentre: bool,
-    /// Window centre in physical pixels, for `recentre`.
-    centre: (f64, f64),
 }
 
 impl RawInput {
@@ -244,10 +239,6 @@ impl RawInput {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: winit::event::MouseButton::Left, .. } if walking => self.clicks += 1,
-            WindowEvent::CursorMoved { position, .. } if walking && self.recentre => {
-                self.mouse.0 += (position.x - self.centre.0) as f32;
-                self.mouse.1 += (position.y - self.centre.1) as f32;
-            }
             WindowEvent::Focused(false) => {
                 self.focus_lost = true;
                 // Key releases are not delivered to an unfocused window, so forget what was held.
@@ -264,26 +255,25 @@ impl RawInput {
     }
 }
 
-/// Grabs and hides the cursor while walking.
+/// Captures and hides the cursor while walking; the look direction always comes from raw device motion.
 ///
 /// winit 0.28 offers two grab modes: `Locked` (the cursor stays put; Wayland, macOS) and `Confined` (it stays inside
-/// the window; X11, Windows). Each platform supports one of them, so `Locked` is tried first. In both cases the look
-/// direction comes from raw device motion, which keeps arriving while the cursor is locked or pinned at an edge. If
-/// neither mode is available, the hidden cursor is moved back to the window centre every frame and its offset from
-/// the centre is used instead.
+/// the window; X11, Windows). `Locked` is used where available. `Confined` is not: on X11 the pointer grab behind it
+/// makes the X server deliver every raw motion event twice, which doubled the mouse sensitivity. Without a lock the
+/// hidden cursor is instead moved back to the window centre every frame, so it never reaches a screen edge or leaves
+/// the window (moving it there produces no raw motion).
 #[derive(Default)]
 struct Capture {
     active: bool,
+    /// The cursor could not be locked: it is put back at the window centre every frame.
+    pin: bool,
 }
 
 impl Capture {
     fn sync(&mut self, window: &winit::window::Window, raw: &mut RawInput, walking: bool) {
         use winit::window::CursorGrabMode;
-        let size = window.inner_size();
-        raw.centre = (size.width as f64 / 2.0, size.height as f64 / 2.0);
         if walking && !self.active {
-            let grabbed = window.set_cursor_grab(CursorGrabMode::Locked).or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined)).is_ok();
-            raw.recentre = !grabbed;
+            self.pin = window.set_cursor_grab(CursorGrabMode::Locked).is_err();
             window.set_cursor_visible(false);
             raw.mouse = (0.0, 0.0);
             self.active = true;
@@ -291,10 +281,10 @@ impl Capture {
             window.set_cursor_grab(CursorGrabMode::None).ok();
             window.set_cursor_visible(true);
             self.active = false;
-            raw.recentre = false;
         }
-        if self.active && raw.recentre {
-            window.set_cursor_position(winit::dpi::PhysicalPosition::new(raw.centre.0, raw.centre.1)).ok();
+        if self.active && self.pin {
+            let size = window.inner_size();
+            window.set_cursor_position(winit::dpi::PhysicalPosition::new(size.width / 2, size.height / 2)).ok();
         }
     }
 }

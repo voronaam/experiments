@@ -402,3 +402,22 @@ unittest
     p.look(-100, 0);
     assert(near(p.yaw, 0.25f));
 }
+
+// Mouse and keys work like a shooter: mouse right turns the view clockwise seen from above (from -z towards +x), mouse
+// up looks up; D for 1 s moves along the camera's right (forward × up, as in `Mat4.lookAt`), W along the view.
+unittest
+{
+    auto w = world();
+    auto p = Walker.spawn(0, 0, 0, w);
+    p.look(100, -100);
+    assert(near(p.yaw, -0.25f) && near(p.pitch, 0.25f));
+    const f = p.forward;
+    assert(f.x > 0 && f.y > 0 && f.z < 0);
+    const flat = Vec3(-sin(p.yaw), 0, -cos(p.yaw));
+    const right = flat.cross(Vec3(0, 1, 0));
+    run(p, Input(0, 1), w, 20);
+    assert(near(p.x, 3 * right.x) && near(p.z, 3 * right.z));
+    auto q = Walker.spawn(0, 0, p.yaw, w);
+    run(q, Input(1, 0), w, 20);
+    assert(near(q.x, 3 * flat.x) && near(q.z, 3 * flat.z));
+}

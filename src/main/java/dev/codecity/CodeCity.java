@@ -23,7 +23,8 @@ import java.util.Optional;
  * Command-line entry point. It parses the options, then runs the whole pipeline once:
  *
  * <pre>
- *   [clone GitHub repo] → walk + parse/analyse → link dependencies → git history → layout → CityModel
+ *   [clone GitHub repo] → walk + parse/analyse → link dependencies ─┬─→ layout ────────→ CityModel
+ *                     git history (own thread, while parsing) ──────┘
  *                                                                                                │
  *                  ┌──────────────────────────────┬──────────────────────────────────────────────┤
  *            --export FILE                  (default)                                        --gui

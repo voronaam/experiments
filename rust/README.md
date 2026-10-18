@@ -1,6 +1,6 @@
 # CodeCity — Rust edition
 
-A native port of CodeCity with the same features and the same output, but 10–19× faster and using about a tenth of the
+A native port of CodeCity with the same features and the same output, but 3–6× faster and using 7–11× less
 memory.
 
 * **Same CLI:** the flags are identical to the Java version.
@@ -26,13 +26,15 @@ Wall time and peak memory, analysing and exporting the whole city with git histo
 
 | Code base | Java edition | Rust edition |
 |---|---|---|
-| google/gson — 721 Java types | 2.7 s · 191 MB | **0.26 s · 16 MB** |
-| colinhacks/zod — 1,761 TypeScript types | 10.0 s · 204 MB | **0.65 s · 29 MB** |
-| BurntSushi/ripgrep — 500 Rust types | 4.2 s · 178 MB | **0.22 s · 23 MB** |
+| google/gson — 721 Java types | 0.92 s · 180 MB | **0.26 s · 16 MB** |
+| colinhacks/zod — 1,761 TypeScript types | 2.07 s · 204 MB | **0.65 s · 29 MB** |
+| BurntSushi/ripgrep — 500 Rust types | 1.28 s · 191 MB | **0.22 s · 23 MB** |
 
-Where the time went in the Java edition:
-* **JVM startup.**
-* **The JNI tree-sitter bindings:** one native call per syntax-tree node.
+Where the time goes in the Java edition:
+* **JVM startup and JIT warm-up.**
+* **The JNI tree-sitter bindings:** one native call per syntax-tree node. The Java edition ships its own optimised
+  build of the binding's native library (see [`native/`](../native/build-tree-sitter.sh)), which makes these calls
+  about 10× cheaper than the stock build, but they still cost more than walking the tree natively.
 
 The Rust edition instead:
 * parses with native tree-sitter,
@@ -45,9 +47,8 @@ Watch-mode rebuilds re-parse only the files that changed.
 ## Parity
 
 Both editions produce identical cities, checked field by field on the code bases above: every building, metric,
-position, district and dependency edge. Java parsing differs underneath (tree-sitter-java here, JavaParser there), so
-the Java analyser mirrors JavaParser's rules, for example `case 1, 2 ->` counting as one decision and `Map.Entry`
-referencing `Map`. The layout is a line-by-line port, so floating-point results match exactly.
+position, district and dependency edge. All editions parse with tree-sitter and the same grammar versions, and the
+analysers are ports of each other. The layout is a line-by-line port, so floating-point results match exactly.
 
 ## Desktop mode
 

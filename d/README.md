@@ -41,9 +41,9 @@ Best of three runs, analysing and exporting the whole city with git history:
 
 | Code base | Java | Rust | D |
 |---|---|---|---|
-| google/gson — 721 Java types | 3.28 s · 188 MB | 0.35 s · 17 MB | 0.36 s · 23 MB |
-| colinhacks/zod — 1,761 TypeScript types | 10.39 s · 198 MB | 0.69 s · 31 MB | 0.69 s · 45 MB |
-| BurntSushi/ripgrep — 500 Rust types | 4.57 s · 178 MB | 0.27 s · 23 MB | 0.31 s · 27 MB |
+| google/gson — 721 Java types | 0.92 s · 180 MB | 0.35 s · 17 MB | 0.36 s · 23 MB |
+| colinhacks/zod — 1,761 TypeScript types | 2.07 s · 204 MB | 0.69 s · 31 MB | 0.69 s · 45 MB |
+| BurntSushi/ripgrep — 500 Rust types | 1.28 s · 191 MB | 0.27 s · 23 MB | 0.31 s · 27 MB |
 
 How the D edition gets there:
 * **Parsing:** files are parsed in parallel (`std.parallelism`), with tree-sitter called directly through C bindings

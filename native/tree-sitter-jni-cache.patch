@@ -1,0 +1,153 @@
+--- a/tree-sitter/src/main/c/org_treesitter_TSParser.c
++++ b/tree-sitter/src/main/c/org_treesitter_TSParser.c
+@@ -34,54 +34,128 @@
+     return (*env)->FindClass(env, class_name);
+ }
+ 
++jfieldID ts_jni_get_field_id(JNIEnv *env, jclass clz, const char *field_name, const char*field_type){
++    return (*env)->GetFieldID(env, clz, field_name, field_type);
++}
++
++/*
++ * CodeCity patch: TSNode and TSPoint cross the JNI boundary on every node access, and looking their class and field
++ * ids up each time (FindClass plus one GetFieldID per field) cost more than the tree-sitter call itself. They are
++ * resolved once in JNI_OnLoad instead. Class and field ids stay valid as long as the class is loaded, and the class
++ * is pinned by the global reference. If the lookup fails, the cache stays empty and every conversion falls back to
++ * the per-call lookup of the original code.
++ */
++static jclass ts_node_class_cache = NULL;
++static jfieldID ts_node_fields[6]; /* context0..3, idPtr, treePtr */
++static jclass ts_point_class_cache = NULL;
++static jfieldID ts_point_fields[2]; /* row, column */
++
++static jclass ts_jni_cache_class(JNIEnv *env, const char *class_name, const char **names, const char **types,
++                                 jfieldID *ids, int count){
++    jclass local = (*env)->FindClass(env, class_name);
++    if (local == NULL) {
++        (*env)->ExceptionClear(env);
++        return NULL;
++    }
++    for (int i = 0; i < count; i++) {
++        ids[i] = (*env)->GetFieldID(env, local, names[i], types[i]);
++        if (ids[i] == NULL) {
++            (*env)->ExceptionClear(env);
++            (*env)->DeleteLocalRef(env, local);
++            return NULL;
++        }
++    }
++    jclass global = (jclass) (*env)->NewGlobalRef(env, local);
++    (*env)->DeleteLocalRef(env, local);
++    return global;
++}
++
+ JavaVM* java_vm = NULL;
+ 
+ jint JNI_OnLoad(JavaVM* vm, void* reserved) {
+     java_vm = vm;
++    JNIEnv *env = NULL;
++    if ((*vm)->GetEnv(vm, (void **) &env, JNI_VERSION_1_6) == JNI_OK) {
++        static const char *node_names[] = {"context0", "context1", "context2", "context3", "idPtr", "treePtr"};
++        static const char *node_types[] = {"I", "I", "I", "I", "J", "J"};
++        static const char *point_names[] = {"row", "column"};
++        static const char *point_types[] = {"I", "I"};
++        ts_node_class_cache = ts_jni_cache_class(env, TS_NODE_CLASS_NAME, node_names, node_types, ts_node_fields, 6);
++        ts_point_class_cache = ts_jni_cache_class(env, TS_POINT_CLASS_NAME, point_names, point_types, ts_point_fields, 2);
++    }
+     return JNI_VERSION_10;
+ }
+ 
+-jfieldID ts_jni_get_field_id(JNIEnv *env, jclass clz, const char *field_name, const char*field_type){
+-    return (*env)->GetFieldID(env, clz, field_name, field_type);
++/* Fills ids with the TSNode field ids, from the cache when possible; returns the class to allocate nodes of. */
++static jclass ts_node_ids(JNIEnv *env, jfieldID *ids){
++    if (ts_node_class_cache != NULL) {
++        for (int i = 0; i < 6; i++) ids[i] = ts_node_fields[i];
++        return ts_node_class_cache;
++    }
++    jclass clz = ts_jni_find_class(env, TS_NODE_CLASS_NAME);
++    ids[0] = ts_jni_get_field_id(env, clz, "context0", "I");
++    ids[1] = ts_jni_get_field_id(env, clz, "context1", "I");
++    ids[2] = ts_jni_get_field_id(env, clz, "context2", "I");
++    ids[3] = ts_jni_get_field_id(env, clz, "context3", "I");
++    ids[4] = ts_jni_get_field_id(env, clz, "idPtr", "J");
++    ids[5] = ts_jni_get_field_id(env, clz, "treePtr", "J");
++    return clz;
++}
++
++/* Same for TSPoint. */
++static jclass ts_point_ids(JNIEnv *env, jfieldID *ids){
++    if (ts_point_class_cache != NULL) {
++        ids[0] = ts_point_fields[0];
++        ids[1] = ts_point_fields[1];
++        return ts_point_class_cache;
++    }
++    jclass clz = ts_jni_find_class(env, TS_POINT_CLASS_NAME);
++    ids[0] = ts_jni_get_field_id(env, clz, "row", "I");
++    ids[1] = ts_jni_get_field_id(env, clz, "column", "I");
++    return clz;
+ }
+ 
+ jobject ts_node_to_obj(JNIEnv *env, TSNode ts_node){
+-    jclass ts_node_class = ts_jni_find_class(env, TS_NODE_CLASS_NAME);
++    jfieldID f[6];
++    jclass ts_node_class = ts_node_ids(env, f);
+     jobject ts_node_object = (*env)->AllocObject(env, ts_node_class);
+-    (*env)->SetIntField(env, ts_node_object, ts_jni_get_field_id(env, ts_node_class, "context0", "I"), ts_node.context[0]);
+-    (*env)->SetIntField(env, ts_node_object, ts_jni_get_field_id(env, ts_node_class, "context1", "I"), ts_node.context[1]);
+-    (*env)->SetIntField(env, ts_node_object, ts_jni_get_field_id(env, ts_node_class, "context2", "I"), ts_node.context[2]);
+-    (*env)->SetIntField(env, ts_node_object, ts_jni_get_field_id(env, ts_node_class, "context3", "I"), ts_node.context[3]);
+-    (*env)->SetLongField(env, ts_node_object, ts_jni_get_field_id(env, ts_node_class, "idPtr", "J"), (jlong) ts_node.id);
+-    (*env)->SetLongField(env, ts_node_object, ts_jni_get_field_id(env, ts_node_class, "treePtr", "J"), (jlong) ts_node.tree);
++    (*env)->SetIntField(env, ts_node_object, f[0], ts_node.context[0]);
++    (*env)->SetIntField(env, ts_node_object, f[1], ts_node.context[1]);
++    (*env)->SetIntField(env, ts_node_object, f[2], ts_node.context[2]);
++    (*env)->SetIntField(env, ts_node_object, f[3], ts_node.context[3]);
++    (*env)->SetLongField(env, ts_node_object, f[4], (jlong) ts_node.id);
++    (*env)->SetLongField(env, ts_node_object, f[5], (jlong) ts_node.tree);
+     return ts_node_object;
+ }
+ 
+ TSNode ts_node_from_obj(JNIEnv *env, jobject ts_node_object){
+     TSNode ts_node;
+-    jclass ts_node_class = (*env)->GetObjectClass(env, ts_node_object);
+-    ts_node.context[0] = (uint32_t)(*env)->GetIntField(env, ts_node_object, ts_jni_get_field_id(env, ts_node_class, "context0", "I"));
+-    ts_node.context[1] = (uint32_t)(*env)->GetIntField(env, ts_node_object, ts_jni_get_field_id(env, ts_node_class, "context1", "I"));
+-    ts_node.context[2] = (uint32_t)(*env)->GetIntField(env, ts_node_object, ts_jni_get_field_id(env, ts_node_class, "context2", "I"));
+-    ts_node.context[3] = (uint32_t)(*env)->GetIntField(env, ts_node_object, ts_jni_get_field_id(env, ts_node_class, "context3", "I"));
+-    ts_node.id = (void *)(*env)->GetLongField(env, ts_node_object, ts_jni_get_field_id(env, ts_node_class, "idPtr", "J"));
+-    ts_node.tree = (const TSTree*)(*env)->GetLongField(env, ts_node_object, ts_jni_get_field_id(env, ts_node_class, "treePtr", "J"));
++    jfieldID f[6];
++    ts_node_ids(env, f);
++    ts_node.context[0] = (uint32_t)(*env)->GetIntField(env, ts_node_object, f[0]);
++    ts_node.context[1] = (uint32_t)(*env)->GetIntField(env, ts_node_object, f[1]);
++    ts_node.context[2] = (uint32_t)(*env)->GetIntField(env, ts_node_object, f[2]);
++    ts_node.context[3] = (uint32_t)(*env)->GetIntField(env, ts_node_object, f[3]);
++    ts_node.id = (void *)(*env)->GetLongField(env, ts_node_object, f[4]);
++    ts_node.tree = (const TSTree*)(*env)->GetLongField(env, ts_node_object, f[5]);
+     return ts_node;
+ }
+ 
+ jobject ts_point_to_obj(JNIEnv *env, TSPoint ts_point){
+-    jclass ts_point_class = ts_jni_find_class(env, TS_POINT_CLASS_NAME);
++    jfieldID f[2];
++    jclass ts_point_class = ts_point_ids(env, f);
+     jobject ts_point_object = (*env)->AllocObject(env, ts_point_class);
+-    (*env)->SetIntField(env, ts_point_object, ts_jni_get_field_id(env, ts_point_class, "row", "I"), ts_point.row);
+-    (*env)->SetIntField(env, ts_point_object, ts_jni_get_field_id(env, ts_point_class, "column", "I"), ts_point.column);
++    (*env)->SetIntField(env, ts_point_object, f[0], ts_point.row);
++    (*env)->SetIntField(env, ts_point_object, f[1], ts_point.column);
+     return ts_point_object;
+ }
+ 
+ TSPoint ts_point_from_obj(JNIEnv *env, jobject ts_point_obj){
+     TSPoint ts_point;
+-    jclass ts_point_class = (*env)->GetObjectClass(env, ts_point_obj);
+-    ts_point.row = (uint32_t)(*env)->GetIntField(env, ts_point_obj, ts_jni_get_field_id(env, ts_point_class, "row", "I"));
+-    ts_point.column = (uint32_t)(*env)->GetIntField(env, ts_point_obj, ts_jni_get_field_id(env, ts_point_class, "column", "I"));
++    jfieldID f[2];
++    ts_point_ids(env, f);
++    ts_point.row = (uint32_t)(*env)->GetIntField(env, ts_point_obj, f[0]);
++    ts_point.column = (uint32_t)(*env)->GetIntField(env, ts_point_obj, f[1]);
+     return ts_point;
+ }
+ 

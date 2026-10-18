@@ -66,20 +66,14 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
 
     // One parser per thread and grammar: a TSParser must not be shared between the threads parsing in parallel. .tsx
     // needs its own grammar because JSX is ambiguous with the <T>expr type assertion of plain TypeScript.
-    private final ThreadLocal<TSParser> tsParser = ThreadLocal.withInitial(() -> parser(new TreeSitterTypescript()));
-    private final ThreadLocal<TSParser> tsxParser = ThreadLocal.withInitial(() -> parser(new TreeSitterTsx()));
+    private final ThreadLocal<TSParser> tsParser = ThreadLocal.withInitial(() -> Syntax.parser(TreeSitterTypescript::new));
+    private final ThreadLocal<TSParser> tsxParser = ThreadLocal.withInitial(() -> Syntax.parser(TreeSitterTsx::new));
     /**
      * Absolute directory → its project directory (see {@link #projectOf}), shared by the parsing threads. Cleared at the
      * start of every {@link #link}, which re-derives the projects, so a {@code package.json} added or removed during a
      * watch session is noticed by the next analysis.
      */
     private final Map<Path, String> projectDirs = new ConcurrentHashMap<>();
-
-    private static TSParser parser(org.treesitter.TSLanguage language) {
-        TSParser p = new TSParser();
-        p.setLanguage(language);
-        return p;
-    }
 
     /** An import binding: {@code local} names {@code imported} ("default", "*" or an export name) of {@code source}. */
     record Import(String local, String source, String imported) {

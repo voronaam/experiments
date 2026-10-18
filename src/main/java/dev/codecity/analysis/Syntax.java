@@ -1,5 +1,6 @@
 package dev.codecity.analysis;
 
+import org.treesitter.TSLanguage;
 import org.treesitter.TSNode;
 import org.treesitter.TSParser;
 
@@ -8,10 +9,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 
 /**
  * A tree-sitter syntax tree plus the source bytes it indexes into, with small navigation helpers. Used by
- * {@link TypeScriptAnalyzer} and {@link RustAnalyzer}.
+ * {@link JavaAnalyzer}, {@link TypeScriptAnalyzer} and {@link RustAnalyzer}.
  *
  * <p>Tree-sitter never gives up on a file: syntax errors become {@code ERROR}/{@code MISSING} nodes inside an
  * otherwise normal tree, which {@code root.hasError()} reports. The analysers therefore always get a tree and mark the
@@ -33,6 +35,17 @@ final class Syntax {
     private Syntax(TSNode root, byte[] utf8) {
         this.root = root;
         this.utf8 = utf8;
+    }
+
+    /**
+     * A new parser for one grammar. The grammar is created only here, after {@link NativeLibraries#install()} has
+     * pointed the binding at the optimised tree-sitter library, since the first grammar or parser loads the natives.
+     */
+    static TSParser parser(Supplier<TSLanguage> grammar) {
+        NativeLibraries.install();
+        TSParser p = new TSParser();
+        p.setLanguage(grammar.get());
+        return p;
     }
 
     /** Parses {@code code} from scratch (no previous tree, so no incremental re-parse). */
@@ -98,6 +111,19 @@ final class Syntax {
 
     static void walk(TSNode n, Consumer<TSNode> visit) {
         walk(n, visit, x -> true);
+    }
+
+    /**
+     * Like {@link #walk(TSNode, Consumer, Predicate)}, with one callback that visits a node and returns whether to
+     * descend into its children (so each node's type is looked up only once).
+     */
+    static void walkWhile(TSNode n, Predicate<TSNode> visit) {
+        if (!visit.test(n)) {
+            return;
+        }
+        for (int i = 0; i < n.getNamedChildCount(); i++) {
+            walkWhile(n.getNamedChild(i), visit);
+        }
     }
 
     /**

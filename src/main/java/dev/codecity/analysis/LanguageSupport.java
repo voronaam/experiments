@@ -15,8 +15,8 @@ import java.util.Set;
  * the whole project (a reference can only be resolved once every type is known), so it always runs again, but it works
  * on the small {@link ParsedFile} summaries rather than on syntax trees.
  *
- * <p>Implementations: {@link JavaAnalyzer} (JavaParser), {@link TypeScriptAnalyzer} and {@link RustAnalyzer}
- * (tree-sitter, via {@link Syntax}).
+ * <p>Implementations: {@link JavaAnalyzer}, {@link TypeScriptAnalyzer} and {@link RustAnalyzer}, all on tree-sitter
+ * (via {@link Syntax}).
  */
 public interface LanguageSupport {
 

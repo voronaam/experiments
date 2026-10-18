@@ -11,7 +11,7 @@ An interactive 3D "software city" for **Java, TypeScript and Rust** code bases. 
 
 | Night mode | History replay | Walk mode |
 |---|---|---|
-| ![gson at night: lit windows and glowing hot spots](docs/screenshots/night.png) | ![gson in July 2012, half-built, with the replay timeline](docs/screenshots/replay.png) | ![Street-level view in walk mode with the crosshair on a class](docs/screenshots/walk.png) |
+| ![gson at night: lit windows and glowing hot spots](docs/screenshots/night.png) | ![gson growing from 2008 to today in history replay](docs/screenshots/replay.gif) | ![Street-level view in walk mode with the crosshair on a class](docs/screenshots/walk.png) |
 
 * **Packages become districts.** They are stacked platforms, one level per nesting depth. Chains like
   `com → acme → shop` are collapsed, and multi-module builds get one district per module.
@@ -22,14 +22,14 @@ An interactive 3D "software city" for **Java, TypeScript and Rust** code bases. 
   * Footprint = number of attributes.
   * Colour = git churn, recency, author count, open pull requests, complexity, complexity per method, LOC, or type kind.
 
-It is a Java 21 application. It parses Java with JavaParser and TypeScript/Rust with tree-sitter, mines `git log`, and lays the city out with a
+It is a Java 21 application. It parses Java, TypeScript and Rust with tree-sitter, mines `git log`, and lays the city out with a
 skyline bin-packer. You can view the result in two ways:
 
 * **Desktop window** (`--gui`): a native JavaFX 3D application. It needs no browser and no internet connection.
 * **Browser viewer** (default): a WebGL page (Three.js) served on localhost, or exported as a single HTML file.
 
 > **Native editions:** [`rust/`](rust/README.md) and [`d/`](d/README.md) are ports with the same CLI, the same
-> output and the same viewers. They are 10–19× faster and use about a tenth of the memory.
+> output and the same viewers. They are 3–6× faster and use 7–11× less memory.
 
 ## Run
 
@@ -61,7 +61,7 @@ city. The header shows the language mix.
 
 | | Java | TypeScript (`.ts`, `.tsx`, `.mts`, `.cts`) | Rust (`.rs`) |
 |---|---|---|---|
-| Parser | JavaParser | tree-sitter (TypeScript / TSX grammars) | tree-sitter |
+| Parser | tree-sitter (Java grammar) | tree-sitter (TypeScript / TSX grammars) | tree-sitter |
 | Districts | packages; build modules (`…/src/main/java`) | directories; one module per `package.json` project | modules; one module per crate (`Cargo.toml`) |
 | Buildings | classes, interfaces, enums, records, annotations | classes, interfaces, enums, type aliases + one **module** building per file | structs, enums, unions, traits + one **module** building per module |
 | Methods | methods and constructors | methods, arrow-function fields, signatures | everything in `impl` blocks anywhere in the crate (trait impls included), trait methods |
@@ -132,7 +132,7 @@ Differences from the browser viewer:
 
 ### History replay
 
-![History replay of google/gson, paused in July 2012](docs/screenshots/replay.png)
+![History replay of google/gson: 18 years of commits, from the first Java classes in 2008 to today's city](docs/screenshots/replay.gif)
 
 Start with `--history` and press **Replay** (or `R`) to watch the city being built, commit by commit, from the first
 commit to today.
@@ -180,8 +180,9 @@ viewers (browser, and the Java, Rust and D desktop windows) behave the same way.
 | | |
 |---|---|
 | `analysis/SourceAnalyzer` | Walks the tree, parses files in parallel with the right `LanguageSupport` (cached by modification time, so watch-mode rebuilds re-parse only what changed), then links each language. |
-| `analysis/JavaAnalyzer` | JavaParser (Java 25 syntax). Computes NOM, NOA, LOC, WMC and dependencies resolved with Java's own name-lookup rules (no classpath needed). |
+| `analysis/JavaAnalyzer` | tree-sitter-java. Computes NOM, NOA, LOC, WMC and dependencies resolved with Java's own name-lookup rules (no classpath needed). |
 | `analysis/TypeScriptAnalyzer`, `RustAnalyzer` | tree-sitter grammars (natives for Linux, macOS and Windows on x86-64 and ARM are bundled in the jar). They resolve imports and `use` paths, and Rust merges `impl` blocks into their types. |
+| `analysis/NativeLibraries` | Loads CodeCity's own `-O2` build of the tree-sitter core library (with the binding's JNI glue patched to cache class and field lookups) instead of the binding's unoptimised one, which made parsing 3-5x slower. `native/build-tree-sitter.sh` rebuilds it for all five platforms with Zig; the results live in `src/main/resources/native/tree-sitter/lib`. |
 | `github/*` | URL parsing, clone cache, remote detection and the pull-request client (GraphQL with a token, REST without). |
 | `analysis/GitHistory` | One `git log --name-only` pass that collects commits, authors and first/last change per file. |
 | `layout/CityLayout` | Recursive skyline packing that tries several strip widths and keeps the most compact, square result. |

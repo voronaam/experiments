@@ -163,6 +163,27 @@ class WalkerTest {
     }
 
     @Test
+    void mouseAndKeysWorkLikeAShooter() {
+        // Mouse right turns the view clockwise seen from above (from −z towards +x), mouse up looks up.
+        World w = world();
+        Walker p = at(0, 0, 0, w);
+        p.look(100, -100);
+        assertEquals(-0.25, p.yaw, TOL);
+        assertEquals(0.25, p.pitch, TOL);
+        double fx = -Math.sin(p.yaw);
+        double fz = -Math.cos(p.yaw);
+        assertTrue(fx > 0 && fz < 0);
+        // D for 1 s moves along the view's right, forward × up = (−fz, fx) on the ground; W along the view.
+        run(p, new Input(0, 1, false, false), w, 20);
+        assertEquals(-3 * fz, p.x, TOL);
+        assertEquals(3 * fx, p.z, TOL);
+        Walker q = at(0, 0, p.yaw, w);
+        run(q, FORWARD, w, 20);
+        assertEquals(3 * fx, q.x, TOL);
+        assertEquals(3 * fz, q.z, TOL);
+    }
+
+    @Test
     void crosshairHitsTheNearestBox() {
         World w = new World(List.of(new Box(7, -1, -1, -6, 1, -4, 0, 3), new Box(8, -1, -1, -12, 1, -10, 0, 3)), 10, 10);
         Walker p = at(0, 0, 0, w);
