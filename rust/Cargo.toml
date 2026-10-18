@@ -9,7 +9,7 @@ default-run = "codecity"
 [features]
 default = ["gui"]
 # Native desktop window (OpenGL via three-d + egui). Disable for a smaller, faster-to-build CLI.
-gui = ["dep:three-d", "dep:webbrowser"]
+gui = ["dep:three-d", "dep:webbrowser", "dep:winit"]
 
 [dependencies]
 tree-sitter = "=0.27.0"
@@ -25,6 +25,9 @@ ureq = "=3.4.0"
 regex = "1.11"
 three-d = { version = "=0.19.0", optional = true, features = ["egui-gui", "window"] }
 webbrowser = { version = "=1.2.3", optional = true }
+# The windowing library three-d uses (same version, no extra crates). The desktop viewer drives winit's event loop
+# itself, instead of three-d's `Window::render_loop`, to grab the cursor and read raw mouse motion in walk mode.
+winit = { version = "=0.28.7", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

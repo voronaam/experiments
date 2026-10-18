@@ -1,9 +1,19 @@
 //! Source viewer: a light tokenizer (comments, strings, keywords, types, constants, numbers, annotations,
 //! Rust lifetimes) with a GitHub-dark palette, rendered as virtualised rows.
+//!
+//! When a building is opened, `gui/mod.rs` reads the type's source file, runs [`highlight`] once over the whole file
+//! and keeps the result in a [`SourceView`]. The source window then only calls [`layout`] for the rows that are
+//! actually on screen, so even a very long file costs little per frame.
+//!
+//! The tokenizer is deliberately approximate: it works character by character with a few lookaheads, knows no
+//! grammar, and only has to look right, not be right. The one piece of state carried from one line to the next is
+//! an open block comment, text block or template literal. No token ever contains a line break, so the output always
+//! has exactly one [`Line`] per line of input.
 
 use crate::model::Language;
 use three_d::egui::{self, Color32, FontId, TextFormat};
 
+/// Token class; decides only the colour.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Style {
     Plain,
@@ -13,10 +23,12 @@ pub enum Style {
     Str,
     Comment,
     Number,
+    /// Java/TypeScript annotations and decorators, Rust attributes and lifetimes, TypeScript `#private` names.
     Annotation,
 }
 
 impl Style {
+    /// Text colour on the viewer's dark background (colours from GitHub's dark theme).
     fn color(self) -> Color32 {
         match self {
             Style::Plain => Color32::from_rgb(0xc9, 0xd1, 0xd9),
@@ -30,18 +42,25 @@ impl Style {
     }
 }
 
+/// One source line as a run of styled pieces; neighbouring plain text is merged into one piece.
 pub type Line = Vec<(String, Style)>;
 
+/// The open source window: the highlighted file and which part of it belongs to the selected type.
 pub struct SourceView {
     pub title: String,
+    /// Every line of the file, highlighted; index `n` is line `n + 1`.
     pub lines: Vec<Line>,
     /// 1-based line range of the selected type
     pub first: usize,
     pub last: usize,
+    /// Set when the view is created; the first frame scrolls to a few lines above `first` and clears it.
     pub scroll_pending: bool,
+    /// Whether the window is shown; cleared by its close button.
     pub open: bool,
 }
 
+// Keywords per language. Literals (`true`, `false`, `null`, `undefined`) and, for TypeScript and Rust, primitive
+// type names are included so they get the keyword colour rather than plain or type colouring.
 const JAVA: &[&str] = &[
     "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class", "const", "continue", "default",
     "do", "double", "else", "enum", "extends", "final", "finally", "float", "for", "goto", "if", "implements", "import",
@@ -64,6 +83,24 @@ const RUST: &[&str] = &[
     "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64", "bool", "char", "str",
 ];
 
+/// Splits `code` into lines and styles each piece.
+///
+/// Returns one [`Line`] per line of input: a file ending in a newline gets an empty last line. `\r` is dropped, so
+/// CRLF files work. Tokens are recognised in this order at each position:
+///
+/// 1. continuation of a block comment, `"""` text block or template literal opened on an earlier line;
+/// 2. `//` line comments (to the end of the line);
+/// 3. `/*` block comments and `"""` text blocks (Java), which may span lines;
+/// 4. Rust lifetimes (`'a`, `'static`), in Rust code only: a quote followed by a letter or `_` and then not a closing
+///    quote;
+/// 5. string and character literals in `"` or `'`, ending at the matching quote or the end of the line (an
+///    unterminated literal stops before the line break); template literals in `` ` `` may span lines like rule 3;
+/// 6. annotations: `@Name`, `@a.b.Name`, `#name` and attributes `#[...]` / `@[...]` up to the first `]` on the line
+///    (or the end of the line);
+/// 7. words, classified as keyword (from the language's list), constant (at least two characters, starts with a
+///    letter, no lower-case letters: `MAX_SIZE`), type (starts with an upper-case letter) or plain;
+/// 8. numbers: a digit followed by any letters, digits, `.` and `_`, which covers `0x1F`, `1_000`, `2.5f`, `10u8`;
+/// 9. anything else is plain.
 pub fn highlight(code: &str, language: Language) -> Vec<Line> {
     let keywords = match language {
         Language::Java => JAVA,
@@ -75,13 +112,18 @@ pub fn highlight(code: &str, language: Language) -> Vec<Line> {
     let mut lines = vec![];
     let mut line: Line = vec![];
     let mut plain = String::new();
-    let mut mode: Option<Style> = None; // inside a block comment or text block that continues onto the next line
+    // inside a block comment, text block or template literal that may continue onto the next line: its style and
+    // closing delimiter
+    let mut mode: Option<(Style, &str)> = None;
     let mut i = 0;
+    // Plain characters are collected in `plain` and only pushed as one piece when a styled token or the end of the
+    // line follows.
     let flush = |plain: &mut String, line: &mut Line| {
         if !plain.is_empty() {
             line.push((std::mem::take(plain), Style::Plain));
         }
     };
+    // Whether the text at position `i` starts with `s`; false near the end instead of panicking.
     let starts = |i: usize, s: &str| s.chars().enumerate().all(|(k, c)| chars.get(i + k) == Some(&c));
     while i < n {
         let c = chars[i];
@@ -95,11 +137,13 @@ pub fn highlight(code: &str, language: Language) -> Vec<Line> {
             i += 1;
             continue;
         }
-        if let Some(style) = mode {
-            let close = if style == Style::Comment { "*/" } else { "\"\"\"" };
+        // Inside a multi-line comment, text block or template literal: everything up to the closing delimiter
+        // (inclusive) or the end of this line is one piece; if the line ends first, `mode` stays set for the next line.
+        // In literals a backslash skips the next character (but never the line break).
+        if let Some((style, close)) = mode {
             let mut j = i;
             while j < n && chars[j] != '\n' && !starts(j, close) {
-                j += 1;
+                j += if style == Style::Str && chars[j] == '\\' && chars.get(j + 1).is_some_and(|&c| c != '\n') { 2 } else { 1 };
             }
             if j < n && starts(j, close) {
                 j += close.len();
@@ -109,6 +153,7 @@ pub fn highlight(code: &str, language: Language) -> Vec<Line> {
             i = j;
             continue;
         }
+        // Identifier characters; `$` is legal in Java and TypeScript identifiers.
         let ident = |i: usize| chars.get(i).is_some_and(|c| c.is_alphanumeric() || *c == '_' || *c == '$');
         if starts(i, "//") {
             flush(&mut plain, &mut line);
@@ -120,15 +165,20 @@ pub fn highlight(code: &str, language: Language) -> Vec<Line> {
             i = j;
         } else if starts(i, "/*") {
             flush(&mut plain, &mut line);
-            mode = Some(Style::Comment);
+            mode = Some((Style::Comment, "*/"));
             line.push(("/*".into(), Style::Comment));
             i += 2;
         } else if starts(i, "\"\"\"") {
             flush(&mut plain, &mut line);
-            mode = Some(Style::Str);
+            mode = Some((Style::Str, "\"\"\""));
             line.push(("\"\"\"".into(), Style::Str));
             i += 3;
-        } else if c == '\'' && i + 2 < n && (chars[i + 1].is_alphabetic() || chars[i + 1] == '_') && chars[i + 2] != '\'' {
+        } else if c == '`' {
+            flush(&mut plain, &mut line);
+            mode = Some((Style::Str, "`"));
+            line.push(("`".into(), Style::Str));
+            i += 1;
+        } else if language == Language::Rust && c == '\'' && i + 2 < n && (chars[i + 1].is_alphabetic() || chars[i + 1] == '_') && chars[i + 2] != '\'' {
             // a Rust lifetime such as 'a or 'static, not a character literal
             flush(&mut plain, &mut line);
             let mut j = i + 1;
@@ -137,23 +187,32 @@ pub fn highlight(code: &str, language: Language) -> Vec<Line> {
             }
             line.push((chars[i..j].iter().collect(), Style::Annotation));
             i = j;
-        } else if c == '"' || c == '\'' || c == '`' {
+        } else if c == '"' || c == '\'' {
             flush(&mut plain, &mut line);
             let mut j = i + 1;
+            // A backslash skips the next character, so escaped quotes do not end the literal; a backslash right before
+            // the line break does not skip it.
             while j < n && chars[j] != c && chars[j] != '\n' {
-                j += if chars[j] == '\\' { 2 } else { 1 };
+                j += if chars[j] == '\\' && chars.get(j + 1).is_some_and(|&c| c != '\n') { 2 } else { 1 };
             }
-            j = (j + 1).min(n);
+            // Include the closing quote; an unterminated literal ends before the line break.
+            if j < n && chars[j] == c {
+                j += 1;
+            }
             line.push((chars[i..j].iter().collect(), Style::Str));
             i = j;
         } else if (c == '@' || c == '#') && i + 1 < n && (chars[i + 1].is_alphabetic() || chars[i + 1] == '[') {
             flush(&mut plain, &mut line);
             let mut j = i + 1;
+            // `#[derive(...)]`: up to the first `]` (a nested `]` ends it early) or the end of the line. Otherwise a
+            // dotted name.
             if chars[j] == '[' {
                 while j < n && chars[j] != ']' && chars[j] != '\n' {
                     j += 1;
                 }
-                j = (j + 1).min(n);
+                if j < n && chars[j] == ']' {
+                    j += 1;
+                }
             } else {
                 while ident(j) || chars.get(j) == Some(&'.') {
                     j += 1;
@@ -169,6 +228,7 @@ pub fn highlight(code: &str, language: Language) -> Vec<Line> {
             let word: String = chars[i..j].iter().collect();
             let style = if keywords.contains(&word.as_str()) {
                 Some(Style::Keyword)
+            // `word == word.to_uppercase()` holds when there are no lower-case letters; digits and `_` are allowed.
             } else if word.chars().count() > 1 && word.chars().next().is_some_and(char::is_alphabetic) && word == word.to_uppercase() {
                 Some(Style::Constant)
             } else if word.chars().next().is_some_and(char::is_uppercase) {
@@ -181,6 +241,7 @@ pub fn highlight(code: &str, language: Language) -> Vec<Line> {
                     flush(&mut plain, &mut line);
                     line.push((word, s));
                 }
+                // Ordinary identifiers stay part of the surrounding plain run.
                 None => plain.push_str(&word),
             }
             i = j;
@@ -202,6 +263,8 @@ pub fn highlight(code: &str, language: Language) -> Vec<Line> {
     lines
 }
 
+/// Builds the egui text for one row: the line number right-aligned in a `digits`-wide grey gutter, three spaces,
+/// then the styled pieces, all in `font`.
 pub fn layout(line: &Line, number: usize, digits: usize, font: &FontId) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let gutter = TextFormat { font_id: font.clone(), color: Color32::from_rgb(0x6e, 0x76, 0x81), ..Default::default() };
@@ -228,5 +291,19 @@ mod tests {
         assert!(find(&lines[2], "C_MAX") == Some(Style::Constant));
         assert!(find(&lines[2], "\"q\"") == Some(Style::Str));
         assert!(find(&lines[2], "42") == Some(Style::Number));
+    }
+
+    #[test]
+    fn line_breaks_never_swallowed() {
+        let code = "let a = \"open\n#[derive(X\nlet b = \"x\\\nconst T = `a\nb` + 'react';\nC_MAX";
+        let lines = highlight(code, Language::TypeScript);
+        assert_eq!(lines.len(), code.lines().count());
+        for (line, text) in lines.iter().zip(code.lines()) {
+            assert_eq!(line.iter().map(|(s, _)| s.as_str()).collect::<String>(), text);
+        }
+        let find = |l: &Line, t: &str| l.iter().find(|(s, _)| s == t).map(|(_, st)| *st);
+        assert!(find(&lines[4], "b`") == Some(Style::Str));
+        assert!(find(&lines[4], "'react'") == Some(Style::Str));
+        assert!(find(&lines[5], "C_MAX") == Some(Style::Constant));
     }
 }

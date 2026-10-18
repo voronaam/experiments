@@ -18,7 +18,23 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 
-/** Command-line entry point. */
+/**
+ * Command-line entry point. It parses the options, then runs the whole pipeline once:
+ *
+ * <pre>
+ *   [clone GitHub repo] → walk + parse/analyse → link dependencies → git history → layout → CityModel
+ *                                                                                                │
+ *                  ┌──────────────────────────────┬──────────────────────────────────────────────┤
+ *            --export FILE                  (default)                                        --gui
+ *        HtmlExporter (JSON inlined)   CityServer (JSON over HTTP) + browser    DesktopApp (reads the model directly)
+ * </pre>
+ *
+ * Everything up to the {@link CityModel} is done by {@link CityModel#build}; this class only decides which viewer
+ * gets the result. With {@code --watch}, a {@link SourceWatcher} calls {@code CityModel.build} again on its own
+ * background thread whenever a source file changes and hands the new model to the running viewer, which swaps it in.
+ * The GitHub context (remote, permalink ref, open pull requests) is fetched only once at start-up and reused for every
+ * rebuild.
+ */
 public final class CodeCity {
 
     private static final String USAGE = """
@@ -52,6 +68,11 @@ public final class CodeCity {
             gh CLI) to fetch every open PR; without a token only the most recent ~30 are loaded.
             """;
 
+    /**
+     * The parsed command line. Exactly one of {@code root} (a local directory, already resolved to its real path) and
+     * {@code remote} (a GitHub repository still to be cloned) is set; {@link #withRoot} turns the latter into the
+     * former once the clone exists.
+     */
     record Options(Path root, GitHubRepo remote, int port, boolean watch, boolean includeTests, boolean git,
                    boolean github, boolean open, Path export, boolean gui) {
         Options withRoot(Path dir) {
@@ -59,6 +80,11 @@ public final class CodeCity {
         }
     }
 
+    /**
+     * Runs the tool. Exit codes: 0 on success (or after {@code --help}), 1 when a clone or the desktop window cannot be
+     * set up, 2 for a bad command line. In server mode this method never returns: the main thread parks forever and
+     * the process ends with Ctrl+C, which runs the shutdown hook that closes the server.
+     */
     public static void main(String[] args) throws Exception {
         Options opts;
         try {
@@ -85,8 +111,11 @@ public final class CodeCity {
         }
         GitHubInfo github = opts.github() ? loadGitHub(opts.root()) : null;
 
+        // One analyser for the first build and every watch-mode rebuild; its isSource() also tells the watcher which
+        // file changes matter.
         SourceAnalyzer analyzer = new SourceAnalyzer();
         System.out.println("Analysing " + opts.root() + " …");
+        // An effectively final copy, so the watcher lambdas below can capture it.
         Options o = opts;
         CityModel model = CityModel.build(analyzer, o.root(), o.includeTests(), o.git(), github);
         printSummary(model);
@@ -110,6 +139,8 @@ public final class CodeCity {
         System.out.println("CodeCity is live at " + server.url() + "  (Ctrl+C to stop)");
 
         if (opts.watch()) {
+            // The callback runs on the watcher's own (debounced) thread. A failed rebuild only logs: the viewer keeps
+            // showing the last good city.
             SourceWatcher watcher = new SourceWatcher(o.root(), analyzer::isSource, () -> {
                 try {
                     CityModel next = CityModel.build(analyzer, o.root(), o.includeTests(), o.git(), github);
@@ -126,9 +157,18 @@ public final class CodeCity {
             openBrowser(server.url());
         }
         Runtime.getRuntime().addShutdownHook(new Thread(server::close));
+        // Joining the current thread never returns; the HTTP server and watcher do their work on other threads.
         Thread.currentThread().join();
     }
 
+    /**
+     * Parses the command line. Returns null for {@code --help}; throws {@link IllegalArgumentException} with a message
+     * for the user on any error.
+     *
+     * <p>A positional argument is treated as a GitHub repository only when it is not an existing directory, so a
+     * local folder that happens to be called e.g. {@code github:x} still wins. A local path defaults to the current
+     * directory and is resolved to its real path (symlinks followed).
+     */
     static Options parse(String[] args) {
         Path root = null;
         GitHubRepo remote = null;
@@ -147,7 +187,12 @@ public final class CodeCity {
                 case "-h", "--help" -> {
                     return null;
                 }
-                case "-p", "--port" -> port = Integer.parseInt(require(rest, a));
+                case "-p", "--port" -> {
+                    port = Integer.parseInt(require(rest, a));
+                    if (port < 0 || port > 65535) {
+                        throw new IllegalArgumentException("invalid port");
+                    }
+                }
                 case "-w", "--watch" -> watch = true;
                 case "-g", "--gui" -> gui = true;
                 case "--no-tests" -> tests = false;
@@ -186,7 +231,12 @@ public final class CodeCity {
         return new Options(dir, null, port, watch, tests, git, github, open, export, gui);
     }
 
-    /** Native window mode: no HTTP server and no browser; blocks until the window is closed. */
+    /**
+     * Native window mode: no HTTP server and no browser; blocks until the window is closed. The watcher is started
+     * before the window, because {@link DesktopApp#launch} does not return until the window closes;
+     * {@link DesktopApp#update} hands each rebuilt model over to the JavaFX thread. {@code System.exit} at the end
+     * also stops the watcher's thread.
+     */
     private static void runDesktop(Options o, SourceAnalyzer analyzer, CityModel model, GitHubInfo github)
             throws IOException {
         if (!DesktopApp.displayAvailable()) {
@@ -212,6 +262,11 @@ public final class CodeCity {
         System.exit(0);
     }
 
+    /**
+     * Detects the GitHub remote of {@code root} and fetches its open pull requests. Returns null when there is no
+     * GitHub remote (the viewers then show no GitHub links at all), and a {@link GitHubInfo} without pulls when the
+     * fetch failed (links, but no PR overlay).
+     */
     private static GitHubInfo loadGitHub(Path root) {
         Optional<GitHubInfo> detected = GitHubInfo.detect(root);
         if (detected.isEmpty()) {
@@ -245,6 +300,11 @@ public final class CodeCity {
                 model.buildMillis());
     }
 
+    /**
+     * Opens {@code url} in the default browser: through AWT's {@link Desktop} where it is supported, otherwise with
+     * the platform's own launcher ({@code open}, {@code rundll32} or {@code xdg-open}). Failures are ignored, since
+     * the URL has already been printed.
+     */
     private static void openBrowser(String url) {
         try {
             if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {

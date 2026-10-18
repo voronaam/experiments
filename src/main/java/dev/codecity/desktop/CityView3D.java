@@ -11,6 +11,7 @@ import javafx.scene.DirectionalLight;
 import javafx.scene.Group;
 import javafx.scene.Node;
 import javafx.scene.PerspectiveCamera;
+import javafx.scene.Cursor;
 import javafx.scene.SceneAntialiasing;
 import javafx.scene.SubScene;
 import javafx.scene.control.Label;
@@ -18,6 +19,7 @@ import javafx.scene.image.PixelWriter;
 import javafx.scene.image.WritableImage;
 import javafx.scene.input.MouseButton;
 import javafx.scene.input.PickResult;
+import javafx.scene.robot.Robot;
 import javafx.scene.layout.Pane;
 import javafx.scene.paint.Color;
 import javafx.scene.paint.PhongMaterial;
@@ -30,7 +32,9 @@ import javafx.scene.transform.Rotate;
 import javafx.scene.transform.Translate;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.IntPredicate;
 
 /**
@@ -38,17 +42,60 @@ import java.util.function.IntPredicate;
  * building's colour is a cell in a palette texture, so recolouring never touches geometry.
  *
  * <p>JavaFX's y axis points down, so world heights are negated here.
+ *
+ * <h2>Meshes</h2>
+ * Building {@code i} is box {@code i} of the building mesh: points {@code 8i .. 8i+7} and triangles
+ * {@code FACES*i .. FACES*i + FACES-1}. That fixed layout is what makes the rest cheap:
+ * <ul>
+ *   <li>Heights change by rewriting the point array only ({@link #writeBuildings}); faces never change.</li>
+ *   <li>Colours: every triangle of box {@code i} uses texture coordinate {@code i}, which points at the centre of
+ *       cell {@code i} of a palette image ({@link #palette}). Recolouring replaces the image.</li>
+ *   <li>Picking: a {@link PickResult} gives the face index, and {@code face / FACES} is the building
+ *       ({@link #pick}).</li>
+ * </ul>
+ * Districts use the same scheme, except that a palette cell stands for a nesting depth instead of a single district.
+ *
+ * <h2>Coordinates</h2>
+ * Layout coordinates are used unchanged for x and z ({@link CityLayout}: the city is centred on the origin); y is the
+ * negated layout height. The camera orbits a target point: its transform chain is
+ * {@code target → yaw → pitch → dolly}, i.e. move to the target, turn around the vertical axis, tilt, then back off
+ * along the view axis by the dolly distance. Negative pitch angles look down on the city.
+ *
+ * <h2>Animation</h2>
+ * An {@link AnimationTimer} calls {@link #tick} once per frame on the JavaFX thread. It advances camera flights,
+ * height transitions, the dots travelling along dependency arcs and the bobbing PR beacons, and keeps the 2D district
+ * labels pinned to their 3D anchors. Every method of this class must be called on the JavaFX thread.
+ *
+ * <h2>Walk mode</h2>
+ * While walking ({@link #enterWalk}), the orbit chain is reused as a first-person camera: the target is the eye, the
+ * dolly is 0, and yaw/pitch come from the {@link Walker}. JavaFX has no pointer lock, so the cursor is hidden and a
+ * {@link Robot} puts it back in the middle of the view every frame; how far it had moved from there is the look delta.
+ * Mouse events are ignored while walking (including the synthetic move the recentring causes), except a primary press,
+ * which selects what the crosshair points at. The crosshair target is found by casting the view ray against the
+ * walker's boxes ({@link Walker#target}) rather than by JavaFX picking, which only works at the cursor.
+ *
+ * <p>The web viewer draws the same scene with three.js instancing instead.
  */
 final class CityView3D {
 
     /** Faces per box: the bottom is never visible and is left out. */
     private static final int FACES = 10;
+    /**
+     * Pixel size of one palette cell. Texture coordinates point at a cell's centre, so the cell must be wide enough
+     * that texture filtering never blends in a neighbouring colour.
+     */
     private static final int CELL = 16;
+    /** Palette cells per texture row: rows are 64 × 16 = 1024 px wide, and as many rows are added as needed. */
     private static final int CELLS_PER_ROW = 64;
     /** Corner triples for the ten faces of a unit box, wound so normals point outwards. */
     private static final int[][] TRIANGLES = boxTriangles();
+    /**
+     * Which of the five visible sides each triangle belongs to. Each side gets its own smoothing group, so normals are
+     * not averaged across a box edge and the boxes are shaded flat with crisp edges.
+     */
     private static final int[] SIDE_OF_TRIANGLE = {0, 0, 1, 1, 2, 2, 3, 3, 4, 4};
 
+    /** Callbacks to the window; building and district indices are -1 for "none". */
     interface Listener {
         void hover(int building, int district, double sceneX, double sceneY);
 
@@ -81,21 +128,32 @@ final class CityView3D {
     private TriangleMesh buildingMesh;
     private MeshView buildingsView;
     private MeshView districtsView;
+    /** Point buffer of the building mesh, rewritten while heights animate and copied into the mesh in one go. */
     private float[] points = new float[0];
+    /** Current, start and target height per building (world units); see {@link #setHeights}. */
     private double[] heights = new double[0];
     private double[] heightsFrom = new double[0];
     private double[] heightsTo = new double[0];
+    /** Start time ({@link System#nanoTime}) and length in seconds of the height animation; 0 when none is running. */
     private long heightStart;
     private double heightDuration;
+    /** Half the city's diagonal, at least 20. Far plane, ground size, zoom limit and default distance scale with it. */
     private double radius = 50;
     private Look.Theme theme = Look.Theme.DAY;
 
+    /**
+     * A dependency arc: quadratic Bézier from {@code p0} via control point {@code p1} to {@code p2}, and the dot that
+     * travels along it. {@code t} is a one-element array so the record can hold the dot's mutable position on the
+     * curve (0..1); {@code speed} is in curve fractions per second.
+     */
     private record Arc(Point3D p0, Point3D p1, Point3D p2, Sphere dot, double speed, double[] t) {
     }
 
     private final List<Arc> arcs = new ArrayList<>();
+    /** Building index of each beacon; entry {@code k} belongs to child {@code k} of {@link #beaconGroup}. */
     private final List<Integer> beaconBuildings = new ArrayList<>();
     private boolean beaconsVisible = true;
+    /** A 2D district label and the world point it is pinned to (the front edge of the district, on top of it). */
     private record LabelAnchor(Label label, Point3D at) {
     }
 
@@ -104,25 +162,45 @@ final class CityView3D {
 
     private Flight flight;
 
+    /**
+     * A camera move in progress: orbit target, dolly distance and pitch (in degrees below the horizon) are
+     * interpolated; the yaw is left alone.
+     */
     private record Flight(long start, double duration, Point3D fromTarget, Point3D toTarget, double fromDist,
-                          double toDist) {
+                          double toDist, double fromPitch, double toPitch) {
     }
 
+    /** Where the mouse button went down (to tell a click from a drag) and where the last drag event was. */
     private double pressX;
     private double pressY;
     private double lastX;
     private double lastY;
 
+    /** Walk mode state: the walker, or null while orbiting, and the orbit camera to restore afterwards. */
+    private Walker walker;
+    private double[] savedOrbit;
+    private Walker.Input walkInput = Walker.Input.NONE;
+    private Robot robot;
+    /** False until the cursor has been centred once after entering, so its starting offset is not taken as a look. */
+    private boolean recentred;
+    /** What the crosshair pointed at last frame, to report hover changes only. */
+    private int aimBuilding = -1;
+    private int aimDistrict = -1;
+
     CityView3D(Pane labelLayer, Listener listener) {
         this.labelLayer = labelLayer;
         this.listener = listener;
+        // Same field of view and near plane as the web viewer's camera.
         camera.setFieldOfView(42);
         camera.setNearClip(0.3);
         camera.getTransforms().addAll(target, yaw, pitch, dolly);
 
         ground.setMaterial(groundMaterial);
+        // The 0.1-thick ground slab spans y = 0.01 .. 0.11, i.e. just below the city's base at y = 0 (y points
+        // down), so its top never z-fights with the bottom of the lowest platform.
         ground.setTranslateY(0.06);
         ground.setMouseTransparent(true);
+        // Key light from above (positive y is down), fill light from a lower, opposite angle.
         key.setDirection(new Point3D(-0.45, 1, -0.6));
         fill.setDirection(new Point3D(0.6, 0.35, 0.8));
         buildingMaterial.setSpecularColor(Color.gray(0.18));
@@ -148,18 +226,34 @@ final class CityView3D {
 
     // ------------------------------------------------------------------ model
 
+    /**
+     * Replaces the city. Both meshes are rebuilt from scratch, as are labels and beacons; arcs are cleared.
+     *
+     * <p>With {@code keepCamera} (a live rebuild) the camera stays where it is and the current heights are carried
+     * over by fully qualified name (indices are not stable across rebuilds), so the caller's next {@link #setHeights}
+     * animates from what is on screen; new types start at 0. Without it, heights start at 0 and the camera frames the
+     * whole city. Either way the targets are 0 until the caller
+     * calls {@link #setHeights}.
+     */
     void setModel(CityModel next, boolean keepCamera) {
+        Map<String, Double> previous = new HashMap<>();
+        if (keepCamera && model != null) {
+            for (int i = 0; i < heights.length; i++) {
+                previous.put(model.buildings().get(i).type().fqn(), heights[i]);
+            }
+        }
         this.model = next;
         world.getChildren().removeIf(n -> n == buildingsView || n == districtsView);
         int n = next.buildings().size();
-        double[] previous = heights;
         heights = new double[n];
         heightsFrom = new double[n];
         heightsTo = new double[n];
-        if (keepCamera) {
-            System.arraycopy(previous, 0, heights, 0, Math.min(previous.length, n));
+        for (int i = 0; i < n; i++) {
+            heights[i] = previous.getOrDefault(next.buildings().get(i).type().fqn(), 0.0);
         }
 
+        // Everything scales with the city's radius: the ground slab reaches 7 radii out in every direction, the zoom
+        // limit is 6 radii and the far plane, at 30 radii, lies beyond both.
         radius = Math.max(20, Math.hypot(next.width(), next.depth()) / 2);
         camera.setFarClip(radius * 30);
         ground.setWidth(radius * 14);
@@ -173,6 +267,7 @@ final class CityView3D {
         buildingsView = new MeshView(buildingMesh);
         buildingsView.setMaterial(buildingMaterial);
         buildingsView.setCullFace(CullFace.BACK);
+        // Inserted before the ground, arcs and beacons in child order.
         world.getChildren().addAll(0, List.of(districtsView, buildingsView));
 
         buildLabels();
@@ -184,6 +279,20 @@ final class CityView3D {
         }
     }
 
+    /**
+     * The ten triangles of a box without its bottom: two per side, top first, then the sides at x = 0, x = 1, z = 0
+     * and z = 1 (the order {@link #SIDE_OF_TRIANGLE} relies on). Winding is computed rather than written out, see
+     * {@link #wind}.
+     *
+     * <pre>
+     *        6 ──── 7        corner k:  x = bit 0,  z = bit 1,  top = bit 2
+     *       /│     /│
+     *      4 ──── 5 │        top    4 5 7 6
+     *      │ 2 ───│ 3        x = 0  0 2 6 4      z = 0  0 1 5 4
+     *      │/     │/         x = 1  1 3 7 5      z = 1  2 3 7 6
+     *      0 ──── 1
+     * </pre>
+     */
     private static int[][] boxTriangles() {
         // Corner k: x = k & 1, z = (k >> 1) & 1, top = k >> 2 (JavaFX y = -1 at the top).
         int[][] quads = {{4, 5, 7, 6}, {0, 2, 6, 4}, {1, 3, 7, 5}, {0, 1, 5, 4}, {2, 3, 7, 6}};
@@ -201,7 +310,10 @@ final class CityView3D {
         return new double[]{k & 1, (k >> 2) == 1 ? -1 : 0, (k >> 1) & 1};
     }
 
-    /** Orders a triangle so that the right-hand normal (b - a) x (c - a) points along {@code out}. */
+    /**
+     * Orders a triangle so that the right-hand normal (b - a) x (c - a) points along {@code out}. The meshes are drawn
+     * with {@link CullFace#BACK}, and this consistent outward winding is what keeps the outside faces visible.
+     */
     private static int[] wind(int a, int b, int c, double[] out) {
         double[] pa = corner(a);
         double[] pb = corner(b);
@@ -213,7 +325,16 @@ final class CityView3D {
         return dot > 0 ? new int[]{a, b, c} : new int[]{a, c, b};
     }
 
-    /** One box per item; texture coordinate {@code i} addresses palette cell {@code i}. */
+    /**
+     * One box per item; texture coordinate {@code i} addresses palette cell {@code i}.
+     *
+     * <p>The faces array uses JavaFX's default {@code POINT_TEXCOORD} format: six ints per triangle,
+     * {@code p0 t0 p1 t1 p2 t2}. Here every texture index is left at 0; callers fill the odd slots with the palette
+     * cell of each box. All points start at the origin (degenerate boxes) until written by {@link #writeBox}.
+     *
+     * @param count number of boxes
+     * @param cells number of palette cells the texture coordinates must address
+     */
     private static TriangleMesh boxMesh(int count, int cells) {
         TriangleMesh mesh = new TriangleMesh();
         float[] tex = new float[cells * 2];
@@ -243,6 +364,10 @@ final class CityView3D {
         return mesh;
     }
 
+    /**
+     * Writes the eight corners of box {@code box} into {@code pts} (three floats each), using the corner numbering of
+     * {@link #boxTriangles}. {@code y0}/{@code y1} are world heights (up positive); they are negated here.
+     */
     private static void writeBox(float[] pts, int box, double x0, double z0, double x1, double z1, double y0, double y1) {
         for (int k = 0; k < 8; k++) {
             int o = (box * 8 + k) * 3;
@@ -252,6 +377,11 @@ final class CityView3D {
         }
     }
 
+    /**
+     * One box per district, {@link CityLayout#PLATFORM} thick and stacked by depth. Each district's faces use the
+     * palette cell of its depth, clamped to the last theme colour, so the theme can recolour all platforms by swapping
+     * one small texture.
+     */
     private TriangleMesh districtMesh(List<CityLayout.District> districts) {
         int levels = theme.districts.length;
         TriangleMesh mesh = boxMesh(districts.size(), levels);
@@ -263,6 +393,7 @@ final class CityView3D {
             writeBox(pts, i, d.x() - d.w() / 2, d.z() - d.d() / 2, d.x() + d.w() / 2, d.z() + d.d() / 2,
                     y0, y0 + CityLayout.PLATFORM);
             int cell = Math.min(d.depth(), levels - 1);
+            // Odd slots of the face array are texture-coordinate indices (see boxMesh).
             for (int k = i * FACES * 6 + 1; k < (i + 1) * FACES * 6; k += 2) {
                 faces[k] = cell;
             }
@@ -272,7 +403,12 @@ final class CityView3D {
         return mesh;
     }
 
+    /**
+     * One box per building with its own palette cell. Points are not written here: they depend on the animated heights
+     * and are filled in by {@link #writeBuildings} on the next frames.
+     */
     private TriangleMesh buildingMesh(List<Building> buildings) {
+        // An empty city still gets one (degenerate) box, so the mesh and palette are never empty; pick() ignores it.
         int n = Math.max(1, buildings.size());
         TriangleMesh mesh = boxMesh(n, n);
         int[] faces = mesh.getFaces().toArray(null);
@@ -288,7 +424,10 @@ final class CityView3D {
 
     // ------------------------------------------------------------------ heights & colours
 
-    /** Animates buildings to new heights; {@code rise} grows the whole city from the ground. */
+    /**
+     * Animates buildings to new heights; {@code rise} grows the whole city from the ground. A new call interrupts a
+     * running animation and continues from the current heights. Durations (1.4 s, 0.65 s) match the web viewer.
+     */
     void setHeights(double[] targets, boolean rise) {
         heightsFrom = rise ? new double[targets.length] : heights.clone();
         heightsTo = targets.clone();
@@ -296,6 +435,7 @@ final class CityView3D {
         heightDuration = rise ? 1.4 : 0.65;
     }
 
+    /** Target height of building {@code i}: where it is going, not where an animation has it right now. */
     double heightOf(int i) {
         return i < heightsTo.length ? heightsTo[i] : 0;
     }
@@ -304,6 +444,10 @@ final class CityView3D {
         return radius;
     }
 
+    /**
+     * Rewrites every building box from the current heights and uploads all points at once. A building with (almost)
+     * no height also gets a zero footprint, so hidden buildings vanish completely and cannot be picked.
+     */
     private void writeBuildings() {
         List<Building> buildings = model.buildings();
         for (int i = 0; i < buildings.size(); i++) {
@@ -315,11 +459,22 @@ final class CityView3D {
         buildingMesh.getPoints().set(0, points, 0, points.length);
     }
 
+    /**
+     * Sets building colours ({@code colors[i]} for building {@code i}) by replacing the palette texture. In a theme
+     * with
+     * {@link Look.Theme#glow}, a darkened copy also becomes the self-illumination map, so buildings glow in their own
+     * colour at night. Must be called again after {@link #applyTheme}, which does not touch building colours.
+     */
     void setColors(Color[] colors) {
         buildingMaterial.setDiffuseMap(palette(colors, 1));
         buildingMaterial.setSelfIlluminationMap(theme.glow > 0 ? palette(colors, theme.glow) : null);
     }
 
+    /**
+     * Paints colour {@code i}, multiplied by {@code scale}, into a solid {@code CELL × CELL} square at cell {@code i};
+     * the layout must match the texture coordinates made by {@link #boxMesh}. Both derive the row count from the
+     * number of cells, so the caller must pass as many colours as the mesh has cells (at least the same row count).
+     */
     private static WritableImage palette(Color[] colors, double scale) {
         int cells = Math.max(1, colors.length);
         int rows = (cells + CELLS_PER_ROW - 1) / CELLS_PER_ROW;
@@ -339,6 +494,7 @@ final class CityView3D {
         return img;
     }
 
+    /** Background, lights, ground and district colours for {@code t}; building colours follow in {@link #setColors}. */
     void applyTheme(Look.Theme t) {
         this.theme = t;
         subScene.setFill(t.background);
@@ -352,6 +508,12 @@ final class CityView3D {
 
     // ------------------------------------------------------------------ labels
 
+    /**
+     * Picks which districts get a floating name label. Candidates are the districts at depth 1 and 2 that contain
+     * types, largest area first, at most 24 of them; a candidate is skipped when its anchor would sit within 8 units
+     * along x and 3 along z of an existing one, and at most 16 labels are kept. The rest of the city stays unlabelled
+     * to avoid clutter (hovering a district shows its name instead).
+     */
     private void buildLabels() {
         labels.forEach(l -> labelLayer.getChildren().remove(l.label()));
         labels.clear();
@@ -381,14 +543,21 @@ final class CityView3D {
         labelsVisible = visible;
     }
 
+    /**
+     * Projects each label's 3D anchor onto the label layer and centres the label just above that point. A label is
+     * hidden when its anchor lies behind the camera (camera-space z ≤ 0; the JavaFX camera looks along +z), where
+     * the projection would otherwise mirror it onto the screen.
+     */
     private void placeLabels() {
         for (LabelAnchor a : labels) {
             Point3D inCamera = camera.sceneToLocal(world.localToScene(a.at()));
-            boolean show = labelsVisible && inCamera != null && inCamera.getZ() > 0;
+            // Hidden while walking: at street level they would show through the buildings in front of them.
+            boolean show = labelsVisible && walker == null && inCamera != null && inCamera.getZ() > 0;
             a.label().setVisible(show);
             if (!show) {
                 continue;
             }
+            // rootScene = true projects through the SubScene's camera into the enclosing Scene's 2D coordinates.
             Point3D onScreen = world.localToScene(a.at(), true);
             Point2D local = labelLayer.sceneToLocal(onScreen.getX(), onScreen.getY());
             a.label().autosize();
@@ -398,10 +567,15 @@ final class CityView3D {
 
     // ------------------------------------------------------------------ arcs & beacons
 
-    /** Draws dependency arcs for the selection: orange to what it uses, blue from what uses it. */
+    /**
+     * Draws dependency arcs for the selection: orange to what it uses, blue from what uses it. Only edges whose both
+     * ends are visible are kept, and of those at most 200 per direction are drawn; past 40 edges in total (visible or not) the tubes get thinner.
+     * Arcs connect roof tops at the target heights, so they are drawn where the buildings end up even while heights
+     * are still animating. A negative {@code selected} just clears the arcs.
+     */
     void showArcs(int selected, IntPredicate visible) {
         clearArcs();
-        if (selected < 0) {
+        if (selected < 0 || !visible.test(selected)) {
             return;
         }
         Building b = model.buildings().get(selected);
@@ -429,11 +603,20 @@ final class CityView3D {
         return new Point3D(lot.x(), -(lot.y() + heightOf(i)), lot.z());
     }
 
+    /**
+     * Adds one arc: a Bézier curve record for {@link #addTubes} ({@code x,y,z} of the three control points and the
+     * tube radius) and a glowing dot that {@link #tick} moves along the curve. The control point sits above the
+     * midpoint, higher than the taller roof by 35% of the distance plus 2 units, so long arcs rise higher and
+     * neighbours still get a visible hump. Dot speed is chosen so that the dot covers roughly the same world distance
+     * per second on any arc, with short arcs not getting faster than 2.8 laps per second; a random phase keeps
+     * the dots from moving in lockstep.
+     */
     private void addArc(int from, int to, Color color, List<double[]> curves, int total) {
         Point3D p0 = topOf(from);
         Point3D p2 = topOf(to);
         double dist = p0.distance(p2);
         Point3D mid = p0.midpoint(p2);
+        // Math.min of y is the taller roof, and subtracting moves up, because y points down.
         Point3D p1 = new Point3D(mid.getX(), Math.min(p0.getY(), p2.getY()) - dist * 0.35 - 2, mid.getZ());
         curves.add(new double[]{p0.getX(), p0.getY(), p0.getZ(), p1.getX(), p1.getY(), p1.getZ(),
                 p2.getX(), p2.getY(), p2.getZ(), (total > 40 ? 0.03 : 0.055) + dist * 0.0005});
@@ -443,6 +626,7 @@ final class CityView3D {
         arcs.add(new Arc(p0, p1, p2, dot, 14 / Math.max(5, dist * 1.2), new double[]{Math.random()}));
     }
 
+    /** Point at {@code t} on the quadratic Bézier curve: (1-t)²·p0 + 2(1-t)t·p1 + t²·p2. */
     private static Point3D bezier(Point3D p0, Point3D p1, Point3D p2, double t) {
         double a = (1 - t) * (1 - t);
         double b = 2 * (1 - t) * t;
@@ -452,13 +636,28 @@ final class CityView3D {
                 a * p0.getZ() + b * p1.getZ() + c * p2.getZ());
     }
 
-    /** All arcs of one colour as a single mesh of thin square tubes. */
+    /**
+     * All arcs of one colour as a single mesh of thin square tubes.
+     *
+     * <p>Each curve is sampled at 25 points ({@code segments = 24}). At every sample a ring of four vertices is placed
+     * around the curve, at ±u and ±v, where u is perpendicular to the tangent and horizontal (tangent × y) and v is
+     * perpendicular to both; a vertical tangent, where that cross product vanishes, falls back to the x axis.
+     * Consecutive rings are joined by four quads (two triangles each). The tangent is a central difference over
+     * ±0.01 in t. Winding is not consistent around the tube, so back-face culling is off.
+     *
+     * <pre>
+     *   ring k+1:  d ── c2        quad per side s: (a, b, c2) + (a, c2, d)
+     *              │  ╱ │
+     *   ring k:    a ── b         a = ring k corner s, b = ring k corner s+1
+     * </pre>
+     */
     private void addTubes(List<double[]> curves, Color color) {
         if (curves.isEmpty()) {
             return;
         }
         final int segments = 24;
         TriangleMesh mesh = new TriangleMesh();
+        // A single texture coordinate: the colour comes from the 1×1 self-illumination map of glow().
         mesh.getTexCoords().setAll(0, 0);
         float[] pts = new float[curves.size() * (segments + 1) * 4 * 3];
         int[] faces = new int[curves.size() * segments * 4 * 2 * 6];
@@ -508,6 +707,10 @@ final class CityView3D {
         arcGroup.getChildren().add(0, view);
     }
 
+    /**
+     * An unlit-looking material: black diffuse and specular, so lights add nothing, and a 1×1 self-illumination map,
+     * which JavaFX adds at full strength regardless of lighting. JavaFX has no plain emissive colour, hence the image.
+     */
     private PhongMaterial glow(Color color) {
         PhongMaterial m = new PhongMaterial(Color.BLACK);
         m.setSpecularColor(Color.BLACK);
@@ -522,6 +725,11 @@ final class CityView3D {
         arcs.clear();
     }
 
+    /**
+     * One spinning diamond per building with open pull requests, bigger with more PRs (capped at 5 PRs). The diamond
+     * is a cube tilted 45° about z and 35° about x so that it stands roughly on a corner; it is wrapped in a group so
+     * {@link #tick} can spin the group about the vertical axis without disturbing the tilt.
+     */
     private void buildBeacons() {
         beaconGroup.getChildren().clear();
         beaconBuildings.clear();
@@ -551,6 +759,7 @@ final class CityView3D {
 
     // ------------------------------------------------------------------ camera
 
+    /** Looks at the whole city from the default angle (or flies there, keeping the current angles). */
     void frameAll(boolean animate) {
         Point3D centre = Point3D.ZERO;
         double dist = radius * 2.9;
@@ -564,22 +773,31 @@ final class CityView3D {
         }
     }
 
+    /**
+     * Flies to the middle of building {@code i}, far enough back to see it whole: 1.8 × its height, 7 × its side, but
+     * never closer than 22 units.
+     */
     void flyToBuilding(int i) {
         CityLayout.Lot lot = model.buildings().get(i).lot();
         double h = heightOf(i);
         flyTo(new Point3D(lot.x(), -(lot.y() + h * 0.5), lot.z()), Math.max(Math.max(h * 1.8, lot.side() * 7), 22));
     }
 
+    /** Flies to the top of district {@code d}, backing off by 1.25 × its longer side plus 10 units. */
     void flyToDistrict(CityLayout.District d) {
         flyTo(new Point3D(d.x(), -(d.depth() + 1) * CityLayout.PLATFORM, d.z()), Math.max(d.w(), d.d()) * 1.25 + 10);
     }
 
+    /**
+     * Starts a 0.9 s flight to a new orbit target and dolly distance. If the camera looks down at less than 20°, it is
+     * tilted to 20° during the flight, so the destination is not seen edge-on.
+     */
     private void flyTo(Point3D to, double distance) {
-        flight = new Flight(System.nanoTime(), 0.9, new Point3D(target.getX(), target.getY(), target.getZ()), to,
-                -dolly.getZ(), distance);
-        if (-pitch.getAngle() < 20) {
-            pitch.setAngle(-20);
+        if (walker != null) {
+            return; // the walker owns the camera; selecting by crosshair must not fly off
         }
+        flight = new Flight(System.nanoTime(), 0.9, new Point3D(target.getX(), target.getY(), target.getZ()), to,
+                -dolly.getZ(), distance, -pitch.getAngle(), Math.max(20, -pitch.getAngle()));
     }
 
     private void setTarget(Point3D p) {
@@ -588,15 +806,30 @@ final class CityView3D {
         target.setZ(p.getZ());
     }
 
+    /**
+     * Mouse controls: primary drag orbits (yaw, and pitch clamped to 4°..86° below the horizon); any other drag, or
+     * shift + primary drag, pans across the ground plane; the wheel zooms exponentially, clamped between 4 units and 6
+     * radii. Pressing the mouse or scrolling cancels a flight. A click only counts if the mouse moved at most 5 px
+     * since the press, so the end of a drag never selects anything.
+     */
     private void installMouse() {
         subScene.setFocusTraversable(true);
         subScene.setOnMousePressed(e -> {
             subScene.requestFocus(); // clicking the city leaves the search field, so shortcuts work again
+            if (walker != null) {
+                if (e.getButton() == MouseButton.PRIMARY) {
+                    listener.click(aimBuilding);
+                }
+                return;
+            }
             pressX = lastX = e.getSceneX();
             pressY = lastY = e.getSceneY();
             flight = null;
         });
         subScene.setOnMouseDragged(e -> {
+            if (walker != null) {
+                return;
+            }
             double dx = e.getSceneX() - lastX;
             double dy = e.getSceneY() - lastY;
             lastX = e.getSceneX();
@@ -607,6 +840,9 @@ final class CityView3D {
                 double p = Math.max(4, Math.min(86, -pitch.getAngle() + dy * 0.3));
                 pitch.setAngle(-p);
             } else {
+                // Pan speed grows with the camera distance, so the ground moves roughly with the cursor at any zoom.
+                // (rx, rz) and (fx, fz) are the camera's sideways and front/back directions on the ground plane,
+                // derived from the yaw, so panning follows the view direction rather than the world axes.
                 double scale = -dolly.getZ() * 0.0016;
                 double a = Math.toRadians(yaw.getAngle());
                 double rx = Math.cos(a), rz = -Math.sin(a);
@@ -616,21 +852,33 @@ final class CityView3D {
             }
         });
         subScene.setOnScroll(e -> {
+            if (walker != null) {
+                return;
+            }
             flight = null;
             double dist = -dolly.getZ() * Math.exp(-e.getDeltaY() * 0.0025);
             dolly.setZ(-Math.max(4, Math.min(radius * 6, dist)));
         });
         subScene.setOnMouseMoved(e -> {
+            if (walker != null) {
+                return;
+            }
             Hit hit = pick(e.getPickResult());
             listener.hover(hit.building, hit.district, e.getSceneX(), e.getSceneY());
         });
-        subScene.setOnMouseExited(e -> listener.hover(-1, -1, 0, 0));
+        subScene.setOnMouseExited(e -> {
+            if (walker == null) {
+                listener.hover(-1, -1, 0, 0);
+            }
+        });
         subScene.setOnMouseClicked(e -> {
-            if (e.getButton() != MouseButton.PRIMARY
+            if (walker != null || e.getButton() != MouseButton.PRIMARY
                     || Math.hypot(e.getSceneX() - pressX, e.getSceneY() - pressY) > 5) {
                 return;
             }
             Hit hit = pick(e.getPickResult());
+            // JavaFX delivers a double click as a click with count 1 followed by one with count 2. The first one
+            // selects (or, on a platform, clears the selection); the second zooms to a district.
             if (e.getClickCount() == 2 && hit.district >= 0 && hit.building < 0) {
                 listener.districtDoubleClick(hit.district);
             } else if (e.getClickCount() == 1) {
@@ -639,9 +887,127 @@ final class CityView3D {
         });
     }
 
+    // ------------------------------------------------------------------ walk mode
+
+    boolean walking() {
+        return walker != null;
+    }
+
+    /** Keys currently held while walking; read by the next frames. */
+    void setWalkInput(Walker.Input input) {
+        walkInput = input;
+    }
+
+    /**
+     * Starts walk mode. The orbit camera is saved for {@link #exitWalk}. With a building selected the player spawns
+     * on the street in front of it (towards +z), facing it; otherwise at the orbit target, facing the way the camera
+     * looked. The cursor is hidden; {@link #tick} recentres it every frame.
+     */
+    void enterWalk(int selected) {
+        if (walker != null || model == null) {
+            return;
+        }
+        flight = null;
+        savedOrbit = new double[]{target.getX(), target.getY(), target.getZ(), yaw.getAngle(), pitch.getAngle(),
+                dolly.getZ()};
+        Walker.World world = Walker.World.of(model, heights);
+        walker = new Walker();
+        if (selected >= 0 && selected < model.buildings().size()) {
+            CityLayout.Lot lot = model.buildings().get(selected).lot();
+            walker.spawn(lot.x(), lot.z() + lot.side() / 2 + Walker.RADIUS + 0.2, 0, world);
+        } else {
+            // The orbit camera looks along (sin a, cos a) on the ground; the walker's yaw 0 looks along −z.
+            walker.spawn(target.getX(), target.getZ(), Math.toRadians(yaw.getAngle()) - Math.PI, world);
+        }
+        camera.setFieldOfView(Walker.FOV);
+        camera.setNearClip(Walker.NEAR);
+        if (robot == null) {
+            robot = new Robot();
+        }
+        recentred = false;
+        aimBuilding = aimDistrict = -2; // forces a hover report on the first frame
+        subScene.setCursor(Cursor.NONE);
+        if (subScene.getScene() != null) {
+            subScene.getScene().setCursor(Cursor.NONE);
+        }
+        placeWalkCamera();
+    }
+
+    /** Leaves walk mode: the orbit camera is restored exactly, the cursor comes back and the hover is cleared. */
+    void exitWalk() {
+        if (walker == null) {
+            return;
+        }
+        walker = null;
+        walkInput = Walker.Input.NONE;
+        setTarget(new Point3D(savedOrbit[0], savedOrbit[1], savedOrbit[2]));
+        yaw.setAngle(savedOrbit[3]);
+        pitch.setAngle(savedOrbit[4]);
+        dolly.setZ(savedOrbit[5]);
+        camera.setFieldOfView(42);
+        camera.setNearClip(0.3);
+        subScene.setCursor(Cursor.DEFAULT);
+        if (subScene.getScene() != null) {
+            subScene.getScene().setCursor(Cursor.DEFAULT);
+        }
+        listener.hover(-1, -1, 0, 0);
+    }
+
+    /**
+     * One walk-mode frame: mouse look, physics, camera, crosshair hover. The look delta is the cursor's offset from the
+     * view's centre on screen (rounded to whole pixels, so a centre between pixels does not read as constant motion),
+     * after which the cursor is moved back there.
+     */
+    private void walkFrame(double dt) {
+        Point2D centre = subScene.localToScreen(subScene.getWidth() / 2, subScene.getHeight() / 2);
+        if (centre != null) {
+            double cx = Math.round(centre.getX());
+            double cy = Math.round(centre.getY());
+            Point2D mouse = robot.getMousePosition();
+            double dx = mouse.getX() - cx;
+            double dy = mouse.getY() - cy;
+            if (recentred && (Math.abs(dx) >= 0.5 || Math.abs(dy) >= 0.5)) {
+                walker.look(dx, dy);
+            }
+            if (!recentred || Math.abs(dx) >= 0.5 || Math.abs(dy) >= 0.5) {
+                robot.mouseMove(cx, cy);
+                recentred = true;
+            }
+        }
+        Walker.World world = Walker.World.of(model, heights);
+        walker.step(dt, walkInput, world);
+        placeWalkCamera();
+        Walker.Box aim = walker.target(world);
+        int b = aim == null ? -1 : aim.building();
+        int d = aim == null ? -1 : aim.district();
+        if (b != aimBuilding || d != aimDistrict) {
+            aimBuilding = b;
+            aimDistrict = d;
+            Point2D mid = subScene.localToScene(subScene.getWidth() / 2, subScene.getHeight() / 2);
+            listener.hover(b, d, mid.getX(), mid.getY());
+        }
+    }
+
+    /**
+     * Turns the orbit chain into an eye: target at the eye (y negated for JavaFX), no dolly. The JavaFX yaw rotation
+     * looks along (sin a, cos a), the walker's yaw along (−sin, −cos), hence the 180°; a positive JavaFX pitch tilts
+     * the view up, as the walker's does.
+     */
+    private void placeWalkCamera() {
+        setTarget(new Point3D(walker.x, -walker.eyeY(), walker.z));
+        yaw.setAngle(Math.toDegrees(walker.yaw) + 180);
+        pitch.setAngle(Math.toDegrees(walker.pitch));
+        dolly.setZ(0);
+    }
+
     private record Hit(int building, int district) {
     }
 
+    /**
+     * Maps a JavaFX pick to a building or district index. Each box has exactly {@link #FACES} triangles in order, so
+     * the face index divided by {@code FACES} is the box. The ground, arcs and beacons are mouse-transparent and never
+     * show up here; the degenerate box of an empty city is ignored.
+     */
     private Hit pick(PickResult r) {
         if (r == null || model == null) {
             return new Hit(-1, -1);
@@ -661,7 +1027,14 @@ final class CityView3D {
     // ------------------------------------------------------------------ frame loop
 
     private long lastFrame;
+    /** Time of the previous walk-mode frame, 0 when not walking. */
+    private long lastWalkFrame;
 
+    /**
+     * Per-frame update ({@code now} in nanoseconds). The frame time {@code dt} is capped at 0.1 s so that after a stall
+     * the arc dots do not jump. Flights use a cubic ease-in-out and height changes a cubic ease-out, as in the web
+     * viewer.
+     */
     private void tick(long now) {
         double dt = lastFrame == 0 ? 0 : Math.min(0.1, (now - lastFrame) / 1e9);
         lastFrame = now;
@@ -675,6 +1048,7 @@ final class CityView3D {
             Point3D to = flight.toTarget();
             setTarget(from.add(to.subtract(from).multiply(e)));
             dolly.setZ(-(flight.fromDist() + (flight.toDist() - flight.fromDist()) * e));
+            pitch.setAngle(-(flight.fromPitch() + (flight.toPitch() - flight.fromPitch()) * e));
             if (k >= 1) {
                 flight = null;
             }
@@ -690,6 +1064,13 @@ final class CityView3D {
                 heightDuration = 0;
             }
         }
+        if (walker != null) {
+            // The walker gets the real frame time (it caps and substeps it itself), not the 0.1 s cap above.
+            walkFrame(lastWalkFrame == 0 ? 0 : (now - lastWalkFrame) / 1e9);
+            lastWalkFrame = now;
+        } else {
+            lastWalkFrame = 0;
+        }
         for (Arc a : arcs) {
             a.t()[0] = (a.t()[0] + dt * a.speed()) % 1;
             Point3D p = bezier(a.p0(), a.p1(), a.p2(), a.t()[0]);
@@ -698,6 +1079,8 @@ final class CityView3D {
             a.dot().setTranslateZ(p.getZ());
         }
         if (beaconsVisible) {
+            // Each beacon floats 1.4 units above its roof, bobs ±0.25 and spins; adding the building index to the
+            // phase keeps them out of step. Beacons on hidden (zero-height) buildings are hidden.
             double t = now / 1e9;
             for (int k = 0; k < beaconBuildings.size(); k++) {
                 int i = beaconBuildings.get(k);

@@ -1,4 +1,15 @@
 // CodeCity viewer — renders the city model produced by the Java analyser.
+//
+// Data: the city JSON comes either from a <script id="city-data"> element (a page written by --export) or from
+// GET api/city on the local server, which also pushes an `update` server-sent event after each watch-mode rebuild.
+// Coordinates come straight from the layout: x/z on the ground with the city centred on the origin, y up.
+//
+// Rendering: every building is one instance of a single InstancedMesh (unit box, base at y = 0) and every district
+// platform one instance of another, so thousands of classes cost two instanced draws. Instance i of the building
+// mesh is building i of city.buildings: its matrix carries position, footprint and (animated) height, its instance
+// colour the metric colour (dimmed or highlighted by search, selection and hover). Picking raycasts against those
+// meshes and reads back hit.instanceId. Night mode patches the standard material's shader (makeBuildingMaterial) for
+// glow and lit windows. The desktop viewer (desktop/CityView3D.java) draws the same scene with JavaFX.
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
@@ -8,6 +19,7 @@ import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js'
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import * as Walk from './walk.js';
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -158,6 +170,17 @@ let cityRadius = 50;
  * Standard PBR material extended with two night-time effects driven from the instance data:
  * a soft glow in the building's own colour, and procedurally lit office windows on the facades.
  */
+//
+// How the patch works: onBeforeCompile receives three.js's generated shader source and splices code in after two of
+// its #include chunks. The vertex shader passes on the box-local position and normal, the instance's scale (the
+// length of each column of instanceMatrix, i.e. footprint and height) and a per-building seed (the instance's x/z
+// position). The fragment shader then, after the emissive chunk:
+//   - adds the instance colour times uGlow to the emitted light (night glow);
+//   - on side faces only (|normal.y| < 0.5), lays a grid of 0.42 × 0.5 world-unit cells over the facade, using the
+//     scale to turn local coordinates into world units so windows keep their size on any building; draws a window
+//     in the middle of each cell; and lights a pseudo-random ~42% of them (hash of cell, seed and face), mostly warm,
+//     about a quarter of them cool. The ground floor and a strip below the roof stay dark.
+// The uniforms live in material.userData so applyTheme can change them without recompiling the shader.
 function makeBuildingMaterial() {
   const material = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6, metalness: 0.05 });
   const uniforms = { uGlow: { value: 0 }, uWindows: { value: 0 } };
@@ -222,6 +245,9 @@ function visible(b) {
 function buildCity(city, { previousHeights = null } = {}) {
   const keepCamera = previousHeights !== null;
   const previousSelection = state.selected >= 0 ? state.city.buildings[state.selected]?.id : null;
+  // Old heights by building id: indices change meaning when types are added or removed.
+  const oldHeights = new Map();
+  if (previousHeights) state.city.buildings.forEach((b, i) => oldHeights.set(b.id, previousHeights[i]));
   state.city = city;
   state.selected = -1;
   state.hovered = -1;
@@ -239,6 +265,7 @@ function buildCity(city, { previousHeights = null } = {}) {
   const tmp = new THREE.Object3D();
 
   // Districts: stacked platforms, one level per package nesting depth.
+  // An InstancedMesh needs at least one instance slot; `count` then hides the unused one for an empty city.
   districtMesh = new THREE.InstancedMesh(unitBox, districtMaterial, Math.max(1, city.districts.length));
   districtMesh.count = city.districts.length;
   city.districts.forEach((d, i) => {
@@ -252,7 +279,8 @@ function buildCity(city, { previousHeights = null } = {}) {
   districtMesh.castShadow = true;
   cityGroup.add(districtMesh);
 
-  // Buildings
+  // Buildings: matrices are written every frame while heights animate (DynamicDrawUsage), see writeBuildingMatrices.
+  // Instance colours start white and are set by updateColors/paintBuildings.
   const n = city.buildings.length;
   buildingMesh = new THREE.InstancedMesh(unitBox, buildingMaterial, Math.max(1, n));
   buildingMesh.count = n;
@@ -267,7 +295,7 @@ function buildCity(city, { previousHeights = null } = {}) {
   state.incoming = incoming;
 
   heights = { cur: new Float32Array(n), from: new Float32Array(n), to: new Float32Array(n), t0: 0, dur: 0 };
-  if (previousHeights) heights.cur.set(previousHeights.subarray(0, n));
+  city.buildings.forEach((b, i) => { heights.cur[i] = oldHeights.get(b.id) ?? 0; });
 
   // Lights, shadows, fog and ground scale with the city.
   cityRadius = Math.max(20, Math.hypot(city.width, city.depth) / 2);
@@ -326,8 +354,10 @@ function buildLabels() {
   setLabelsVisible(state.labels);
 }
 
+// District labels are HTML on top of the canvas, so at street level they would show through the buildings; walk
+// mode hides them regardless of the setting.
 function setLabelsVisible(on) {
-  for (const l of labelObjects) l.visible = on;
+  for (const l of labelObjects) l.visible = on && !walk;
 }
 
 /** Recomputes target heights for the current metric and animates the skyline towards them. */
@@ -345,6 +375,8 @@ function updateHeights(rise = false) {
   heights.dur = rise ? 1400 : 650;
 }
 
+// Advances the height animation (cubic ease-out). When it ends, the bounding volumes are recomputed: three.js culls
+// and raycasts an InstancedMesh against them, so without this, grown buildings could be missed by picking.
 function stepHeights(now) {
   if (!heights.dur) return false;
   const k = Math.min(1, (now - heights.t0) / heights.dur);
@@ -366,6 +398,9 @@ const pos = new THREE.Vector3();
 const scl = new THREE.Vector3();
 const quat = new THREE.Quaternion();
 
+// Writes every building's instance matrix from the current heights. A building with (almost) no height also gets a
+// zero footprint, so hidden buildings vanish; the y scale never reaches exactly 0, which would make the matrix
+// singular.
 function writeBuildingMatrices() {
   const { buildings } = state.city;
   for (let i = 0; i < buildings.length; i++) {
@@ -581,6 +616,7 @@ function renderInspector() {
   if (i < 0) { el.hidden = true; return; }
   const b = state.city.buildings[i];
   const hasGit = state.city.hasGit;
+  // b.methods is capped at 300 by the server; the method counts below use b.nom, which counts all of them.
   const maxCx = Math.max(1, ...b.methods.map((m) => m[3]));
   const metric = (v, l) => `<div class="metric"><b>${v}</b><span>${l}</span></div>`;
   const depChip = (j, dir) => {
@@ -607,13 +643,13 @@ function renderInspector() {
     </div>
     <div class="file-link"><span title="${esc(b.file)}:${b.line}">${esc(b.file)}:${b.line}</span>${live ? '<button id="view-source">Source</button>' : ''}</div>
     ${renderGitHubSection(b)}
-    ${b.methods.length ? `<h3><span>Methods by complexity</span><span>${b.methods.length}</span></h3>
+    ${b.methods.length ? `<h3><span>Methods by complexity</span><span>${b.nom}</span></h3>
     <div class="methods">${b.methods.slice(0, 15).map((m) => `
       <div class="method" title="line ${m[1]} · ${m[2]} LOC · ${m[4]} params">
         <span class="m-name">${esc(m[0])}(${m[4] ? '…' : ''})</span><span class="m-val">cx ${m[3]} · ${m[2]} loc</span>
         <span class="m-bar"><i style="width:${(m[3] / maxCx) * 100}%;background:${rampColor(m[3] / Math.max(10, maxCx)).getStyle()}"></i></span>
       </div>`).join('')}
-      ${b.methods.length > 15 ? `<span class="muted">+ ${b.methods.length - 15} more</span>` : ''}
+      ${b.nom > 15 ? `<span class="muted">+ ${b.nom - 15} more</span>` : ''}
     </div>` : ''}
     <h3><span>Uses</span><span>${out.length}</span></h3>
     <div class="deps">${out.map((j) => depChip(j, 'out')).join('') || '<span class="muted">nothing in this project</span>'}</div>
@@ -746,17 +782,22 @@ function topOf(i) {
 }
 
 /** Dependency arcs: orange for what the selection uses, blue for what uses it; particles flow along the edge. */
+// Each arc is a quadratic Bézier tube from roof to roof, the control point above the midpoint at the taller roof plus
+// 35% of the distance plus 2, so long arcs arch higher. Only edges whose both ends are visible are drawn, at most 200
+// per direction (filtered first, then capped, like the desktop viewers); with more than 40 edges in total (visible or
+// not) the tubes are fainter. A dot per arc travels along it at roughly constant world speed (stepArcs). The Java desktop
+// viewer builds the same curves (CityView3D.showArcs).
 function buildArcs() {
   clearArcs();
   const i = state.selected;
   if (i < 0) return;
   const { buildings } = state.city;
   const night = state.theme === 'night';
-  const out = buildings[i].deps.slice(0, 200);
-  const inc = state.incoming[i].slice(0, 200);
-  const opacity = (night ? 0.75 : 0.85) * (out.length + inc.length > 40 ? 0.5 : 1);
+  const shown = (list) => (visible(buildings[i]) ? list.filter((j) => visible(buildings[j])).slice(0, 200) : []);
+  const out = shown(buildings[i].deps);
+  const inc = shown(state.incoming[i]);
+  const opacity = (night ? 0.75 : 0.85) * (buildings[i].deps.length + state.incoming[i].length > 40 ? 0.5 : 1);
   const add = (from, to, colorHex) => {
-    if (!visible(buildings[from]) || !visible(buildings[to])) return;
     const p0 = topOf(from), p1 = topOf(to);
     const dist = p0.distanceTo(p1);
     const mid = p0.clone().lerp(p1, 0.5);
@@ -832,6 +873,8 @@ function frameAll(animate = true) {
 const raycaster = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
 
+// Raycasts from the camera through the pointer. Buildings take precedence over the platforms beneath them; the
+// instanceId of the hit is the building or district index. Beacons are excluded (their raycast is a no-op).
 function pick(clientX, clientY) {
   if (!buildingMesh) return null;
   ndc.set((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1);
@@ -866,6 +909,7 @@ function showTooltip(target, x, y) {
 let pointer = null;
 let hoverQueued = false;
 canvas.addEventListener('pointermove', (e) => {
+  if (walk) return; // the crosshair does the hovering while walking (stepWalk)
   pointer = { x: e.clientX, y: e.clientY, buttons: e.buttons };
   if (hoverQueued) return;
   hoverQueued = true;
@@ -880,20 +924,35 @@ canvas.addEventListener('pointermove', (e) => {
   });
 });
 canvas.addEventListener('pointerleave', () => {
+  if (walk) return;
   pointer = null;
   showTooltip(null);
   if (state.hovered >= 0) { state.hovered = -1; paintBuildings(); }
 });
 
 let down = null;
-canvas.addEventListener('pointerdown', (e) => { down = { x: e.clientX, y: e.clientY }; flight = null; });
+canvas.addEventListener('pointerdown', (e) => {
+  // While walking the cursor is captured: a left click picks whatever is under the crosshair, without flying there.
+  if (walk) {
+    if (e.button === 0 && walk.locked) {
+      const target = pick(innerWidth / 2, innerHeight / 2);
+      if (target?.type === 'building') select(target.index, { fly: false });
+      else if (state.selected >= 0) select(-1);
+    }
+    return;
+  }
+  down = { x: e.clientX, y: e.clientY };
+  flight = null;
+});
 canvas.addEventListener('pointerup', (e) => {
+  if (walk) return;
   if (!down || Math.hypot(e.clientX - down.x, e.clientY - down.y) > 5 || e.button !== 0) return;
   const target = pick(e.clientX, e.clientY);
   if (target?.type === 'building') select(target.index);
   else if (state.selected >= 0) select(-1);
 });
 canvas.addEventListener('dblclick', (e) => {
+  if (walk) return;
   const target = pick(e.clientX, e.clientY);
   if (target?.type === 'district') flyToDistrict(state.city.districts[target.index]);
 });
@@ -995,6 +1054,7 @@ function bindControls() {
   ao.addEventListener('change', () => { state.ao = ao.checked; savePrefs(); gtao.enabled = state.ao; });
   $('#btn-theme').addEventListener('click', toggleTheme);
   $('#btn-frame').addEventListener('click', () => frameAll());
+  $('#btn-walk').addEventListener('click', toggleWalk);
   $('#btn-snapshot').addEventListener('click', snapshot);
   $('#source-close').addEventListener('click', closeSource);
   $('#source-modal').addEventListener('click', (e) => { if (e.target.id === 'source-modal') closeSource(); });
@@ -1018,15 +1078,31 @@ function snapshot() {
 addEventListener('keydown', (e) => {
   const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement;
   if (e.key === 'Escape') {
+    // Esc leaves walk mode and does nothing else (the selection stays). The browser may also release the pointer
+    // lock for this key press and so end walk mode first; the time check keeps that same press from clearing.
+    if (walk) { exitWalk(); return; }
+    if (performance.now() - walkExitedAt < 300) return;
     if (!$('#source-modal').hidden) closeSource();
     else if (state.selected >= 0) select(-1);
     else if (searchInput.value) { searchInput.value = ''; runSearch(''); }
     return;
   }
   if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
-  if (e.key === '/') { e.preventDefault(); searchInput.focus(); searchInput.select(); }
-  else if (e.key === 'f' || e.key === 'F') frameAll();
+  if (e.code === 'KeyG') { toggleWalk(); return; }
+  if (walk && WALK_KEYS.has(e.code)) {
+    e.preventDefault(); // Space would scroll or press a focused button, arrows would scroll
+    walk.keys.add(e.code);
+    return;
+  }
+  if (e.key === '/') { exitWalk(); e.preventDefault(); searchInput.focus(); searchInput.select(); }
+  else if (e.key === 'f' || e.key === 'F') { exitWalk(); frameAll(); }
   else if (e.key === 'n' || e.key === 'N') toggleTheme();
+});
+
+addEventListener('keyup', (e) => {
+  if (!walk || !WALK_KEYS.has(e.code)) return;
+  e.preventDefault();
+  walk.keys.delete(e.code);
 });
 
 addEventListener('resize', () => {
@@ -1036,6 +1112,154 @@ addEventListener('resize', () => {
   composer.setSize(innerWidth, innerHeight);
   labelRenderer.setSize(innerWidth, innerHeight);
 });
+
+// ---------------------------------------------------------------- walk mode
+//
+// First-person walking through the city (G or the Walk button). walk.js does the movement and collision; this part
+// owns the input, the camera and the HUD. On entering, the orbit camera (position, target, fov, near plane) is saved
+// and OrbitControls is switched off; the canvas takes the pointer lock, so the mouse turns the view through
+// movementX/Y and a click picks whatever is under the crosshair. Losing the pointer lock (Esc, switching windows)
+// ends walk mode, as do G, Esc, / and F; the saved orbit camera is then restored exactly and the selection kept.
+// The desktop viewers implement the same rules (desktop/Walker.java, gui/walk.rs, gui/walk.d).
+
+const WALK_KEYS = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ShiftLeft', 'ShiftRight', 'Space']);
+let walk = null; // { player, world, city, keys, saved, locked, hintTimer } while walking
+let walkExitedAt = -Infinity;
+
+function toggleWalk() {
+  if (walk) exitWalk();
+  else enterWalk();
+}
+
+function enterWalk() {
+  if (!state.city || walk) return;
+  flight = null;
+  const saved = { position: camera.position.clone(), target: controls.target.clone(), fov: camera.fov, near: camera.near };
+  const world = Walk.makeWorld(state.city, heights.cur);
+  let player;
+  if (state.selected >= 0) {
+    // On the street in front of the selected building, looking at it (yaw 0 looks towards −z).
+    const b = state.city.buildings[state.selected];
+    player = Walk.spawn(world, b.x, b.z + b.side / 2 + Walk.RADIUS + 0.2, 0);
+  } else {
+    // Where the orbit camera looks, facing the way it faces.
+    const dir = controls.target.clone().sub(camera.position);
+    player = Walk.spawn(world, controls.target.x, controls.target.z, Math.atan2(-dir.x, -dir.z));
+  }
+  walk = { player, world, city: state.city, keys: new Set(), saved, locked: false, hintTimer: 0 };
+  controls.enabled = false;
+  setLabelsVisible(false);
+  camera.fov = Walk.FOV;
+  camera.near = Walk.NEAR;
+  camera.updateProjectionMatrix();
+  placeWalkCamera();
+
+  document.activeElement?.blur?.(); // a focused Walk button would otherwise be "clicked" by Space
+  showTooltip(null);
+  canvas.style.cursor = '';
+  document.body.classList.add('walking');
+  $('#btn-walk').classList.add('active');
+  $('#btn-walk').setAttribute('aria-pressed', 'true');
+  $('#crosshair').hidden = false;
+  const hint = $('#walk-hint');
+  hint.hidden = false;
+  hint.classList.remove('faded');
+  walk.hintTimer = setTimeout(() => hint.classList.add('faded'), 6000);
+
+  // Some browsers return a promise from requestPointerLock, older ones report failures through pointerlockerror.
+  try {
+    const p = canvas.requestPointerLock();
+    if (p && p.catch) p.catch(() => walkLockFailed());
+  } catch {
+    walkLockFailed();
+  }
+}
+
+function walkLockFailed() {
+  if (!walk || walk.locked) return;
+  exitWalk();
+  toast('Walk mode needs mouse capture — click the Walk button or press G again');
+}
+
+function exitWalk() {
+  if (!walk) return;
+  const { saved, hintTimer } = walk;
+  walk = null;
+  walkExitedAt = performance.now();
+  clearTimeout(hintTimer);
+  if (document.pointerLockElement === canvas) document.exitPointerLock();
+  camera.position.copy(saved.position);
+  controls.target.copy(saved.target);
+  camera.fov = saved.fov;
+  camera.near = saved.near;
+  camera.updateProjectionMatrix();
+  controls.enabled = true;
+  controls.update();
+  setLabelsVisible(state.labels);
+
+  document.body.classList.remove('walking');
+  $('#btn-walk').classList.remove('active');
+  $('#btn-walk').setAttribute('aria-pressed', 'false');
+  $('#crosshair').hidden = true;
+  $('#walk-hint').hidden = true;
+  showTooltip(null);
+  if (state.hovered >= 0) { state.hovered = -1; paintBuildings(); }
+}
+
+document.addEventListener('pointerlockchange', () => {
+  if (!walk) return;
+  if (document.pointerLockElement === canvas) walk.locked = true;
+  else exitWalk();
+});
+document.addEventListener('pointerlockerror', () => walkLockFailed());
+document.addEventListener('mousemove', (e) => {
+  if (walk?.locked) Walk.look(walk.player, e.movementX, e.movementY);
+});
+addEventListener('blur', () => exitWalk());
+
+function placeWalkCamera() {
+  const p = walk.player;
+  const eye = Walk.eye(p);
+  camera.position.set(eye.x, eye.y, eye.z);
+  camera.rotation.set(p.pitch, p.yaw, 0, 'YXZ');
+}
+
+// One frame of walking: refresh the world if the city or the heights changed, move, place the camera, and treat the
+// building under the crosshair as hovered (highlight + tooltip just below the centre of the screen). Districts get no
+// tooltip here: theirs offers double-click to zoom, which is off while walking.
+function stepWalk(dt) {
+  if (walk.city !== state.city) {
+    walk.world = Walk.makeWorld(state.city, heights.cur);
+    walk.city = state.city;
+  } else {
+    Walk.updateHeights(walk.world, state.city, heights.cur);
+  }
+  const k = walk.keys;
+  const input = {
+    forward: k.has('KeyW') || k.has('ArrowUp'),
+    back: k.has('KeyS') || k.has('ArrowDown'),
+    left: k.has('KeyA') || k.has('ArrowLeft'),
+    right: k.has('KeyD') || k.has('ArrowRight'),
+    run: k.has('ShiftLeft') || k.has('ShiftRight'),
+    jump: k.has('Space'),
+  };
+  Walk.step(walk.player, dt, input, walk.world);
+  placeWalkCamera();
+  camera.updateMatrixWorld();
+
+  const target = pick(innerWidth / 2, innerHeight / 2);
+  const hovered = target?.type === 'building' ? target.index : -1;
+  if (hovered === state.hovered) return;
+  state.hovered = hovered;
+  paintBuildings();
+  if (hovered >= 0) {
+    showTooltip(target, 0, 0);
+    tooltip.style.left = `${Math.round((innerWidth - tooltip.offsetWidth) / 2)}px`;
+    tooltip.style.top = `${Math.round(innerHeight / 2 + 22)}px`;
+  } else {
+    showTooltip(null);
+  }
+}
 
 // ---------------------------------------------------------------- live updates
 
@@ -1064,13 +1288,17 @@ function render() {
 }
 
 function loop() {
-  const dt = Math.min(clock.getDelta(), 0.1);
+  const frameTime = clock.getDelta();
+  const dt = Math.min(frameTime, 0.1);
   const now = performance.now();
   stepFlight(now);
   stepHeights(now);
   stepArcs(dt);
   stepBeacons(now);
-  controls.update();
+  // While walking the camera belongs to stepWalk; OrbitControls.update would turn it back towards its target.
+  // walk.js caps the frame time itself (MAX_FRAME) and substeps it.
+  if (walk) stepWalk(frameTime);
+  else controls.update();
   render();
   requestAnimationFrame(loop);
 }

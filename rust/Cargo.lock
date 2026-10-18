@@ -271,6 +271,7 @@ dependencies = [
  "tree-sitter-typescript",
  "ureq",
  "webbrowser",
+ "winit",
 ]
 
 [[package]]

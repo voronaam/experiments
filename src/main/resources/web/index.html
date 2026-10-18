@@ -60,6 +60,7 @@
     <section class="buttons">
       <button id="btn-theme" title="Toggle day / night (N)">Night</button>
       <button id="btn-frame" title="Frame whole city (F)">Frame</button>
+      <button id="btn-walk" title="Walk through the city (G)" aria-pressed="false">Walk</button>
       <button id="btn-snapshot" title="Save a PNG">Snapshot</button>
     </section>
   </aside>
@@ -84,6 +85,8 @@
   </div>
 
   <div class="hint">drag to orbit · right-drag to pan · scroll to zoom · click a building · <kbd>F</kbd> frame · <kbd>N</kbd> night · <kbd>Esc</kbd> clear</div>
+  <div id="crosshair" class="crosshair" hidden></div>
+  <div id="walk-hint" class="hint walk-hint" hidden><kbd>WASD</kbd> move · Mouse look · <kbd>Shift</kbd> run · <kbd>Space</kbd> jump · Click select · <kbd>G</kbd>/<kbd>Esc</kbd> exit</div>
   <div id="loading" class="loading"><div class="spinner"></div><span>Building city…</span></div>
 
   <script type="module" src="app.js"></script>

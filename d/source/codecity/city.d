@@ -1,4 +1,12 @@
 /// An analysed and laid-out city, consumed by both the web viewer (as JSON) and the desktop viewer.
+///
+/// `CityModel.build` runs the whole pipeline for one source tree: walk and parse the sources and link their
+/// dependencies (`codecity.analysis`), mine git history in parallel (`codecity.git`), lay the city out
+/// (`codecity.layout`), then join everything per type into `Building`s. A rebuild (`--watch`) does not modify a
+/// model: it builds a new one, which replaces the old one as a whole.
+///
+/// Indices: `Building.index`, `Building.deps`/`incoming` and the JSON `deps` all index `analysis.types` (which is
+/// sorted by fqn) and `buildings` alike, because `buildings[i]` is built for `analysis.types[i]`.
 module codecity.city;
 
 import codecity.analysis : SourceAnalyzer;
@@ -14,17 +22,21 @@ import std.datetime.stopwatch : StopWatch, AutoStart;
 import std.datetime.systime : Clock;
 import std.path : baseName, relativePath;
 
+/// At most this many methods per building are kept (the most complex ones), to bound the JSON size.
 enum maxMethods = 300;
 
 /// One building, fully resolved: the type, where it stands, its history and its edges.
 struct Building
 {
+    /// Index into `Analysis.types` (equal to this building's own index in `CityModel.buildings`).
     size_t index;
     Lot lot;
     /// Path relative to the analysed root, with forward slashes.
     string file;
     bool hasHistory;
+    /// Only meaningful when `hasHistory`.
     FileHistory history;
+    /// Types this one uses / types that use this one, as indices into `Analysis.types`.
     size_t[] deps;
     size_t[] incoming;
     /// Indices into the GitHub info's pull requests.
@@ -39,14 +51,17 @@ struct LanguageCount
     size_t count;
 }
 
+/// Totals for the whole city, sent to the viewers and printed after each build.
 struct Stats
 {
+    /// `packages` counts distinct (language, module, package) triples, not districts.
     size_t files, failedFiles, types, packages;
     uint methods, loc;
     /// Type count per language, most common first.
     LanguageCount[] languages;
 }
 
+/// The complete city: analysis results, layout and GitHub context, ready to be served or drawn.
 final class CityModel
 {
     string name;
@@ -58,13 +73,17 @@ final class CityModel
     Building[] buildings;
     Stats stats;
     long buildMillis;
+    /// Lazily built JSON form; see `json`.
     private string cachedJson;
 
+    /// Runs the full pipeline for `root`. `useGit` enables history mining; `github` (valid when `hasGithub`) was
+    /// fetched once by the caller and is copied into every model, so rebuilds do not query GitHub again.
     static CityModel build(SourceAnalyzer analyzer, string root, bool includeTests, bool useGit, bool hasGithub, GitHubInfo github)
     {
         auto sw = StopWatch(AutoStart.yes);
         FileHistory[string] history;
-        // git log runs while the sources are parsed
+        // git log runs while the sources are parsed. The thread writes `history` (captured by the closure); join()
+        // makes that write visible here before it is read.
         auto gitThread = new Thread({ if (useGit) history = load(root); });
         gitThread.start();
         auto analysis = analyzer.analyze(root, includeTests);
@@ -93,18 +112,27 @@ final class CityModel
     bool hasPulls() const { return hasGithub && github.hasPulls; }
 
     /// The model as served to the web viewer; computed on first use.
+    ///
+    /// Called from the server's connection threads at the same time, so the cache is read and written under the
+    /// model's monitor: the first caller builds the string, later ones wait for it and then share it.
     string json()
     {
-        if (cachedJson is null) cachedJson = toJson();
-        return cachedJson;
+        synchronized (this)
+        {
+            if (cachedJson is null) cachedJson = toJson();
+            return cachedJson;
+        }
     }
 
+    /// Serialises the model in the format the web viewer (`app.js`) reads. Coordinates and sizes go through
+    /// `JsonWriter.number`, which rounds them to 3 decimals.
     private string toJson()
     {
         auto w = JsonWriter.create();
         w.beginObject()
             .field("name", name)
             .field("root", analysis.root)
+            // ISO 8601 in UTC to whole seconds: "YYYY-MM-DDTHH:MM:SS" is 19 characters, then "Z".
             .field("generatedAt", Clock.currTime.toUTC.toISOExtString[0 .. 19] ~ "Z")
             .fieldBool("hasGit", hasGit)
             .fieldNum("platform", platform)
@@ -182,7 +210,8 @@ final class CityModel
                 .field("endLine", t.endLine)
                 .fieldNum("x", b.lot.x).fieldNum("z", b.lot.z).fieldNum("y", b.lot.y)
                 .fieldNum("side", b.lot.side)
-                .field("district", b.lot.district)
+                // Index into the "districts" array above (pre-order, as produced by the layout).
+            .field("district", b.lot.district)
                 .field("nom", t.nom)
                 .field("noa", t.noa)
                 .field("loc", t.loc)
@@ -200,6 +229,7 @@ final class CityModel
                 foreach (p; b.prs) w.value(p);
                 w.endArray();
             }
+            // Methods as compact tuples [name, line, loc, complexity, parameters] to keep the JSON small.
             w.name("methods").beginArray();
             foreach (m; b.methods)
                 w.beginArray().value(m.name).value(m.line).value(m.loc).value(m.complexity).value(m.parameters).endArray();
@@ -215,10 +245,17 @@ final class CityModel
     }
 }
 
+/// Joins the per-type data into `Building`s, one per `a.types` entry and in the same order: the type's lot,
+/// root-relative file path, git history, dependency edges in both directions and the open PRs touching its file.
+///
+/// `github` is null when there is no GitHub context. PR file paths are relative to the repository root while
+/// `file` is relative to the analysed root, so `GitHubInfo.prefix` (the root's path inside the repository) is put in
+/// front before looking them up. Dependencies on fqns that are not in `a.types` are dropped.
 private Building[] resolve(ref Analysis a, Lot[string] lots, const(GitHubInfo)* github)
 {
     size_t[string] index;
     foreach (i, ref t; a.types) index[t.fqn] = i;
+    // Repository-relative path → indices of the PRs that change it.
     size_t[][string] pullsByPath;
     if (github !is null && github.hasPulls)
         foreach (i, pr; github.pulls)
@@ -238,9 +275,12 @@ private Building[] resolve(ref Analysis a, Lot[string] lots, const(GitHubInfo)* 
     {
         const file = relativePath(t.file, a.root).replace("\\", "/");
         const repoPath = github !is null ? github.prefix ~ file : file;
+        // Most complex first, larger first on ties; the stable sort keeps source order among equal methods.
         auto methods = t.methods.dup;
         methods.sort!((x, y) => x.complexity != y.complexity ? x.complexity > y.complexity : x.loc > y.loc, SwapStrategy.stable);
         if (methods.length > maxMethods) methods = methods[0 .. maxMethods];
+        // History is keyed by absolute path (git top level + repository-relative path); this matches `t.file`
+        // because the analysed root was canonicalised (see `parseArgs` in app.d).
         auto h = t.file in a.history;
         result[i] = Building(i, lots[t.fqn], file, h !is null, h ? *h : FileHistory.init, deps[i], incoming[i],
             pullsByPath.get(repoPath, null), methods);
@@ -261,6 +301,7 @@ private Stats computeStats(ref Analysis a)
         s.methods += t.nom;
         s.loc += t.loc;
     }
+    // Fixed language order first, then a stable sort by count, so equal counts keep the order Java, TS, Rust.
     foreach (l; [Language.java, Language.typescript, Language.rust])
         if (auto n = l in counts) s.languages ~= LanguageCount(l, *n);
     s.languages.sort!((x, y) => x.count > y.count, SwapStrategy.stable);

@@ -6,6 +6,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
@@ -109,5 +110,56 @@ class JavaAnalyzerTest {
         TypeInfo first = analyzer.analyze(root, true).types().getFirst();
         TypeInfo second = analyzer.analyze(root, true).types().getFirst();
         assertTrue(first == second, "expected cached instance");
+    }
+
+    @Test
+    void resolutionNeverSeesTheDefaultPackage() throws IOException {
+        // Default package: `Line` inside Order is the member type, not the top-level `Line`.
+        write("src/main/java/Line.java", "class Line {}");
+        write("src/main/java/Util.java", "class Util {}");
+        write("src/main/java/Order.java", "class Order { Line l; static class Line {} }");
+        // Named package: default-package types are invisible, imports and the same package are used instead.
+        write("src/main/java/shop/Cart.java",
+                "package shop;\nimport other.Util;\nclass Cart { Line l; Util u; Order o; other.Helper h; }");
+        write("src/main/java/shop/Line.java", "package shop; class Line {}");
+        write("src/main/java/other/Util.java", "package other; public class Util {}");
+        write("src/main/java/other/Helper.java", "package other; public class Helper {}");
+        Analysis analysis = analyze();
+        assertEquals(Set.of("Order.Line"), analysis.dependencies().get("Order"));
+        assertEquals(Set.of("other.Helper", "other.Util", "shop.Line"), analysis.dependencies().get("shop.Cart"));
+    }
+
+    @Test
+    void linesFollowTreeSitterRowsAndTrailingBlockComments() throws IOException {
+        // A lone \r is not a line break; the comment opened after `int x;` hides the next line.
+        write("src/main/java/a/A.java", "package a;\rclass A {\n  int x; /* start\n  comment\n  end */\n  int y;\n}\n");
+        TypeInfo t = analyze().types().getFirst();
+        assertEquals(List.of(1, 6, 4), List.of(t.line(), t.endLine(), t.loc()));
+    }
+
+    @Test
+    void duplicateFqnAcrossLanguagesIsDroppedWithItsDependencies() throws IOException {
+        // The Java type `App.tsx` and the TypeScript module building `App.tsx` share an fqn; Java (first) wins.
+        write("App.java", "package App; class tsx { Other o; }");
+        write("Other.java", "package App; class Other {}");
+        write("App.tsx", "import { f } from \"./b\";\nexport function g() { return f(); }\n");
+        write("b.ts", "export function f() { return 1; }\n");
+        Analysis analysis = analyze();
+        TypeInfo app = analysis.types().stream().filter(t -> t.fqn().equals("App.tsx")).findFirst().orElseThrow();
+        // b.ts proves that TypeScript module buildings exist, so App.tsx really was produced twice.
+        assertTrue(analysis.types().stream().anyMatch(t -> t.fqn().equals("b.ts")));
+        assertEquals(Language.JAVA, app.language());
+        assertEquals(Set.of("App.Other"), analysis.dependencies().get("App.tsx"));
+    }
+
+    @Test
+    void cachedParsesSeeManifestChanges() throws IOException {
+        write("Cargo.toml", "[package]\nname = \"before\"\n");
+        write("src/lib.rs", "pub struct A;\n");
+        SourceAnalyzer analyzer = new SourceAnalyzer();
+        assertTrue(analyzer.analyze(root, true).types().stream().anyMatch(t -> t.fqn().equals("before::A")));
+        // Only the manifest changes (a different size, so the change is seen even within the mtime resolution).
+        write("Cargo.toml", "[package]\nname = \"after_rename\"\n");
+        assertTrue(analyzer.analyze(root, true).types().stream().anyMatch(t -> t.fqn().equals("after_rename::A")));
     }
 }

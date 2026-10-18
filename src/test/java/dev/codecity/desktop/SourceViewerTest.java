@@ -3,6 +3,7 @@ package dev.codecity.desktop;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -30,5 +31,19 @@ class SourceViewerTest {
         assertTrue(styleOf(lines.get(2), "MAX").contains("constant"));
         assertTrue(styleOf(lines.get(2), "42").contains("number"));
         assertTrue(styleOf(lines.get(2), "\"a\\\"b\"").contains("string"));
+    }
+
+    @Test
+    void unterminatedLiteralsDoNotMergeLines() {
+        var lines = SourceViewer.highlight("String a = \"open\nString b = \"x\\\nint C = 1;\n");
+        assertEquals(4, lines.size());
+        assertTrue(styleOf(lines.get(1), "String").contains("type"));
+        assertTrue(styleOf(lines.get(2), "int").contains("keyword"));
+    }
+
+    @Test
+    void lifetimesOnlyInRust() {
+        var ts = SourceViewer.highlight("import 'react';", Set.of("import"));
+        assertTrue(styleOf(ts.get(0), "'react'").contains("string"));
     }
 }

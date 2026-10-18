@@ -214,3 +214,17 @@
 .code.number { -fx-fill: #79c0ff; }
 .code.constant { -fx-fill: #79c0ff; }
 .code.annotation { -fx-fill: #d2a8ff; }
+
+/* ---------- walk mode ---------- */
+.crosshair { -fx-background-color: -cc-text; -fx-opacity: 0.85; }
+.toggle-button {
+    -fx-background-color: -cc-input;
+    -fx-background-radius: 9;
+    -fx-border-color: -cc-border;
+    -fx-border-radius: 9;
+    -fx-text-fill: -cc-text;
+    -fx-cursor: hand;
+}
+.toggle-button:hover { -fx-background-color: -cc-accent-soft; -fx-border-color: -cc-accent; }
+.toggle-button:selected { -fx-background-color: -cc-accent; -fx-border-color: -cc-accent; -fx-text-fill: white; }
+.controls .toggle-button { -fx-font-size: 12px; -fx-padding: 6 4 6 4; }

@@ -118,4 +118,69 @@ class RustAnalyzerTest {
         assertEquals("flags::defs", t.get("app::flags::defs::Verbose").packageName());
         assertTrue(analyze().dependencies().get("app::App").contains("core_lib::Engine"), "dependency across crates");
     }
+
+    @Test
+    void qualifiedPathsResolveTheTypesInsideTheBrackets() throws IOException {
+        write("Cargo.toml", "[package]\nname = \"q\"\n");
+        write("src/lib.rs", """
+                pub fn helper() {}
+                pub trait Tr { type Item; }
+                pub struct S;
+                impl S { fn f<T>(x: <T as Tr>::Item) {} }
+                """);
+        Analysis a = analyze(); // used to throw from Resolver.resolve, aborting the whole analysis
+        assertTrue(a.dependencies().get("q::S").contains("q::Tr"));
+    }
+
+    @Test
+    void findsThePackageNameAfterArrayValues() throws IOException {
+        write("Cargo.toml", "[package]\nauthors = [\"a\"]\nname = \"named\"\n[dependencies]\nname = \"no\"\n");
+        write("src/lib.rs", "pub struct A;\n");
+        assertTrue(byFqn(analyze()).containsKey("named::A"));
+    }
+
+    @Test
+    void pathsIntoATypeDependOnTheType() throws IOException {
+        write("Cargo.toml", "[package]\nname = \"p\"\n");
+        write("src/lib.rs", "pub mod cart;\npub enum Shape { Circle }\n");
+        write("src/cart.rs", """
+                pub struct Cart;
+                impl Cart { pub fn new() -> Self { Cart } }
+                pub struct Shop;
+                impl Shop { fn open(&self) { Cart::new(); let _s = crate::Shape::Circle; } }
+                """);
+        Analysis a = analyze();
+        assertTrue(a.dependencies().get("p::cart::Shop").contains("p::cart::Cart"), "Cart::new()");
+        assertTrue(a.dependencies().get("p::cart::Shop").contains("p::Shape"), "Shape::Circle");
+    }
+
+    @Test
+    void moduleBuildingsForImplsAreNamedAndPlacedLikeOtherModuleBuildings() throws IOException {
+        write("Cargo.toml", "[package]\nname = \"m\"\n");
+        write("src/lib.rs", "pub mod cart;\npub trait Probe { fn probe(&self); }\n");
+        write("src/cart.rs", """
+                pub struct Cart;
+                #[cfg(test)]
+                mod tests {
+                    impl crate::Probe for u32 { fn probe(&self) {} }
+                }
+                """);
+        Analysis a = analyze();
+        TypeInfo tests = byFqn(a).get("m::cart::tests::{fn}");
+        assertEquals("cart", tests.packageName(), "cfg(test) modules stay in their parent's district");
+        assertEquals("mod tests", tests.name());
+        assertTrue(tests.test());
+        assertTrue(a.dependencies().get("m::cart::tests::{fn}").contains("m::Probe"));
+    }
+
+    @Test
+    void seesCargoManifestChangesOnReanalysis() throws IOException {
+        SourceAnalyzer analyzer = new SourceAnalyzer();
+        write("Cargo.toml", "[package]\nname = \"before\"\n");
+        write("src/lib.rs", "pub struct A;\n");
+        assertTrue(byFqn(analyzer.analyze(root, true)).containsKey("before::A"));
+        write("Cargo.toml", "[package]\nname = \"after\"\n");
+        write("src/lib.rs", "pub struct A; // changed, so the file is parsed again\n");
+        assertTrue(byFqn(analyzer.analyze(root, true)).containsKey("after::A"));
+    }
 }

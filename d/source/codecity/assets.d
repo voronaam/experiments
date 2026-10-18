@@ -3,6 +3,7 @@ module codecity.assets;
 
 enum indexHtml = import("index.html");
 enum appJs = import("app.js");
+enum walkJs = import("walk.js");
 enum styleCss = import("style.css");
 enum faviconSvg = import("favicon.svg");
 
@@ -13,6 +14,7 @@ bool asset(string path, out string contentType, out string body_)
     {
     case "/", "/index.html": contentType = "text/html; charset=utf-8"; body_ = indexHtml; return true;
     case "/app.js": contentType = "text/javascript; charset=utf-8"; body_ = appJs; return true;
+    case "/walk.js": contentType = "text/javascript; charset=utf-8"; body_ = walkJs; return true;
     case "/style.css": contentType = "text/css; charset=utf-8"; body_ = styleCss; return true;
     case "/favicon.svg": contentType = "image/svg+xml"; body_ = faviconSvg; return true;
     default: return false;

@@ -1,7 +1,14 @@
 /// GitHub integration: repository URLs, the clone cache, remote detection and open pull requests.
+///
+/// Runs before the city is built (see `run` in app.d): a GitHub URL on the command line is cloned into a local cache
+/// and analysed like any directory; for a local tree with a GitHub remote, `GitHubInfo.detect` works out where the
+/// tree lives on GitHub (so the viewer can link to files, blame and history) and `fetchPulls` loads the open pull
+/// requests once, for the PR overlay. Rebuilds in watch mode reuse that information and do not contact GitHub again.
+///
+/// GitHub Enterprise hosts are supported; their APIs live under `/api/v3` and `/api/graphql` on the host itself.
 module codecity.github;
 
-import codecity.git : realPath, run;
+import codecity.git : output, realPath, run;
 import std.algorithm : canFind, endsWith, startsWith;
 import std.array : replace, split;
 import std.conv : to;
@@ -9,7 +16,7 @@ import std.file : exists, isDir, mkdirRecurse;
 import std.format : format;
 import std.json;
 import std.path : buildPath, dirName, relativePath;
-import std.process : environment, execute, spawnProcess, wait;
+import std.process : environment, spawnProcess, wait;
 import std.regex : ctRegex, matchFirst;
 import std.stdio : stderr, writefln, writeln;
 import std.string : strip, toLower;
@@ -25,6 +32,7 @@ struct GitHubRepo
     /// Only hosts containing "github" match. Throws on `.`/`..` path segments.
     static bool parse(string text, out GitHubRepo repo)
     {
+        // One owner or repository name: letters, digits, `_`, `.` and `-` (no slashes).
         enum segment = `[A-Za-z0-9_.-]+`;
         const s = text.strip;
         string stripGit(string n) { return n.endsWith(".git") ? n[0 .. $ - 4] : n; }
@@ -37,9 +45,15 @@ struct GitHubRepo
         }
         else
         {
+            // In each pattern: group 1 = host, 2 = owner, 3 = repository; for HTTPS, group 4 = branch. Optional
+            // `user@` parts and ports are accepted and dropped. The branch group is lazy so a trailing slash is not
+            // part of it, but it may contain slashes itself (`/tree/release/2.x`).
             foreach (i, re; [
+                // https://[user@]host[:port]/owner/repo[/tree/branch][/]
                 ctRegex!(`^https?://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(` ~ segment ~ `)/(` ~ segment ~ `)(?:/tree/(.+?))?/?$`),
+                // scp-like SSH: user@host:owner/repo[.git]
                 ctRegex!(`^[^@\s]+@([^:/]+):(` ~ segment ~ `)/(` ~ segment ~ `)/?$`),
+                // ssh://[user@]host[:port]/owner/repo[.git]
                 ctRegex!(`^ssh://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(` ~ segment ~ `)/(` ~ segment ~ `)/?$`),
             ])
             {
@@ -52,6 +66,7 @@ struct GitHubRepo
                 }
             }
         }
+        // The owner and name become directories of the clone cache (`cloneOrUpdate`), so `.` and `..` would escape it.
         if (ok && ([".", ".."].canFind(repo.owner) || [".", ".."].canFind(repo.name)))
             throw new Exception(format("invalid repository %s/%s", repo.owner, repo.name));
         return ok;
@@ -73,7 +88,7 @@ struct PullRequest
     string author;
     string updatedAt;
     bool draft;
-    /// Repository-relative paths of the files it changes.
+    /// Repository-relative paths of the files it changes (all of them, fetched 100 at a time).
     string[] files;
 }
 
@@ -90,6 +105,9 @@ struct GitHubInfo
     string pullsSource;
 
     /// Finds a GitHub remote for the repository containing `root`.
+    ///
+    /// `origin` is preferred; otherwise the first remote (in `git remote -v` order) with a GitHub URL is used. False
+    /// when `root` is not in a git work tree or no remote points at GitHub. Pull requests are not fetched here.
     static bool detect(string root, out GitHubInfo info)
     {
         auto top = run(root, "rev-parse", "--show-toplevel");
@@ -115,6 +133,7 @@ struct GitHubInfo
         // a local-only commit would 404 on GitHub; fall back to the branch name then
         auto containing = run(root, "branch", "-r", "--contains", "HEAD");
         const pushed = containing !is null && containing.strip.length > 0;
+        // On a detached HEAD, --abbrev-ref prints "HEAD"; there is no branch name to fall back to then, so use the SHA.
         auto branch = run(root, "rev-parse", "--abbrev-ref", "HEAD");
         if (branch is null || branch == "HEAD") branch = sha;
         string prefix = relativePath(root, realPath(top)).replace("\\", "/");
@@ -126,6 +145,7 @@ struct GitHubInfo
 
 // ------------------------------------------------------------------ clone cache
 
+/// Where cloned repositories are kept: `$XDG_CACHE_HOME/codecity/repos`, or `~/.cache/codecity/repos`.
 string cacheRoot()
 {
     auto xdg = environment.get("XDG_CACHE_HOME", "");
@@ -134,9 +154,15 @@ string cacheRoot()
 }
 
 /// Clones blobless (full history, current files only) or fetches the latest state into an existing mirror.
+///
+/// The clone lives at `<cacheRoot>/<host>/<owner>/<name>` and is reused on later runs. `--filter=blob:none`
+/// downloads every commit and tree, which is all `git log --name-only` needs for the history metrics, but file
+/// contents only for the checked-out revision. Returns the clone's directory; throws if git fails.
 string cloneOrUpdate(GitHubRepo repo)
 {
     const dir = buildPath(cacheRoot(), repo.host, repo.owner, repo.name);
+    // Runs git with the terminal's stdin/stdout/stderr, so its progress output and any credential prompt are
+    // visible to the user.
     void interactive(string[] args)
     {
         auto status = wait(spawnProcess(["git"] ~ args));
@@ -157,6 +183,7 @@ string cloneOrUpdate(GitHubRepo repo)
         mkdirRecurse(dir.dirName);
         auto args = ["clone", "--filter=blob:none"];
         if (repo.branch.length) args ~= ["--branch", repo.branch];
+        // "--" ends the options, so nothing in the URL or path can be taken for one.
         interactive(args ~ ["--", repo.webUrl ~ ".git", dir]);
     }
     return dir;
@@ -164,8 +191,13 @@ string cloneOrUpdate(GitHubRepo repo)
 
 // ------------------------------------------------------------------ pull requests
 
+/// GraphQL: PRs per page and the page limit (at most 300 PRs). REST without a token: how many file-list requests
+/// (one per PR and 100 files) are made at most, out of the 60 requests per hour GitHub allows unauthenticated
+/// clients.
 private enum pageSize = 50, maxPages = 6, anonymousFileLookups = 30;
 
+/// An API token for the repository's host, or null. Environment variables come first (the same ones the `gh` CLI
+/// reads, enterprise-specific ones for other hosts), then `gh auth token` for a logged-in `gh`.
 private string token(ref const GitHubRepo repo)
 {
     foreach (v; repo.isPublic ? ["GH_TOKEN", "GITHUB_TOKEN"] : ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_TOKEN"])
@@ -173,21 +205,19 @@ private string token(ref const GitHubRepo repo)
         auto t = environment.get(v, "").strip;
         if (t.length) return t;
     }
-    try
-    {
-        auto r = execute(["gh", "auth", "token", "--hostname", repo.host]);
-        if (r.status == 0 && r.output.strip.length) return r.output.strip;
-    }
-    catch (Exception) {}
-    return null;
+    auto t = output(["gh", "auth", "token", "--hostname", repo.host]);
+    return t.length ? t : null;
 }
 
 private struct Response
 {
     JSONValue json;
+    /// The `X-RateLimit-Remaining` header: API requests left in the current window, or -1 when it was missing.
     long remaining = -1;
 }
 
+/// Performs one API call with libcurl and parses the JSON response. `body_` is sent only for POST (GraphQL). Throws
+/// on any non-2xx status, with a readable message for the common failures (see `failure`).
 private Response request(string method, string url, string tok, string body_ = null)
 {
     import std.net.curl : HTTP;
@@ -201,21 +231,52 @@ private Response request(string method, string url, string tok, string body_ = n
     if (method == "POST") http.postData = body_;
     auto data = appender!(ubyte[]);
     Response r;
+    string remainingHeader;
+    bool retryAfter;
     http.onReceiveHeader = (in char[] key, in char[] value) {
-        if (key.toLower == "x-ratelimit-remaining") r.remaining = value.to!long;
+        if (key.toLower == "x-ratelimit-remaining")
+        {
+            remainingHeader = value.idup;
+            r.remaining = value.to!long;
+        }
+        if (key.toLower == "retry-after") retryAfter = true;
     };
     http.onReceive = (ubyte[] chunk) { data.put(chunk); return chunk.length; };
     http.perform();
-    const status = http.statusLine.code;
-    if (status == 401) throw new Exception("token rejected (HTTP 401)");
-    if (status == 403 || status == 429) throw new Exception(format("rate limited (HTTP %d)", status));
-    if (status < 200 || status > 299) throw new Exception(format("HTTP %d", status));
+    if (auto msg = failure(http.statusLine.code, remainingHeader, retryAfter)) throw new Exception(msg);
     r.json = parseJSON(cast(string) data.data);
     return r;
 }
 
+/// The message for a failed request, or null for a 2xx status. GitHub answers an exhausted rate limit with 429, or
+/// with 403 and either `x-ratelimit-remaining: 0` (primary limit) or a `retry-after` header (secondary limit); any
+/// other 403 means the token or anonymous client may not access the repository.
+private string failure(int status, string rateLimitRemaining, bool retryAfter)
+{
+    if (status >= 200 && status <= 299) return null;
+    if (status == 429 || (status == 403 && (rateLimitRemaining == "0" || retryAfter)))
+        return format("rate limited (HTTP %d)", status);
+    if (status == 401) return "token rejected (HTTP 401)";
+    if (status == 403) return "access denied (HTTP 403)";
+    return format("HTTP %d", status);
+}
+
+/// Sends one GraphQL query and returns its `data`. GraphQL reports errors (bad token scope, unknown repository, …)
+/// with HTTP 200 and an "errors" array.
+private JSONValue query(ref const GitHubRepo repo, string tok, string text, JSONValue variables)
+{
+    JSONValue body_ = ["query": JSONValue(text), "variables": variables];
+    auto json = request("POST", repo.graphqlApi, tok, body_.toString).json;
+    if (auto errors = "errors" in json)
+        if (errors.type == JSONType.array && errors.array.length)
+            throw new Exception(str(errors.array[0], "message"));
+    auto data = "data" in json;
+    return data ? *data : JSONValue(null);
+}
+
 import core.time : seconds;
 
+/// The string member `key` of object `v`, or null when it is missing or not a string (e.g. JSON null).
 private string str(JSONValue v, string key)
 {
     auto p = key in v;
@@ -245,25 +306,28 @@ bool fetchPulls(ref const GitHubRepo repo, out PullRequest[] pulls, out string s
     }
 }
 
+/// With a token: the GraphQL API returns each PR together with its changed files, 50 PRs per request, so all open
+/// PRs (up to `maxPages` pages) cost only a few requests. PRs are ordered by last update, newest first, so when the
+/// page limit cuts the list off, the most recently active PRs are the ones kept. Each PR comes with its first 100
+/// files; a PR with more is completed 100 files per extra request, paged by cursor like the PRs.
 private void graphql(ref const GitHubRepo repo, string tok, out PullRequest[] pulls, out string source)
 {
-    const query = format("query($owner: String!, $name: String!, $cursor: String) { repository(owner: $owner, name: $name) { "
+    const pullsQuery = format("query($owner: String!, $name: String!, $cursor: String) { repository(owner: $owner, name: $name) { "
         ~ "pullRequests(states: OPEN, first: %d, after: $cursor, orderBy: {field: UPDATED_AT, direction: DESC}) { "
-        ~ "pageInfo { hasNextPage endCursor } nodes { number title url updatedAt isDraft author { login } files(first: 100) { nodes { path } } } } } }",
+        ~ "pageInfo { hasNextPage endCursor } nodes { number title url updatedAt isDraft author { login } files(first: 100) { pageInfo { hasNextPage endCursor } nodes { path } } } } } }",
         pageSize);
+    // The next 100 files of one PR, after the files seen so far.
+    enum filesQuery = "query($owner: String!, $name: String!, $number: Int!, $cursor: String) { repository(owner: $owner, name: $name) { "
+        ~ "pullRequest(number: $number) { files(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { path } } } } }";
+    // Cursor pagination: null asks for the first page, then each page's endCursor asks for the next.
     JSONValue cursor = null;
     bool more = true;
     foreach (_; 0 .. maxPages)
     {
         if (!more) break;
         JSONValue variables = ["owner": JSONValue(repo.owner), "name": JSONValue(repo.name), "cursor": cursor];
-        JSONValue body_ = ["query": JSONValue(query), "variables": variables];
-        auto json = request("POST", repo.graphqlApi, tok, body_.toString).json;
-        if (auto errors = "errors" in json)
-            if (errors.type == JSONType.array && errors.array.length)
-                throw new Exception(str(errors.array[0], "message"));
-        auto data = "data" in json;
-        auto repository = data ? "repository" in *data : null;
+        auto data = query(repo, tok, pullsQuery, variables);
+        auto repository = data.type == JSONType.object ? "repository" in data : null;
         if (repository is null || repository.type != JSONType.object) throw new Exception("repository not found or not accessible");
         auto prs = (*repository)["pullRequests"];
         foreach (n; prs["nodes"].array)
@@ -273,10 +337,19 @@ private void graphql(ref const GitHubRepo repo, string tok, out PullRequest[] pu
             pr.title = str(n, "title");
             pr.url = str(n, "url");
             auto author = "author" in n;
+            // author is null for deleted ("ghost") accounts.
             pr.author = author && author.type == JSONType.object ? str(*author, "login") : null;
             pr.updatedAt = str(n, "updatedAt");
             pr.draft = flag(n, "isDraft");
-            foreach (f; n["files"]["nodes"].array) pr.files ~= str(f, "path");
+            auto connection = n["files"];
+            while (true)
+            {
+                foreach (f; connection["nodes"].array) pr.files ~= str(f, "path");
+                if (!flag(connection["pageInfo"], "hasNextPage")) break;
+                JSONValue next = ["owner": JSONValue(repo.owner), "name": JSONValue(repo.name),
+                    "number": JSONValue(pr.number), "cursor": connection["pageInfo"]["endCursor"]];
+                connection = query(repo, tok, filesQuery, next)["repository"]["pullRequest"]["files"];
+            }
             pulls ~= pr;
         }
         more = flag(prs["pageInfo"], "hasNextPage");
@@ -285,28 +358,42 @@ private void graphql(ref const GitHubRepo repo, string tok, out PullRequest[] pu
     source = more ? format("latest %d open PRs", pulls.length) : "all open PRs";
 }
 
+/// Without a token: the REST API lists PRs without their files, so each PR costs one more request. One listing
+/// request (up to 100 PRs, most recently updated first) is followed by file requests (100 files each, until a page
+/// comes back short) PR by PR until the budget is used up: `anonymousFileLookups`, or fewer if the rate limit left
+/// after the listing is lower, keeping one request in reserve. A PR whose files do not fit in what is left is left
+/// out, like the PRs after it, rather than shown with only some of its files.
 private void rest(ref const GitHubRepo repo, out PullRequest[] pulls, out string source)
 {
     const base = format("%s/repos/%s/%s", repo.restApi, repo.owner, repo.name);
     auto listing = request("GET", base ~ "/pulls?state=open&sort=updated&direction=desc&per_page=100", null);
+    // Without the header, assume the full budget is available.
     const remaining = listing.remaining < 0 ? anonymousFileLookups + 1 : listing.remaining;
     const budget = remaining - 1 < anonymousFileLookups ? (remaining > 0 ? remaining - 1 : 0) : anonymousFileLookups;
+    long used = 0;
     auto nodes = listing.json.array;
     foreach (n; nodes)
     {
-        if (pulls.length >= budget) break;
         PullRequest pr;
         pr.number = n["number"].integer;
-        auto files = request("GET", format("%s/pulls/%d/files?per_page=100", base, pr.number), null).json;
+        bool done;
+        for (int page = 1; !done && used < budget; page++)
+        {
+            auto batch = request("GET", format("%s/pulls/%d/files?per_page=100&page=%d", base, pr.number, page), null).json.array;
+            used++;
+            foreach (f; batch) pr.files ~= str(f, "filename");
+            done = batch.length < 100;
+        }
+        if (!done) break;
         pr.title = str(n, "title");
         pr.url = str(n, "html_url");
         auto user = "user" in n;
         pr.author = user && user.type == JSONType.object ? str(*user, "login") : null;
         pr.updatedAt = str(n, "updated_at");
         pr.draft = flag(n, "draft");
-        foreach (f; files.array) pr.files ~= str(f, "filename");
         pulls ~= pr;
     }
+    // A full page of 100 may mean there are more open PRs than the listing returned.
     const complete = pulls.length == nodes.length && nodes.length < 100;
     if (!complete)
         writefln("  GitHub: no token found — showing the %d most recently updated open PRs. Set GH_TOKEN (or log in with `gh`) to see all of them.",
@@ -330,4 +417,16 @@ unittest
     try GitHubRepo.parse("github:../..", r);
     catch (Exception) threw = true;
     assert(threw);
+}
+
+unittest
+{
+    assert(failure(200, "59", false) is null);
+    assert(failure(403, "0", false) == "rate limited (HTTP 403)");
+    assert(failure(403, "4000", true) == "rate limited (HTTP 403)");
+    assert(failure(429, null, false) == "rate limited (HTTP 429)");
+    assert(failure(403, "4999", false) == "access denied (HTTP 403)");
+    assert(failure(403, null, false) == "access denied (HTTP 403)");
+    assert(failure(401, null, false) == "token rejected (HTTP 401)");
+    assert(failure(404, null, false) == "HTTP 404");
 }

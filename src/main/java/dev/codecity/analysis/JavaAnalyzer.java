@@ -39,14 +39,33 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.regex.Pattern;
 
-/** Java support: parses sources with JavaParser and extracts the classic CodeCity metrics per type. */
+/**
+ * Java support: parses sources with JavaParser and extracts the classic CodeCity metrics per type.
+ *
+ * <p>Every class, interface, enum, record and annotation type is a building, nested and member types included (each
+ * gets its own building, e.g. {@code Order.Line}); local and anonymous classes are not. Packages are the districts,
+ * and the path up to the first {@code src} directory is the build module.
+ *
+ * <p>Parsing is purely syntactic: no classpath and no symbol solver. References are collected as the names written in
+ * the source and resolved in {@link #link} against the set of project types, following Java's scoping rules closely
+ * enough for project-internal edges. Java needs no extra linker context: everything is stored on {@link TypeInfo}
+ * (references and imports), so {@link ParsedFile#context()} is null.
+ */
 public final class JavaAnalyzer implements LanguageSupport {
 
+    /**
+     * One parser per thread, because a {@link JavaParser} instance is not thread-safe and files are parsed in parallel.
+     * Comments are not attached to AST nodes, as nothing here reads them.
+     */
     private final ThreadLocal<JavaParser> parsers = ThreadLocal.withInitial(() -> new JavaParser(
             new ParserConfiguration()
                     .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_25)
                     .setAttributeComments(false)));
+
+    /** A {@code \r} that is not part of a {@code \r\n}. */
+    private static final Pattern LONE_CR = Pattern.compile("\r(?!\n)");
 
     @Override
     public Language language() {
@@ -71,9 +90,16 @@ public final class JavaAnalyzer implements LanguageSupport {
         return new Linked(unique, resolveDependencies(unique, byFqn));
     }
 
+    /**
+     * Extracts every type of one file. JavaParser recovers from many syntax errors and still returns a partial tree;
+     * such files are analysed as far as possible and only flagged as failed. Without any tree the file contributes
+     * nothing.
+     */
     @Override
     public ParsedFile parse(Path root, Path file, String code) {
-        ParseResult<CompilationUnit> parsed = parsers.get().parse(code);
+        // JavaParser counts a lone '\r' as a line break, tree-sitter (used by the other editions) does not. Parsing
+        // it as a space keeps every line number, and what the rest of the line means, as tree-sitter sees it.
+        ParseResult<CompilationUnit> parsed = parsers.get().parse(LONE_CR.matcher(code).replaceAll(" "));
         Optional<CompilationUnit> unit = parsed.getResult();
         if (unit.isEmpty()) {
             return new ParsedFile(file, List.of(), null, true);
@@ -85,6 +111,13 @@ public final class JavaAnalyzer implements LanguageSupport {
         boolean test = isTest(relative);
         String pkg = cu.getPackageDeclaration().map(p -> p.getNameAsString()).orElse("");
 
+        // Imports are recorded by what they make visible under a simple name:
+        //   import a.b.C;          → explicit "a.b.C"
+        //   import static a.b.C.m; → explicit "a.b.C" (the member's declaring type is what this file depends on)
+        //   import static a.b.C.*; → explicit "a.b.C" (getNameAsString() omits the ".*")
+        //   import a.b.*;          → wildcard "a.b"
+        // A static import thus makes C a resolution candidate for a reference to "C". Calls to a statically imported
+        // member name no type, so they do not by themselves create a dependency on C.
         List<String> explicitImports = new ArrayList<>();
         List<String> wildcardImports = new ArrayList<>();
         for (ImportDeclaration imp : cu.getImports()) {
@@ -100,14 +133,18 @@ public final class JavaAnalyzer implements LanguageSupport {
         }
 
         List<TypeInfo> types = new ArrayList<>();
+        // findAll walks the whole tree, so member types are found as well as top-level ones.
         for (TypeDeclaration<?> td : cu.findAll(TypeDeclaration.class)) {
             Optional<String> fqn = td.getFullyQualifiedName();
             if (fqn.isEmpty()) {
                 continue; // local class
             }
+            // Strip the package: "com.acme.Order.Line" → "Order.Line".
             String name = pkg.isEmpty() ? fqn.get() : fqn.get().substring(pkg.length() + 1);
             int begin = td.getBegin().map(p -> p.line).orElse(1);
             int end = td.getEnd().map(p -> p.line).orElse(begin);
+            // LOC and references of an outer type include those of its member types, because both are measured over
+            // the outer type's whole extent.
             types.add(new TypeInfo(
                     Language.JAVA, fqn.get(), name, pkg, module, kindOf(td), file, begin, end,
                     SourceText.countLoc(lines, begin, end), countAttributes(td), test,
@@ -118,7 +155,12 @@ public final class JavaAnalyzer implements LanguageSupport {
     }
 
 
-    /** "core/api" for {@code core/api/src/main/java/...}; "" when sources sit directly under the root. */
+    /**
+     * "core/api" for {@code core/api/src/main/java/...}; "" when sources sit directly under the root.
+     *
+     * <p>The module is everything before the first {@code src} segment, which matches the Maven and Gradle layouts
+     * without reading any build file. A file outside any {@code src} directory belongs to the root module "".
+     */
     static String moduleOf(Path relative) {
         List<String> parts = new ArrayList<>();
         for (Path p : relative) {
@@ -131,6 +173,7 @@ public final class JavaAnalyzer implements LanguageSupport {
         return "";
     }
 
+    /** In a test directory, or named like a JUnit ({@code *Test}, {@code *Tests}) or Failsafe ({@code *IT}) test. */
     static boolean isTest(Path relative) {
         String name = relative.getFileName().toString();
         return SourceText.inTestDirectory(relative)
@@ -138,6 +181,7 @@ public final class JavaAnalyzer implements LanguageSupport {
     }
 
 
+    /** Abstract classes get their own kind so the viewers can tell them apart from concrete ones. */
     private static String kindOf(TypeDeclaration<?> td) {
         if (td instanceof ClassOrInterfaceDeclaration c) {
             if (c.isInterface()) {
@@ -157,6 +201,10 @@ public final class JavaAnalyzer implements LanguageSupport {
         return "class";
     }
 
+    /**
+     * Number of attributes (NOA): every declared variable counts, so {@code int x, y;} is two. Static fields count too.
+     * Record components and enum constants are attributes as well, although they are not field declarations.
+     */
     private static int countAttributes(TypeDeclaration<?> td) {
         int n = td.getFields().stream().mapToInt(f -> f.getVariables().size()).sum();
         if (td instanceof RecordDeclaration r) {
@@ -168,6 +216,10 @@ public final class JavaAnalyzer implements LanguageSupport {
         return n;
     }
 
+    /**
+     * Methods and constructors declared directly in the type (not in member types, which are buildings of their own).
+     * Initialiser blocks and compact record constructors are not {@link CallableDeclaration}s and are not counted.
+     */
     private static List<MethodInfo> methodsOf(TypeDeclaration<?> td, String[] lines) {
         List<MethodInfo> methods = new ArrayList<>();
         for (BodyDeclaration<?> member : td.getMembers()) {
@@ -181,7 +233,14 @@ public final class JavaAnalyzer implements LanguageSupport {
         return methods;
     }
 
-    /** McCabe cyclomatic complexity: 1 + number of decision points. */
+    /**
+     * McCabe cyclomatic complexity: 1 + number of decision points.
+     *
+     * <p>Decision points are {@code if}, the four loops, {@code catch}, {@code ?:}, every {@code case} entry (a
+     * {@code default} has no labels and is not counted; {@code case 1, 2 ->} counts once) and every {@code &&} or
+     * {@code ||}. The walk covers the whole subtree, so lambdas and anonymous classes inside a method add to that
+     * method's complexity. The TypeScript and Rust analysers count the equivalent constructs of their languages.
+     */
     static int complexity(Node node) {
         int[] cx = {1};
         node.walk(n -> {
@@ -198,6 +257,11 @@ public final class JavaAnalyzer implements LanguageSupport {
         return cx[0];
     }
 
+    /**
+     * Raw names this type uses, as written: type usages ({@code a.b.C}, {@code Map.Entry}, without type arguments),
+     * annotations, and type-like scopes of method calls and field accesses ({@code Foo.bar()}). Names of JDK or
+     * library types are collected too; {@link #resolve} simply finds no project type for them.
+     */
     private static Set<String> referencesOf(TypeDeclaration<?> td) {
         Set<String> refs = new HashSet<>();
         td.walk(n -> {
@@ -214,7 +278,10 @@ public final class JavaAnalyzer implements LanguageSupport {
         return refs;
     }
 
-    /** {@code Foo.bar()} / {@code Foo.BAR}: an upper-case scope is very likely a type name. */
+    /**
+     * {@code Foo.bar()} / {@code Foo.BAR}: an upper-case scope is very likely a type name. Without a symbol solver a
+     * static call parses like a call on a variable named {@code Foo}, so Java's naming convention decides.
+     */
     private static void addTypeLikeScope(Expression scope, Set<String> refs) {
         if (scope instanceof NameExpr name) {
             String s = name.getNameAsString();
@@ -227,6 +294,9 @@ public final class JavaAnalyzer implements LanguageSupport {
     /**
      * Resolves raw type names against the project using Java's own lookup order (enclosing types, single-type imports,
      * same package, on-demand imports). No classpath is needed because only project-internal edges matter.
+     *
+     * @return fqn → resolved fqns, in reference order; names that match no project type are dropped, as are self
+     *         references
      */
     static Map<String, Set<String>> resolveDependencies(List<TypeInfo> types, Map<String, TypeInfo> byFqn) {
         Map<String, Set<String>> deps = new HashMap<>();
@@ -243,10 +313,25 @@ public final class JavaAnalyzer implements LanguageSupport {
         return deps;
     }
 
+    /**
+     * Resolves one name written in {@code from}, or returns null if it names no project type.
+     *
+     * <p>Only the first segment of a dotted name is looked up; the rest is appended to each candidate. For
+     * {@code Order.Line} written in {@code com.acme.shop.Cart.Item} the candidates are, in order:
+     * <pre>
+     *   com.acme.shop.Cart.Item.Order   member of the type itself
+     *   com.acme.shop.Cart.Order        member of an enclosing type, innermost first
+     *   a.b.Order                       for each single-type import "a.b.Order"
+     *   com.acme.shop.Order             same package
+     *   x.y.Order                       for each on-demand import "x.y.*"
+     * </pre>
+     * The first candidate that exists wins, with {@code .Line} appended if that exists, else the candidate itself
+     * (so an unknown nested name still yields an edge to the outer type). Member types inherited from supertypes are
+     * not considered. Only when no candidate exists is the name taken as already fully qualified
+     * ({@code com.acme.Order}). Types in the default package are found only from the default package itself (as its
+     * "same package" candidate): as in Java, they are invisible from named packages.
+     */
     private static String resolve(String ref, TypeInfo from, Map<String, TypeInfo> byFqn) {
-        if (byFqn.containsKey(ref)) {
-            return ref;
-        }
         int dot = ref.indexOf('.');
         String first = dot < 0 ? ref : ref.substring(0, dot);
         String rest = dot < 0 ? "" : ref.substring(dot);
@@ -263,7 +348,7 @@ public final class JavaAnalyzer implements LanguageSupport {
             enclosing = enclosing.substring(0, i);
         }
         for (String imp : from.explicitImports()) {
-            if (imp.equals(first) || imp.endsWith("." + first)) {
+            if (imp.endsWith("." + first)) {
                 candidates.add(imp);
             }
         }
@@ -279,6 +364,8 @@ public final class JavaAnalyzer implements LanguageSupport {
                 return c;
             }
         }
-        return null;
+        // Already fully qualified, which a default-package type never is from outside that package.
+        TypeInfo target = byFqn.get(ref);
+        return target != null && !target.packageName().isEmpty() ? ref : null;
     }
 }

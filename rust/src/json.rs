@@ -1,8 +1,17 @@
 //! Minimal streaming JSON writer whose output is safe to embed inside an HTML `<script>` element
 //! (mirrors the Java version's number formatting so both produce identical files).
+//!
+//! The writer is a builder: every method appends to one `String` and returns `&mut Self`, so a document is written as
+//! a chain such as `w.begin_object().field_str("a", "x").name("b").begin_array().int(1).end_array().end_object()`.
+//! It does not check structure; callers must balance `begin_*`/`end_*` and put a `name` before every value inside an
+//! object.
+//!
+//! Commas are handled by one flag, `need_comma`: it is true right after a complete value (so the next value or name
+//! needs a `,` first) and false right after `{`, `[` or `name:` (where the next value must follow directly).
 
 use std::fmt::Write;
 
+/// Builds one JSON document in memory; take it with [`JsonWriter::finish`].
 pub struct JsonWriter {
     out: String,
     need_comma: bool,
@@ -16,6 +25,7 @@ impl Default for JsonWriter {
 
 impl JsonWriter {
     pub fn new() -> Self {
+        // Pre-sized to 64 KiB to save the first few regrowths while a city document is written.
         JsonWriter { out: String::with_capacity(1 << 16), need_comma: false }
     }
 
@@ -51,6 +61,7 @@ impl JsonWriter {
         self
     }
 
+    /// Writes an object key and its colon; the value written next belongs to it.
     pub fn name(&mut self, name: &str) -> &mut Self {
         self.comma();
         self.string(name);
@@ -81,9 +92,15 @@ impl JsonWriter {
     }
 
     /// Rounded to 3 decimals; whole numbers are written without a fraction.
+    ///
+    /// Three decimals keep the file small. Rust's `{}` for `f64` prints the shortest representation that
+    /// round-trips (`0.4`, not `0.40000000000000002`) and never uses an exponent. The rounding is Java's
+    /// `Math.round`, which rounds halves up (`-2.0625` → `-2.062`), not `f64::round`, which rounds them away from
+    /// zero; the 1e15 bound is the Java edition's too. JSON has no NaN or infinity, so those are written as `0`.
     pub fn num(&mut self, v: f64) -> &mut Self {
         self.comma();
-        let r = (v * 1000.0).round() / 1000.0;
+        let r = if v.is_finite() { round_half_up(v * 1000.0) / 1000.0 } else { 0.0 };
+        // `2` rather than `2.0`. Larger whole values are printed by the float branch (as in the Java edition).
         if r == r.trunc() && r.abs() < 1e15 {
             let _ = write!(self.out, "{}", r as i64);
         } else {
@@ -97,6 +114,7 @@ impl JsonWriter {
         self.raw(if v { "true" } else { "false" })
     }
 
+    /// Writes `json` verbatim as a value; the caller must make sure it is valid JSON.
     pub fn raw(&mut self, json: &str) -> &mut Self {
         self.comma();
         self.out.push_str(json);
@@ -120,6 +138,10 @@ impl JsonWriter {
         self.name(n).bool(v)
     }
 
+    /// Writes a quoted, escaped string literal. On top of what JSON requires (quote, backslash, control characters),
+    /// it escapes `<`, `>` and `&` as `\u003c` etc., so the output can never contain `</script>` or `<!--` and is safe
+    /// inside an HTML `<script>` element (see `export.rs`). U+2028 and U+2029 are escaped too: older JavaScript
+    /// engines treat them as line terminators, which would break the string if the JSON were evaluated as script.
     fn string(&mut self, s: &str) {
         self.out.push('"');
         for c in s.chars() {
@@ -143,6 +165,13 @@ impl JsonWriter {
     }
 }
 
+/// Nearest whole number, halves rounded up (towards positive infinity), like Java's `Math.round`. `x - floor(x)` is
+/// exact for every finite double, so the comparison with 0.5 is too.
+fn round_half_up(x: f64) -> f64 {
+    let f = x.floor();
+    if x - f >= 0.5 { f + 1.0 } else { f }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +183,17 @@ mod tests {
         w.name("e").begin_array().int(1).int(2).end_array().end_object();
         let escaped = format!("{0}u003c/script{0}u003e", '\\');
         assert_eq!(w.finish(), format!(r#"{{"a":"{escaped}","b":2,"c":0.4,"d":1.235,"e":[1,2]}}"#));
+    }
+
+    #[test]
+    fn rounds_halves_up_like_java_and_writes_non_finite_as_zero() {
+        let mut w = JsonWriter::new();
+        w.begin_array();
+        // 2.0625 * 1000 = 2062.5 exactly, so these are true ties at the third decimal.
+        for v in [2.0625, -2.0625, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            w.num(v);
+        }
+        w.end_array();
+        assert_eq!(w.finish(), "[2.063,-2.062,-1,0,0,0]");
     }
 }

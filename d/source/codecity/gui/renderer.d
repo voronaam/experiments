@@ -1,5 +1,29 @@
 /// OpenGL 3.3 renderer: every building and district is one instance of a unit box (a handful of draw calls for any
 /// city), lit with a sun + ambient model, soft PCF shadow mapping, and the night-time glow / office-window shader.
+///
+/// The renderer knows nothing about types or metrics: `codecity.gui.app` turns the city model into flat arrays of
+/// `Instance`s (one per building, district, particle, …) and the arc mesh, uploads them through the `set*` methods
+/// whenever they change, and calls `render` once per frame. Picking is not done here but on the CPU by ray-casting
+/// against the same boxes (`App.pick` with `codecity.gui.math.rayBox`).
+///
+/// Each frame:
+/// ---
+/// 1. shadow pass (only when the districts/buildings changed): depth of districts + buildings, seen from the sun,
+///    into a 4096² depth texture
+/// 2. lit pass, opaque, back faces culled:   ground, districts (no night effects), buildings (glow + windows)
+/// 3. unlit pass, opaque, no culling:        dependency arcs (mesh), particles on the arcs, PR beacon gems
+/// 4. blended, no depth writes:              the translucent selection marker box
+/// ---
+/// ImGui is drawn afterwards by `runGui`, on top of all this.
+///
+/// Shapes and GL state: every shape is one `InstancedShape` (a VAO with its per-vertex buffer and a per-instance
+/// buffer). All but the beacons share the unit box from `boxVertices`; a building is that box translated to its lot
+/// and scaled to (side, height, side). The renderer leaves depth testing enabled and blending enabled when it returns;
+/// ImGui's OpenGL3 backend sets up the state it needs itself.
+///
+/// Colours: instance colours are sRGB in 0..1. The lit shader converts them to linear light, lights them, and converts
+/// back (gamma 2.2) because the default framebuffer is not an sRGB one; the unlit shaders pass them through as they
+/// are. Lighting uniforms (`Lighting.ambient` / `sun`) are expected in linear light.
 module codecity.gui.renderer;
 
 import codecity.gui.gl;
@@ -8,6 +32,16 @@ import std.conv : to;
 import std.math : PI;
 import std.string : toStringz;
 
+// The shaders are D token strings (`q{...}`), which must consist of valid D tokens; GLSL fits that well enough.
+// `layout(location = N)` must agree with the attribute numbers `InstancedShape` and `Renderer.this` set up:
+// 0 = vertex position, 1 = normal (or the arc mesh's colour), 2 = instance offset, 3 = instance scale,
+// 4 = instance colour.
+
+/// Lit vertex shader: places one vertex of the unit box for one instance. The box has its base at y = 0, so
+/// `iOffset` is the centre of the box's bottom face and `iScale` its (width, height, depth); `world = iOffset + aPos *
+/// iScale`. Instances are only scaled and translated, never rotated, so the box's normals stay valid in world space
+/// and are passed through unchanged (non-uniform scale does not affect axis-aligned normals). The vertex is also
+/// projected into the sun's clip space (`vLight`) for the shadow lookup.
 private enum litVertex = q{
     #version 330 core
     layout(location = 0) in vec3 aPos;
@@ -31,6 +65,29 @@ private enum litVertex = q{
     }
 };
 
+/// Lit fragment shader.
+///
+/// `shadow()` returns the lit fraction 0..1. It maps the light-space position from NDC (-1..1) to texture/depth
+/// coordinates (0..1); anything outside the shadow map's box is treated as lit. It then takes 3 × 3 samples one texel
+/// apart (percentage-closer filtering): with a `sampler2DShadow`, every `texture()` call compares the fragment's depth
+/// (minus a bias of 0.0012 against shadow acne) with the stored depth, and because the texture uses `GL_LINEAR`
+/// filtering most hardware also blends the comparisons of the 2 × 2 nearest texels, so the 9 taps give a soft edge.
+///
+/// `main()`:
+/// - `base`: the instance colour converted from sRGB to linear light (gamma 2.2).
+/// - Lambert diffuse from the sun (`uSunDir` is the direction the light travels, hence `L = -uSunDir`). Faces turned
+///   away from the sun skip the shadow lookup; `uShadows` switches shadows off entirely.
+/// - Blinn-Phong specular (half vector `L + V`, exponent 32, strength 0.12), tinted by the sun, also shadowed.
+/// - Ambient sky light scaled by `hemi`: 1.0 on roofs, 0.72 on walls, 0.44 on the (invisible) undersides.
+/// - `uGlow` (night only, buildings only) adds a fraction of the building's own colour as emission, unlit.
+/// - `uWindows` (night only, buildings only) paints office windows on walls (`abs(n.y) < 0.5`). The wall is divided
+///   into a world-aligned grid of cells 0.42 wide and 0.5 high, using world `z` along walls that face ±x and world `x`
+///   along walls that face ±z, so neighbouring buildings line up. The window is the middle of the cell (22–78 % of
+///   its width, 28–72 % of its height). `rnd` is the classic `fract(sin(dot(...)) * 43758.5453)` hash of the cell,
+///   offset by the wall's normal so opposite walls differ. About 42 % of windows are lit (`rnd >= 0.58`), none below
+///   y = 0.9 (the ground floor, counted from the ground plane, not from the building's base). Most lit windows are
+///   warm yellow, the brightest ones (`rnd >= 0.9`) cool white; brightness varies between 0.6 and 1.0 with `rnd`.
+/// - The result is converted back to sRGB. Alpha is passed through but this pass does not blend.
 private enum litFragment = q{
     #version 330 core
     in vec3 vPos;
@@ -84,6 +141,8 @@ private enum litFragment = q{
     }
 };
 
+/// Shadow pass: only the position matters (no colour attachment, empty fragment shader); depth is written by the
+/// fixed-function stage. `uViewProj` is the sun's orthographic view-projection.
 private enum depthVertex = q{
     #version 330 core
     layout(location = 0) in vec3 aPos;
@@ -98,6 +157,8 @@ private enum depthFragment = q{
     void main() {}
 };
 
+/// Unlit instanced shapes (arc particles, PR beacons): flat instance colour, no lighting, no normals needed (the gem
+/// has none).
 private enum unlitInstancedVertex = q{
     #version 330 core
     layout(location = 0) in vec3 aPos;
@@ -109,6 +170,7 @@ private enum unlitInstancedVertex = q{
     void main() { vColor = iColor; gl_Position = uViewProj * vec4(iOffset + aPos * iScale, 1.0); }
 };
 
+/// The dependency-arc mesh: plain world-space triangles with a per-vertex colour (attribute 1), no instancing.
 private enum meshVertex = q{
     #version 330 core
     layout(location = 0) in vec3 aPos;
@@ -118,6 +180,7 @@ private enum meshVertex = q{
     void main() { vColor = aColor; gl_Position = uViewProj * vec4(aPos, 1.0); }
 };
 
+/// Shared fragment shader of the two unlit programs: the interpolated colour as is.
 private enum unlitFragment = q{
     #version 330 core
     in vec4 vColor;
@@ -126,6 +189,10 @@ private enum unlitFragment = q{
 };
 
 /// One instance: offset (x, y, z), scale (w, h, d), colour (r, g, b, a) — 10 floats.
+///
+/// Uploaded as is, so the field order and the tight packing of floats are what the attribute pointers in
+/// `InstancedShape` describe (offset at float 0, scale at float 3, colour at float 6, stride `Instance.sizeof`). For
+/// the box shapes, `offset` is the centre of the bottom face; for the gem, its centre. Colour is sRGB in 0..1.
 struct Instance
 {
     float[3] offset;
@@ -133,18 +200,24 @@ struct Instance
     float[4] color;
 }
 
-/// A vertex of the arc mesh.
+/// A vertex of the arc mesh (world position, sRGB colour); 7 tightly packed floats, matching the attribute pointers
+/// set up for `arcVao`.
 struct ColoredVertex
 {
     float[3] position;
     float[4] color;
 }
 
+/// A mesh drawn many times with `glDrawArraysInstanced`: one static vertex buffer (`vbo`) plus one dynamic buffer of
+/// `Instance`s (`instances`), bound together in a VAO. The VAO records which buffer each attribute reads from, so
+/// later `upload`s can replace the instance buffer's contents without touching the VAO.
 private final class InstancedShape
 {
     GLuint vao, vbo, instances;
+    /// Vertices in the mesh, and instances in the last upload.
     GLsizei vertexCount, count;
 
+    /// `vertices` is a flat list of triangles: (x, y, z) per vertex, followed by (nx, ny, nz) when `withNormals`.
     this(const(float)[] vertices, bool withNormals)
     {
         glGenVertexArrays(1, &vao);
@@ -163,7 +236,8 @@ private final class InstancedShape
         vertexCount = cast(GLsizei)(vertices.length / (withNormals ? 6 : 3));
         glGenBuffers(1, &instances);
         glBindBuffer(GL_ARRAY_BUFFER, instances);
-        // per-instance attributes: offset (location 2), scale (3), colour (4)
+        // per-instance attributes: offset (location 2), scale (3), colour (4), as [location, floats, first float].
+        // A divisor of 1 advances the attribute once per instance instead of once per vertex.
         foreach (spec; [[2, 3, 0], [3, 3, 3], [4, 4, 6]])
         {
             glEnableVertexAttribArray(spec[0]);
@@ -173,6 +247,8 @@ private final class InstancedShape
         glBindVertexArray(0);
     }
 
+    /// Replaces all instances. `glBufferData` reallocates the buffer each time (fine for these sizes, and simpler than
+    /// tracking capacity); null / empty data makes `draw` a no-op.
     void upload(const(Instance)[] data)
     {
         glBindBuffer(GL_ARRAY_BUFFER, instances);
@@ -188,9 +264,13 @@ private final class InstancedShape
     }
 }
 
+/// A linked vertex + fragment shader program. Compile and link errors throw with the driver's log; they happen in the
+/// `Renderer` constructor, so the viewer fails to start rather than running with a missing program.
 private final class Program
 {
     GLuint id;
+    /// Uniform locations by name, looked up once. A name the driver does not know (or optimised away) caches -1, and
+    /// `glUniform*` silently ignores location -1.
     GLint[string] uniforms;
 
     this(string vertex, string fragment)
@@ -240,10 +320,14 @@ private final class Program
     void set(string n, float v) { glUniform1f(loc(n), v); }
     void set(string n, int v) { glUniform1i(loc(n), v); }
     void set(string n, Vec3 v) { glUniform3f(loc(n), v.x, v.y, v.z); }
+    // column-major already, hence transpose = 0 (false)
     void set(string n, ref const Mat4 m) { glUniformMatrix4fv(loc(n), 1, 0, m.m.ptr); }
 }
 
 /// Unit box with its base at y = 0 and a 1×1 footprint centred on the origin: 36 vertices with normals.
+/// Each face is two triangles (corners 0-1-2 and 0-2-3) wound counter-clockwise seen from outside, the OpenGL default
+/// front face, so `GL_CULL_FACE` with `GL_BACK` removes the faces turned away from the camera. Layout per vertex:
+/// x, y, z, nx, ny, nz.
 private float[] boxVertices()
 {
     float[] v;
@@ -261,7 +345,8 @@ private float[] boxVertices()
     return v;
 }
 
-/// A faceted gem (octahedron) for the PR beacons.
+/// A faceted gem (octahedron) for the PR beacons: 1.6 tall and 1 wide, centred on the origin, positions only (it is
+/// drawn unlit).
 private float[] gemVertices()
 {
     float[] v;
@@ -271,15 +356,23 @@ private float[] gemVertices()
     return v;
 }
 
+/// The scene renderer. Must be created and used on the thread that owns the GL context, after `loadGL`.
 final class Renderer
 {
     private Program lit, depth, unlitInstanced, mesh;
     private InstancedShape buildings, districts, ground, particles, beacons, marker;
     private GLuint shadowFbo, shadowTex, arcVao, arcVbo;
     private GLsizei arcVertexCount;
+    /// Shadow map resolution in texels per side: 16.7 M texels of 24-bit depth, typically about 64 MiB of GPU memory.
     private enum shadowSize = 4096;
+    /// The sun's view-projection from the last shadow pass; the lit pass needs the same one to look up shadows.
     private Mat4 lightViewProj;
+    /// Shadows are static as long as the districts and buildings are, so the shadow map is only re-rendered after
+    /// they change (`setBuildings` with `geometryChanged` / `setDistricts`) or when shadows are switched back on
+    /// (`invalidateShadows`). Re-uploads for colour changes alone (hover, selection, search) keep the shadow map; every
+    /// frame of a height animation re-renders it.
     private bool shadowsDirty = true;
+    /// Direction the sunlight travels (not necessarily normalised): downwards, towards +x and slightly towards -z.
     Vec3 sunDir = Vec3(0.55f, -1.0f, -0.3f);
 
     this()
@@ -296,6 +389,9 @@ final class Renderer
         marker = new InstancedShape(box, true);
         beacons = new InstancedShape(gemVertices(), false);
 
+        // Shadow map: a depth texture used as a comparison sampler (`sampler2DShadow`): `texture()` returns
+        // ref <= stored (GL_LEQUAL) instead of the depth, and GL_LINEAR blends four such results. Outside the texture
+        // the border depth 1 (the far plane) means "nothing in the way", so the region beyond the map is lit.
         glGenTextures(1, &shadowTex);
         glBindTexture(GL_TEXTURE_2D, shadowTex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, shadowSize, shadowSize, 0, GL_DEPTH_COMPONENT, GL_FLOAT, null);
@@ -307,6 +403,7 @@ final class Renderer
         glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, border.ptr);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+        // a depth-only framebuffer: no colour buffer to draw into or read from
         glGenFramebuffers(1, &shadowFbo);
         glBindFramebuffer(GL_FRAMEBUFFER, shadowFbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, shadowTex, 0);
@@ -314,6 +411,7 @@ final class Renderer
         glReadBuffer(GL_NONE);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
+        // the arc mesh: position (location 0) and colour (location 1) interleaved as `ColoredVertex`
         glGenVertexArrays(1, &arcVao);
         glBindVertexArray(arcVao);
         glGenBuffers(1, &arcVbo);
@@ -325,13 +423,21 @@ final class Renderer
         glBindVertexArray(0);
     }
 
-    void setBuildings(const(Instance)[] data) { buildings.upload(data); shadowsDirty = true; }
+    /// `geometryChanged`: positions, heights or visibility differ from the last upload, not only colours.
+    void setBuildings(const(Instance)[] data, bool geometryChanged)
+    {
+        buildings.upload(data);
+        if (geometryChanged) shadowsDirty = true;
+    }
     void setDistricts(const(Instance)[] data) { districts.upload(data); shadowsDirty = true; }
+    // The ground does not cast shadows, and particles, beacons and the marker are not in the shadow pass, so these
+    // do not invalidate the shadow map.
     void setGround(Instance g) { ground.upload([g]); }
     void setParticles(const(Instance)[] data) { particles.upload(data); }
     void setBeacons(const(Instance)[] data) { beacons.upload(data); }
     void setMarker(const(Instance)[] data) { marker.upload(data); }
 
+    /// Replaces the arc mesh (a triangle list); empty hides the arcs.
     void setArcs(const(ColoredVertex)[] vertices)
     {
         glBindBuffer(GL_ARRAY_BUFFER, arcVbo);
@@ -341,6 +447,8 @@ final class Renderer
 
     void invalidateShadows() { shadowsDirty = true; }
 
+    /// Per-frame lighting, from the theme's `Palette`. `ambient` and `sun` are linear-light colours already multiplied
+    /// by their intensity; `glow` and `windows` drive the night effects; `shadows` is the user's toggle.
     struct Lighting
     {
         Vec3 ambient, sun;
@@ -348,10 +456,19 @@ final class Renderer
         bool shadows = true;
     }
 
+    /// Draws one frame into the default framebuffer (see the module comment for the passes).
+    ///
+    /// `width` / `height` are the framebuffer size in pixels (not window coordinates, which differ on HiDPI screens),
+    /// `viewProj` the camera's view-projection, `camera` its world position (for specular highlights), `radius` half
+    /// the city's diagonal (which sizes the shadow camera), `background` the sRGB clear colour.
     void render(int width, int height, ref const Mat4 viewProj, Vec3 camera, float radius, Vec3 background, Lighting light)
     {
         if (light.shadows && shadowsDirty)
         {
+            // The sun is a directional light, so the shadow camera is orthographic. It sits 3 radii from the centre,
+            // against the light's direction, looking at the origin; the box it sees is 2.3 radii wide and tall (the
+            // city fits in a circle of `radius`, plus some margin) and 7 radii deep, which covers the whole city
+            // whatever the sun direction. With 4096 texels over 2.3 radii, a texel is ~1/1780 of the radius.
             const d = sunDir.normalized;
             const eye = -d * (radius * 3);
             lightViewProj = Mat4.orthographic(-radius * 1.15f, radius * 1.15f, -radius * 1.15f, radius * 1.15f, 0.1f, radius * 7)
@@ -360,10 +477,13 @@ final class Renderer
             glViewport(0, 0, shadowSize, shadowSize);
             glClear(GL_DEPTH_BUFFER_BIT);
             glEnable(GL_DEPTH_TEST);
+            // push the stored depths slightly away from the light (slope factor 2, constant 4 units) so that surfaces
+            // do not shadow themselves (acne); this and the shader's bias work together
             glEnable(GL_POLYGON_OFFSET_FILL);
             glPolygonOffset(2.0f, 4.0f);
             depth.use();
             depth.set("uViewProj", lightViewProj);
+            // the ground is not drawn: it is the lowest surface, so it only receives shadows
             districts.draw();
             buildings.draw();
             glDisable(GL_POLYGON_OFFSET_FILL);
@@ -389,7 +509,8 @@ final class Renderer
         lit.set("uShadows", light.shadows ? 1.0f : 0.0f);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, shadowTex);
-        lit.set("uShadowMap", 0);
+        lit.set("uShadowMap", 0); // texture unit 0
+        // ground and districts never glow or get windows; only the buildings do
         lit.set("uGlow", 0.0f);
         lit.set("uWindows", 0.0f);
         ground.draw();
@@ -398,6 +519,9 @@ final class Renderer
         lit.set("uWindows", light.windows);
         buildings.draw();
 
+        // Culling is off from here on, so winding does not matter for the arc tubes, particles and gems (the gem's
+        // triangles are in fact wound clockwise, i.e. inside out), and the translucent marker shows its far faces
+        // through its near ones.
         glDisable(GL_CULL_FACE);
         if (arcVertexCount)
         {
@@ -410,6 +534,9 @@ final class Renderer
         unlitInstanced.set("uViewProj", viewProj);
         particles.draw();
         beacons.draw();
+        // The selection marker is a translucent box around the selected building, drawn last with ordinary alpha
+        // blending. It is depth-tested (so the city in front of it hides it) but does not write depth, so the
+        // building inside it still shows through.
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glDepthMask(0);
@@ -418,7 +545,9 @@ final class Renderer
         glBindVertexArray(0);
     }
 
-    /// Reads the colour buffer (rows bottom-up) as RGBA.
+    /// Reads the colour buffer (rows bottom-up) as RGBA. Called right after `render` and before ImGui draws, so
+    /// snapshots contain the city without the interface. A pack alignment of 1 keeps the rows tightly packed
+    /// whatever the width.
     ubyte[] readPixels(int width, int height)
     {
         auto data = new ubyte[width * height * 4];

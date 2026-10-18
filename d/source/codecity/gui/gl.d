@@ -1,4 +1,12 @@
 /// A tiny OpenGL 3.3 core loader: just the entry points the renderer uses, resolved through GLFW at start-up.
+///
+/// On most platforms the OpenGL library only exports the 1.x functions; everything newer (and, in a core profile,
+/// everything at all) must be fetched as a function pointer from the driver once a context is current. So each GL
+/// function is a `__gshared` function-pointer variable with the C signature from the GL headers, and `loadGL` fills
+/// them all in through `glfwGetProcAddress`. The pointers belong to the one context `runGui` creates; the viewer only
+/// ever uses GL from that (main) thread. ImGui's OpenGL3 backend carries its own loader and does not use these.
+///
+/// To use another GL function: add its constant(s) below, its pointer declaration, and its name to `names`.
 module codecity.gui.gl;
 
 import codecity.gui.glfw : glfwGetProcAddress;
@@ -63,6 +71,7 @@ enum : GLenum
     GL_FRAMEBUFFER_COMPLETE = 0x8CD5,
 }
 
+/// Every function `loadGL` resolves. Must list each pointer declared below, spelled exactly like the variable.
 private enum names = [
     "glClearColor", "glClear", "glViewport", "glEnable", "glDisable", "glBlendFunc", "glDepthMask", "glCullFace",
     "glCreateShader", "glShaderSource", "glCompileShader", "glGetShaderiv", "glGetShaderInfoLog", "glCreateProgram",
@@ -75,6 +84,8 @@ private enum names = [
     "glReadPixels", "glPolygonOffset", "glCheckFramebufferStatus", "glPixelStorei", "glDeleteShader",
 ];
 
+// `extern (System)` is the platform's GL calling convention (stdcall on 32-bit Windows, C elsewhere). `__gshared`
+// makes them plain globals instead of D's default thread-local storage, so they are loaded once for the process.
 extern (System) @nogc nothrow __gshared
 {
     void function(GLfloat, GLfloat, GLfloat, GLfloat) glClearColor;
@@ -134,6 +145,7 @@ extern (System) @nogc nothrow __gshared
 /// Resolves every entry point; returns the name of the first one missing, or null.
 string loadGL()
 {
+    // unrolled at compile time into one `glFoo = cast(typeof(glFoo)) glfwGetProcAddress("glFoo");` per name
     static foreach (name; names)
     {
         mixin(name ~ " = cast(typeof(" ~ name ~ ")) glfwGetProcAddress(\"" ~ name ~ "\");");

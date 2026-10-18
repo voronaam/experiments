@@ -3,7 +3,9 @@ package dev.codecity.desktop;
 import dev.codecity.CityModel;
 import dev.codecity.CityModel.Building;
 import dev.codecity.layout.CityLayout;
+import javafx.animation.FadeTransition;
 import javafx.animation.PauseTransition;
+import javafx.animation.SequentialTransition;
 import javafx.application.Application;
 import javafx.application.ConditionalFeature;
 import javafx.application.Platform;
@@ -23,6 +25,7 @@ import javafx.scene.control.ListCell;
 import javafx.scene.control.ListView;
 import javafx.scene.control.TextField;
 import javafx.scene.control.TextInputControl;
+import javafx.scene.control.ToggleButton;
 import javafx.scene.image.Image;
 import javafx.scene.image.PixelReader;
 import javafx.scene.image.WritableImage;
@@ -53,11 +56,33 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.prefs.Preferences;
 
-/** Native desktop viewer: the same city as the web viewer, rendered with JavaFX 3D in an application window. */
+/**
+ * Native desktop viewer: the same city as the web viewer, rendered with JavaFX 3D in an application window.
+ *
+ * <p>This class owns the window, the HUD (top bar with search and stats, control panel, inspector, tooltip, toast) and
+ * the view state: selected and hovered building, height and colour metric, theme, search matches and whether test
+ * code is shown. {@link CityView3D} only draws; whenever the state changes, this class recomputes heights
+ * ({@link #reheight}) or colours ({@link #recolor}) and pushes them into the view. Metric, theme and toggles are
+ * remembered between runs in {@link Preferences}.
+ *
+ * <h2>Threads</h2>
+ * {@link #launch} hands the first model over through a static field because JavaFX instantiates the
+ * {@link Application} itself. Everything else runs on the JavaFX application thread; {@link #update}, called from the
+ * watcher's thread, forwards the rebuilt model with {@link Platform#runLater}.
+ *
+ * <h2>Walk mode</h2>
+ * G or the Walk button switches to a first-person walk through the city ({@link #setWalking}). This class tracks the
+ * movement keys and shows the crosshair and the key hint; {@link CityView3D} and {@link Walker} do the rest.
+ *
+ * <p>Buildings are referred to by their index in {@link CityModel#buildings()} throughout, the same index the view
+ * uses for boxes and palette cells. Indices are only valid for one model; across a rebuild the selection is carried
+ * over by fully qualified name instead.
+ */
 public final class DesktopApp extends Application {
 
     /** Held strongly so the level set in {@link #launch} sticks. */
@@ -65,7 +90,7 @@ public final class DesktopApp extends Application {
     private static volatile CityModel initialModel;
     private static volatile DesktopApp instance;
 
-    /** Opens the window and blocks until it is closed. */
+    /** Opens the window and blocks until it is closed. Can only be called once per JVM (a JavaFX restriction). */
     public static void launch(CityModel model) {
         initialModel = model;
         // Running from a plain (non-modular) jar is fine for us; hide JavaFX's warning about it.
@@ -81,7 +106,10 @@ public final class DesktopApp extends Application {
         }
     }
 
-    /** True when a graphical display is likely available. */
+    /**
+     * True when a graphical display is likely available. Only checked on Linux/BSD, where an unset {@code DISPLAY}
+     * and {@code WAYLAND_DISPLAY} means JavaFX would fail to start; other systems are assumed to have one.
+     */
     public static boolean displayAvailable() {
         String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
         if (os.contains("linux") || os.contains("bsd")) {
@@ -102,10 +130,14 @@ public final class DesktopApp extends Application {
     private Look.ColorMetric colorMetric;
     private Look.Theme theme;
     private boolean showTests;
+    /** Selected and hovered building, -1 for none. */
     private int selected = -1;
     private int hovered = -1;
+    /** Buildings matching the current search, or null when no search is active (nothing is dimmed then). */
     private BitSet matches;
+    /** The best search matches, in ranked order, as shown in the result popup. */
     private List<Integer> results = List.of();
+    /** Set when '/' focused the search field; the matching KEY_TYPED event is then swallowed. */
     private boolean swallowSlash;
 
     private final Label projectName = new Label();
@@ -123,7 +155,22 @@ public final class DesktopApp extends Application {
     private final Label tooltip = new Label();
     private final Label toast = new Label();
     private final PauseTransition toastTimer = new PauseTransition(Duration.seconds(2.6));
+    private final ToggleButton walkButton = new ToggleButton("Walk (G)");
+    /** The orbit-controls hint at the bottom; hidden while walking, when the walk hint takes its place. */
+    private final Label orbitHint = new Label("drag to orbit · right-drag to pan · scroll to zoom · click a building · / search · F frame · N night · Esc clear");
+    /** Crosshair at the centre of the view and the key hint shown on entering walk mode. */
+    private final Pane crosshair = new Pane();
+    private final Label walkHint = new Label("WASD move · Mouse look · Shift run · Space jump · Click select · G/Esc exit");
+    private final SequentialTransition walkHintFade = new SequentialTransition(
+            new PauseTransition(Duration.seconds(6)), new FadeTransition(Duration.seconds(0.8), walkHint));
+    /** Movement keys held while walking. */
+    private final EnumSet<KeyCode> held = EnumSet.noneOf(KeyCode.class);
 
+    /**
+     * Builds the window. The scene is a stack of layers, bottom to top: the 3D viewport, district labels, the HUD,
+     * the hover tooltip and the toast. Every layer but the HUD is mouse-transparent and the HUD only picks on its
+     * panels, so drags on empty areas reach the 3D view.
+     */
     @Override
     public void start(Stage stage) {
         this.stage = stage;
@@ -132,6 +179,7 @@ public final class DesktopApp extends Application {
             return;
         }
         heightMetric = enumPref("height", Look.HeightMetric.NOM);
+        // No default here: setModel picks churn or complexity depending on whether git history is available.
         colorMetric = enumPref("color", null);
         theme = enumPref("theme", Look.Theme.DAY);
         showTests = prefs.getBoolean("tests", true);
@@ -191,7 +239,7 @@ public final class DesktopApp extends Application {
         hud.setLeft(controls);
         BorderPane.setAlignment(controls, Pos.TOP_LEFT);
         hud.setRight(inspector);
-        Label hint = new Label("drag to orbit · right-drag to pan · scroll to zoom · click a building · / search · F frame · N night · Esc clear");
+        Label hint = orbitHint;
         hint.getStyleClass().addAll("panel", "hint");
         hud.setBottom(hint);
         BorderPane.setAlignment(hint, Pos.CENTER);
@@ -209,11 +257,43 @@ public final class DesktopApp extends Application {
         StackPane.setMargin(toast, new Insets(0, 0, 64, 0));
         toastTimer.setOnFinished(e -> toast.setVisible(false));
 
-        root = new StackPane(viewport, labelLayer, hud, tooltipLayer, toast);
+        // Crosshair: two thin 14 px lines crossing at the centre, coloured by the theme (see .crosshair in the CSS).
+        Region horizontal = styled(new Region(), "crosshair");
+        horizontal.resizeRelocate(0, 6.5, 14, 1.5);
+        Region vertical = styled(new Region(), "crosshair");
+        vertical.resizeRelocate(6.5, 0, 1.5, 14);
+        horizontal.setManaged(false); // placed by hand; a Pane would shrink them to their (zero) preferred size
+        vertical.setManaged(false);
+        crosshair.getChildren().addAll(horizontal, vertical);
+        crosshair.setPrefSize(14, 14);
+        crosshair.setMaxSize(14, 14);
+        crosshair.setMouseTransparent(true);
+        crosshair.setVisible(false);
+        walkHint.getStyleClass().addAll("panel", "hint");
+        walkHint.setMouseTransparent(true);
+        walkHint.setVisible(false);
+        StackPane.setAlignment(walkHint, Pos.BOTTOM_CENTER);
+        StackPane.setMargin(walkHint, new Insets(0, 0, 64, 0));
+        ((FadeTransition) walkHintFade.getChildren().get(1)).setToValue(0);
+
+        root = new StackPane(viewport, labelLayer, hud, crosshair, walkHint, tooltipLayer, toast);
         root.getStyleClass().add("app");
         Scene scene = new Scene(root, 1440, 900);
         scene.getStylesheets().add(stylesheet);
+        // A filter on the scene sees keys before the focused control does, so shortcuts work anywhere.
         scene.addEventFilter(KeyEvent.KEY_PRESSED, this::onKey);
+        scene.addEventFilter(KeyEvent.KEY_RELEASED, e -> {
+            if (held.remove(e.getCode())) {
+                pushWalkInput();
+                e.consume();
+            }
+        });
+        // Losing the window (another app, a dialog) ends walk mode, which also frees the cursor.
+        stage.focusedProperty().addListener((o, was, now) -> {
+            if (!now) {
+                setWalking(false);
+            }
+        });
         // The '/' that focuses the search field must not also be typed into it.
         scene.addEventFilter(KeyEvent.KEY_TYPED, e -> {
             if (swallowSlash && "/".equals(e.getCharacter())) {
@@ -232,6 +312,12 @@ public final class DesktopApp extends Application {
 
     // ------------------------------------------------------------------ model & state
 
+    /**
+     * Shows {@code next}. {@code live} marks a watch-mode rebuild: the camera and current heights are kept (heights
+     * animate from where they were instead of rising from the ground), the selection is restored by fully qualified
+     * name if the type still exists, an active search is re-run, and a toast announces the rebuild. A colour metric
+     * the new model cannot provide (no git, no PRs) falls back to churn or complexity.
+     */
     private void setModel(CityModel next, boolean live) {
         String previous = selected >= 0 && model != null ? model.buildings().get(selected).type().fqn() : null;
         model = next;
@@ -267,10 +353,18 @@ public final class DesktopApp extends Application {
         }
     }
 
+    /** Whether building {@code i} is shown; only test code can be hidden. */
     private boolean visible(int i) {
         return showTests || !model.buildings().get(i).type().test();
     }
 
+    /**
+     * Computes target heights for the height metric and starts the animation. The value at the 95th percentile of the
+     * visible buildings (at least 1) is scaled to 20% of the city radius, clamped to 8..16 units, so the skyline
+     * grows with the city. Every building gets a 0.35 base, so zero-valued types still show as a slab, and heights are
+     * capped at 0.75 radius, which limits how far outliers tower over the rest. Hidden buildings get
+     * height 0, which also hides them from picking. Same formula as the web viewer.
+     */
     private void reheight(boolean rise) {
         List<Building> buildings = model.buildings();
         double[] values = buildings.stream().filter(b -> visible(b.index()))
@@ -289,6 +383,13 @@ public final class DesktopApp extends Application {
         }
     }
 
+    /**
+     * Recomputes every building colour: the metric colour, faded 80% towards the theme's dim colour when the building
+     * falls outside the search matches or outside the selection and its direct dependencies (both directions), and
+     * lightened 30% towards white when hovered. Called on every state change, including hover changes; it only
+     * rebuilds the small palette texture, never geometry. The scale is computed over all buildings, including
+     * hidden ones.
+     */
     private void recolor() {
         List<Building> buildings = model.buildings();
         Look.Scale scale = Look.Scale.of(colorMetric, buildings);
@@ -317,6 +418,7 @@ public final class DesktopApp extends Application {
         renderLegend(scale);
     }
 
+    /** Selects building {@code i} (-1 clears); inspector, arcs and dimming follow, and {@code fly} moves the camera. */
     private void select(int i, boolean fly) {
         selected = i;
         if (i < 0) {
@@ -341,6 +443,7 @@ public final class DesktopApp extends Application {
         city.applyTheme(theme);
     }
 
+    /** Switches day/night. Colours are recomputed because the dim colour and the night glow depend on the theme. */
     private void toggleTheme() {
         theme = theme.other();
         prefs.put("theme", theme.name());
@@ -491,17 +594,21 @@ public final class DesktopApp extends Application {
         frame.setOnAction(e -> city.frameAll(true));
         Button snapshot = new Button("Snapshot");
         snapshot.setOnAction(e -> snapshot());
+        // The toggle's selected state shows whether walk mode is on; setWalking keeps it in sync.
+        walkButton.setOnAction(e -> setWalking(!city.walking()));
         HBox buttons = new HBox(6, themeButton, frame, snapshot);
         for (Node b : buttons.getChildren()) {
             HBox.setHgrow(b, Priority.ALWAYS);
             ((Button) b).setMaxWidth(Double.MAX_VALUE);
         }
+        // Full width on its own row: four buttons side by side do not fit the panel.
+        walkButton.setMaxWidth(Double.MAX_VALUE);
 
         VBox box = new VBox(6,
                 styled(new Label("HEIGHT"), "caption"), heightBox,
                 spacer(8), styled(new Label("COLOUR"), "caption"), colorBox, legend,
                 spacer(8), testsBox, labelsBox, beaconsBox,
-                spacer(8), buttons);
+                spacer(8), buttons, walkButton);
         box.getStyleClass().addAll("panel", "controls");
         box.setPrefWidth(236);
         box.setMaxWidth(236);
@@ -509,6 +616,10 @@ public final class DesktopApp extends Application {
         return box;
     }
 
+    /**
+     * Fills the top-right chips: GitHub repository (with PR count, "+" when only part of the open PRs was loaded),
+     * language mix, counts, and parse errors if any.
+     */
     private void renderStats() {
         CityModel.Stats s = model.stats();
         stats.getChildren().clear();
@@ -552,6 +663,11 @@ public final class DesktopApp extends Application {
         return chip;
     }
 
+    /**
+     * Legend under the colour box: swatches of the kinds present for the categorical metric, otherwise the ramp with
+     * the scale's end values ("+" on the clipped top end) and the metric's words for both ends. For inverted metrics
+     * the values swap sides, because the ramp's hot end then means the lowest value.
+     */
     private void renderLegend(Look.Scale scale) {
         legend.getChildren().clear();
         Look.ColorMetric m = scale.metric();
@@ -601,11 +717,19 @@ public final class DesktopApp extends Application {
 
     // ------------------------------------------------------------------ interaction
 
+    /**
+     * Hover feedback from the 3D view: highlights the building (recolouring only when the hovered building changes)
+     * and shows a tooltip next to the cursor, kept 8 px inside the window; in walk mode the crosshair is the cursor
+     * and the tooltip sits centred below it. Platforms get a tooltip too, except the
+     * city's own base (depth 0).
+     */
     private void onHover(int building, int district, double x, double y) {
         if (building != hovered) {
             hovered = building;
             recolor();
-            city.subScene.setCursor(building >= 0 ? javafx.scene.Cursor.HAND : javafx.scene.Cursor.DEFAULT);
+            if (!city.walking()) {
+                city.subScene.setCursor(building >= 0 ? javafx.scene.Cursor.HAND : javafx.scene.Cursor.DEFAULT);
+            }
         }
         String text = null;
         if (building >= 0) {
@@ -625,7 +749,9 @@ public final class DesktopApp extends Application {
         } else if (district >= 0) {
             CityLayout.District d = model.districts().get(district);
             if (d.depth() > 0) {
-                text = d.label() + "\n" + d.id().replaceFirst("^module:", "") + "\n" + d.types() + " types · double-click to zoom";
+                // Double-click zooming is off while walking, so only offer it when orbiting.
+                text = d.label() + "\n" + d.id().replaceFirst("^module:", "") + "\n" + d.types() + " types"
+                        + (city.walking() ? "" : " · double-click to zoom");
             }
         }
         if (text == null) {
@@ -637,9 +763,20 @@ public final class DesktopApp extends Application {
         tooltip.autosize();
         double w = tooltip.getWidth();
         double h = tooltip.getHeight();
+        if (city.walking()) {
+            // (x, y) is the crosshair: centre the tooltip just below it.
+            tooltip.relocate(x - w / 2, y + 18);
+            return;
+        }
         tooltip.relocate(Math.min(x + 14, root.getWidth() - w - 8), Math.min(y + 14, root.getHeight() - h - 8));
     }
 
+    /**
+     * Searches the visible types; queries shorter than two characters clear the search. Ranking: exact simple name,
+     * then name prefix, then name substring, then a match anywhere in the fully qualified name; ties go to the shorter
+     * name. Every match stays undimmed in the city, the best 12 are listed in the popup, which is only shown while the
+     * search field has focus.
+     */
     private void runSearch(String text) {
         String q = text.strip().toLowerCase(Locale.ROOT);
         if (q.length() < 2) {
@@ -668,6 +805,7 @@ public final class DesktopApp extends Application {
         scored.forEach(s -> matches.set(s.i()));
         results = scored.stream().limit(12).map(Scored::i).toList();
         resultList.getItems().setAll(results);
+        // About 44 px per two-line result cell plus padding.
         resultList.setPrefHeight(Math.min(300, results.size() * 44 + 12));
         if (!results.isEmpty() && search.isFocused() && stage.isShowing()) {
             var p = search.localToScreen(0, search.getHeight() + 6);
@@ -680,8 +818,26 @@ public final class DesktopApp extends Application {
         recolor();
     }
 
+    /**
+     * Global shortcuts. Esc undoes one thing at a time: closes the result popup, else clears the selection, else
+     * clears the search, and always returns focus to the 3D view. The letter shortcuts are ignored while typing in a
+     * text field or with Ctrl/Cmd/Alt held. While walking, movement keys are only recorded, Esc and G leave walk mode
+     * (Esc then does nothing else), and '/' and F leave it before doing their usual thing. '/' is recognised by its key code or by the key's text;
+     * {@link #swallowSlash} stops the same keystroke from being typed into the field it focuses.
+     */
     private void onKey(KeyEvent e) {
         boolean typing = e.getTarget() instanceof TextInputControl;
+        if (city.walking() && WALK_KEYS.contains(e.getCode())) {
+            held.add(e.getCode());
+            pushWalkInput();
+            e.consume(); // keeps Space from pressing a focused button and arrows from moving focus
+            return;
+        }
+        if (city.walking() && (e.getCode() == KeyCode.ESCAPE || e.getCode() == KeyCode.G)) {
+            setWalking(false);
+            e.consume();
+            return;
+        }
         if (e.getCode() == KeyCode.ESCAPE) {
             if (resultPopup.isShowing()) {
                 resultPopup.hide();
@@ -697,16 +853,64 @@ public final class DesktopApp extends Application {
         if (typing || e.isShortcutDown() || e.isAltDown()) {
             return;
         }
-        if (e.getCode() == KeyCode.SLASH || "/".equals(e.getText())) {
+        if (e.getCode() == KeyCode.G) {
+            setWalking(true);
+            e.consume();
+        } else if (e.getCode() == KeyCode.SLASH || "/".equals(e.getText())) {
+            setWalking(false);
             swallowSlash = true;
             search.requestFocus();
             search.selectAll();
             e.consume();
         } else if (e.getCode() == KeyCode.F) {
+            setWalking(false);
             city.frameAll(true);
         } else if (e.getCode() == KeyCode.N) {
             toggleTheme();
         }
+    }
+
+    /** Keys that move the walker; JavaFX reports key codes by layout, not physical position. */
+    private static final EnumSet<KeyCode> WALK_KEYS = EnumSet.of(KeyCode.W, KeyCode.A, KeyCode.S, KeyCode.D,
+            KeyCode.UP, KeyCode.DOWN, KeyCode.LEFT, KeyCode.RIGHT, KeyCode.SHIFT, KeyCode.SPACE);
+
+    /**
+     * Enters or leaves walk mode, keeping the Walk button, crosshair and hint in step. Entering shows the hint, which
+     * fades out after 6 s; leaving restores the orbit camera and keeps the selection.
+     */
+    private void setWalking(boolean on) {
+        if (on == city.walking()) {
+            walkButton.setSelected(on);
+            return;
+        }
+        held.clear();
+        if (on) {
+            resultPopup.hide();
+            city.enterWalk(selected);
+            city.subScene.requestFocus();
+            walkHint.setOpacity(1);
+            walkHint.setVisible(true);
+            walkHintFade.playFromStart();
+        } else {
+            city.exitWalk();
+            walkHintFade.stop();
+            walkHint.setVisible(false);
+        }
+        pushWalkInput();
+        orbitHint.setVisible(!city.walking());
+        crosshair.setVisible(city.walking());
+        walkButton.setSelected(city.walking());
+    }
+
+    /** Turns the held keys into the walker's input: W/S or Up/Down forward, D/A or Right/Left sideways. */
+    private void pushWalkInput() {
+        double forward = (has(KeyCode.W, KeyCode.UP) ? 1 : 0) - (has(KeyCode.S, KeyCode.DOWN) ? 1 : 0);
+        double right = (has(KeyCode.D, KeyCode.RIGHT) ? 1 : 0) - (has(KeyCode.A, KeyCode.LEFT) ? 1 : 0);
+        city.setWalkInput(new Walker.Input(forward, right, held.contains(KeyCode.SHIFT), held.contains(KeyCode.SPACE)));
+    }
+
+    private boolean has(KeyCode a, KeyCode b) {
+        return held.contains(a) || held.contains(b);
     }
 
     private void snapshot() {
@@ -726,6 +930,10 @@ public final class DesktopApp extends Application {
         }
     }
 
+    /**
+     * Saves a JavaFX image as PNG by copying it pixel by pixel into an AWT image for {@link ImageIO}. The project only
+     * depends on javafx-controls, so {@code SwingFXUtils} (from javafx-swing) is not available for this.
+     */
     static void writePng(WritableImage image, File file) throws IOException {
         int w = (int) image.getWidth();
         int h = (int) image.getHeight();
@@ -771,6 +979,11 @@ public final class DesktopApp extends Application {
 
     // ------------------------------------------------------------------ helpers
 
+    /**
+     * Reads an enum constant stored by name. With a null fallback the enum type cannot be taken from it, so it is
+     * assumed to be {@link Look.ColorMetric}, the only preference read that way. Unknown names (e.g. from an older
+     * version) yield the fallback.
+     */
     private <E extends Enum<E>> E enumPref(String key, E fallback) {
         String v = prefs.get(key, null);
         if (v == null) {
@@ -796,6 +1009,7 @@ public final class DesktopApp extends Application {
         return r;
     }
 
+    /** The logo's four bars as {x, y, width, height, colour} on a 30 × 30 grid, shared by the HUD logo and the icon. */
     private static final String[][] BARS = {{"5", "16", "5", "11", "#38bdf8"}, {"11.5", "7", "5", "20", "#f97316"},
             {"18", "12", "4", "15", "#facc15"}, {"23.5", "19", "4", "8", "#34d399"}};
 
@@ -814,6 +1028,7 @@ public final class DesktopApp extends Application {
         return pane;
     }
 
+    /** The window icon: the logo bars at double scale on a dark rounded square, rendered to an image. */
     private static Image icon() {
         Canvas canvas = new Canvas(64, 64);
         GraphicsContext g = canvas.getGraphicsContext2D();

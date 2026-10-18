@@ -1,4 +1,11 @@
 //! An analysed and laid-out city, consumed by both the web viewer (as JSON) and the desktop viewer.
+//!
+//! [`CityModel::build`] runs the whole pipeline for one source tree: analysis and git history (in parallel), then
+//! [`crate::layout`], then [`resolve`], which joins every type with its lot, history, dependency edges and pull
+//! requests into a [`Building`]. A model is immutable once built; watch mode builds a new one and swaps it in.
+//!
+//! Indices: `buildings[i]` is `analysis.types[i]` (`Building::index == i`), and every index in `deps`, `incoming`
+//! and the JSON `deps` arrays is such a building index.
 
 use crate::analysis::SourceAnalyzer;
 use crate::github::GitHubInfo;
@@ -10,16 +17,22 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
 
+/// At most this many methods per building go into the model (and the JSON), the most complex first, so a very large
+/// type cannot blow up the document.
 const MAX_METHODS: usize = 300;
 
 /// One building, fully resolved: the type, where it stands, its history and its edges.
 pub struct Building {
+    /// Index into [`Analysis::types`] (equal to the building's own index).
     pub index: usize,
     pub lot: Lot,
     /// Path relative to the analysed root, with forward slashes.
     pub file: String,
+    /// None when git history is off or the file has no commits (e.g. not committed yet).
     pub history: Option<FileHistory>,
+    /// Buildings this one depends on, in the order of [`Analysis::dependencies`] (sorted by fqn).
     pub deps: Vec<usize>,
+    /// Buildings that depend on this one (the reverse edges), in ascending index order.
     pub incoming: Vec<usize>,
     /// Indices into the GitHub info's pull requests.
     pub prs: Vec<usize>,
@@ -27,10 +40,12 @@ pub struct Building {
     pub methods: Vec<MethodInfo>,
 }
 
+/// Totals for the JSON `stats` object and the console summary.
 pub struct Stats {
     pub files: usize,
     pub failed_files: usize,
     pub types: usize,
+    /// Distinct (language, module, package) triples, so equal package names in different modules count separately.
     pub packages: usize,
     pub methods: u32,
     pub loc: u32,
@@ -38,29 +53,37 @@ pub struct Stats {
     pub languages: Vec<(Language, usize)>,
 }
 
+/// Everything a viewer needs about one analysed source tree.
 pub struct CityModel {
+    /// The root directory's name, used as the city's (root district's) label.
     pub name: String,
     pub analysis: Analysis,
+    /// From [`layout::Layout`], in pre-order; [`Lot::district`] indexes into it.
     pub districts: Vec<District>,
     pub width: f64,
     pub depth: f64,
     pub github: Option<GitHubInfo>,
     pub buildings: Vec<Building>,
     pub stats: Stats,
+    /// Wall-clock time of [`CityModel::build`], for the console.
     pub build_millis: u128,
+    /// The JSON document, built at most once and only if asked for (the native window never needs it).
     json: OnceLock<String>,
 }
 
 impl CityModel {
+    /// Analyses `root` and lays it out. Never fails: unreadable files and missing git just yield less data.
     pub fn build(analyzer: &SourceAnalyzer, root: &Path, include_tests: bool, use_git: bool, github: Option<GitHubInfo>) -> CityModel {
         let start = Instant::now();
         let (mut analysis, history) = std::thread::scope(|s| {
-            // git log runs while the sources are parsed
+            // git log runs while the sources are parsed. A scoped thread may borrow root; if it panics, the city is
+            // built without history (unwrap_or_default).
             let git = s.spawn(|| if use_git { crate::git::load(root) } else { HashMap::new() });
             let analysis = analyzer.analyze(root, include_tests);
             (analysis, git.join().unwrap_or_default())
         });
         analysis.history = history;
+        // A root without a file name (e.g. "/") is named after its full path.
         let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| root.display().to_string());
         let layout = layout::layout(&name, &analysis.types);
         let buildings = resolve(&analysis, &layout.lots, github.as_ref());
@@ -96,6 +119,19 @@ impl CityModel {
         self.json.get_or_init(|| self.to_json())
     }
 
+    /// Writes the document the web viewer loads. The format is shared with the Java and D editions:
+    ///
+    /// ```text
+    /// { name, root, generatedAt, hasGit, platform, width, depth,
+    ///   stats: { files, failedFiles, types, packages, methods, loc, languages: { <lang id>: count } },
+    ///   github?: { host, owner, repo, url, ref, prefix, pullsSource?, pulls?: [ { number, title, … } ] },
+    ///   districts: [ { id, name, depth, x, z, w, d, types } ],
+    ///   buildings: [ { id, lang, name, …, x, z, y, side, district, nom, noa, loc, cx,
+    ///                  commits?, authors?, last?, first?, prs?, methods: [ [name, line, loc, cx, params] ], deps } ] }
+    /// ```
+    ///
+    /// Methods are arrays rather than objects to keep the file small. `?` marks keys that are left out when there is
+    /// no data; `pullsSource` and `pulls` are only present when the pull requests were fetched.
     fn to_json(&self) -> String {
         let a = &self.analysis;
         let mut w = JsonWriter::new();
@@ -214,8 +250,11 @@ impl CityModel {
     }
 }
 
+/// Joins every type with its lot, file history, dependency edges (both directions) and the open pull requests that
+/// touch its file. fqns are unique (the analyser keeps one type per fqn), so every type has exactly one lot.
 fn resolve(a: &Analysis, lots: &HashMap<String, Lot>, github: Option<&GitHubInfo>) -> Vec<Building> {
     let index: HashMap<&str, usize> = a.types.iter().enumerate().map(|(i, t)| (t.fqn.as_str(), i)).collect();
+    // PR files are repository-relative paths, so index the PRs by path once rather than scanning them per type.
     let mut pulls_by_path: HashMap<&str, Vec<usize>> = HashMap::new();
     if let Some(pulls) = github.and_then(|g| g.pulls.as_ref()) {
         for (i, pr) in pulls.iter().enumerate() {
@@ -224,6 +263,8 @@ fn resolve(a: &Analysis, lots: &HashMap<String, Lot>, github: Option<&GitHubInfo
             }
         }
     }
+    // Dependencies by fqn → by building index. Analysis has already dropped targets that are not in `types`, so the
+    // filter_map is only a safeguard.
     let deps: Vec<Vec<usize>> = a
         .types
         .iter()
@@ -242,8 +283,11 @@ fn resolve(a: &Analysis, lots: &HashMap<String, Lot>, github: Option<&GitHubInfo
         .zip(incoming)
         .map(|(((i, t), deps), incoming)| {
             let file = slashes(t.file.strip_prefix(&a.root).unwrap_or(&t.file));
+            // The analysed root may be a subdirectory of the repository; the GitHub prefix turns the root-relative
+            // path into the repository-relative one that PR file lists use.
             let repo_path = github.map(|g| format!("{}{}", g.prefix, file)).unwrap_or_else(|| file.clone());
             let mut methods = t.methods.clone();
+            // Most complex first, then largest (descending on both); the sort is stable, so ties keep source order.
             methods.sort_by(|x, y| y.complexity.cmp(&x.complexity).then(y.loc.cmp(&x.loc)));
             methods.truncate(MAX_METHODS);
             Building {
@@ -260,6 +304,7 @@ fn resolve(a: &Analysis, lots: &HashMap<String, Lot>, github: Option<&GitHubInfo
         .collect()
 }
 
+/// Totals over the types that made it into the model (after `--no-tests` filtering).
 fn stats(a: &Analysis) -> Stats {
     let mut packages: Vec<(Language, &str, &str)> = a.types.iter().map(|t| (t.language, t.module.as_str(), t.package.as_str())).collect();
     packages.sort_unstable();
@@ -268,6 +313,7 @@ fn stats(a: &Analysis) -> Stats {
     for t in &a.types {
         *counts.entry(t.language).or_default() += 1;
     }
+    // Start from Language::ALL so that languages with equal counts keep a fixed order (the sort below is stable).
     let mut languages: Vec<(Language, usize)> = Language::ALL.iter().filter_map(|l| counts.get(l).map(|n| (*l, *n))).collect();
     languages.sort_by(|x, y| y.1.cmp(&x.1));
     Stats {
@@ -285,7 +331,12 @@ fn stats(a: &Analysis) -> Stats {
 fn now_iso() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
     let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
-    // civil-from-days (Howard Hinnant)
+    // civil-from-days (Howard Hinnant, "chrono-Compatible Low-Level Date Algorithms"). It shifts the epoch to
+    // 0000-03-01 so that the leap day is the last day of the year, and counts in 400-year eras of 146097 days:
+    //   719468  days from 0000-03-01 to 1970-01-01
+    //   doe     day of the era [0, 146096], yoe year of the era [0, 399], doy day of the March-based year [0, 365]
+    //   mp      month counted from March [0, 11]; (153 * mp + 2) / 5 is the first day of that month in the year
+    // Months 11 and 12 of that March-based year (January, February) belong to the next calendar year.
     let z = days + 719468;
     let era = z.div_euclid(146097);
     let doe = z - era * 146097;

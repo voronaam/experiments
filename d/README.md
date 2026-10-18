@@ -65,6 +65,8 @@ field by field: every building, metric, position, district and dependency edge.
 * soft shadows (PCF shadow map) and the night-time glow / lit-window shader;
 * an ImGui interface: search, the inspector, a source viewer with syntax highlighting, legend, toasts and snapshots;
 * dependency arcs with flowing particles, PR beacons, and live reload.
+* **Walk mode** (`G`): walk through the city in first person, as described in the
+  [main README](../README.md#walk-mode).
 
 Settings are saved in `~/.config/codecity/desktop.json`, the same file and format as the Rust edition, so both share
 them. Snapshots go to `~/Pictures` (or the current directory if that doesn't exist).

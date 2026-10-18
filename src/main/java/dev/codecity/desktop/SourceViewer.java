@@ -21,7 +21,16 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
-/** A native source window with lightweight Java highlighting; the selected type's lines are marked. */
+/**
+ * A native source window with lightweight Java, TypeScript and Rust highlighting; the selected type's lines are
+ * marked.
+ *
+ * <p>The highlighter is a single-pass hand-written scanner, not a real lexer: it knows comments, string and character
+ * literals, Java text blocks, annotations/Rust lifetimes, numbers and a keyword list per language, and guesses
+ * constants (ALL_CAPS) and types (Capitalised). Odd constructs may be coloured wrongly, but apart from dropped '\r'
+ * characters every character ends up in exactly one token. The file is shown in a virtualised {@link ListView} with
+ * one row per line.
+ */
 final class SourceViewer {
 
     private static final Set<String> TS_KEYWORDS = Set.of(
@@ -48,9 +57,15 @@ final class SourceViewer {
     private SourceViewer() {
     }
 
+    /** A run of text and its CSS style class ({@code keyword}, {@code string}, {@code comment}, ...). */
     private record Token(String text, String style) {
     }
 
+    /**
+     * Opens a window on {@code b}'s file, scrolled so the type's first line is near the top (three lines of context
+     * above it). Files over 4 MiB, like in the web viewer's server, are not loaded; a read error is shown in place of
+     * the code. Esc closes the window.
+     */
     static void show(Window owner, Building b, String stylesheet) {
         String code;
         try {
@@ -77,6 +92,7 @@ final class SourceViewer {
             @Override
             protected void updateItem(Integer line, boolean empty) {
                 super.updateItem(line, empty);
+                // Cells are reused for different lines while scrolling, so the marker class is reset every time.
                 getStyleClass().remove("in-type");
                 if (empty || line == null) {
                     setGraphic(null);
@@ -125,9 +141,21 @@ final class SourceViewer {
         return highlight(code, KEYWORDS);
     }
 
+    /**
+     * The scanner. At each position the first matching rule wins, in this order: newline, continuation of a multi-line
+     * construct ({@code mode}), line comment, block comment, text block, Rust lifetime, string/char literal,
+     * annotation, word (keyword / constant / type / plain), number, anything else (plain). Plain characters are
+     * collected in {@code plain} and flushed as one token before the next styled token, so the token count stays low.
+     * '\n' is handled first, even inside comments and text blocks, and no token ever contains one, so each line gets
+     * its own list; '\r' is dropped. Lifetimes are only recognised in Rust code ({@code keywords} is
+     * {@code RUST_KEYWORDS}), so a TypeScript {@code 'react'} stays a string.
+     *
+     * @return one token list per line, as many lists as the text has lines
+     */
     static List<List<Token>> highlight(String code, Set<String> keywords) {
         List<List<Token>> lines = new ArrayList<>();
         List<Token> line = new ArrayList<>();
+        boolean rust = keywords == RUST_KEYWORDS;
         String mode = null; // "comment" or "string" for constructs that continue onto the next line
         int i = 0;
         int n = code.length();
@@ -176,7 +204,7 @@ final class SourceViewer {
                 mode = "string";
                 line.add(new Token("\"\"\"", "string"));
                 i += 3;
-            } else if (c == '\'' && i + 2 < n && Character.isJavaIdentifierStart(code.charAt(i + 1))
+            } else if (rust && c == '\'' && i + 2 < n && Character.isJavaIdentifierStart(code.charAt(i + 1))
                     && code.charAt(i + 2) != '\'') {
                 // a Rust lifetime such as 'a or 'static, not a character literal
                 flush(plain, line);
@@ -189,10 +217,15 @@ final class SourceViewer {
             } else if (c == '"' || c == '\'') {
                 flush(plain, line);
                 int j = i + 1;
+                // Single-line literal: runs to the matching quote or the end of the line (the line break itself is
+                // never taken); a backslash skips the next character so an escaped quote does not end it, unless that
+                // character is the line break.
                 while (j < n && code.charAt(j) != c && code.charAt(j) != '\n') {
-                    j += code.charAt(j) == '\\' ? 2 : 1;
+                    j += code.charAt(j) == '\\' && j + 1 < n && code.charAt(j + 1) != '\n' ? 2 : 1;
                 }
-                j = Math.min(n, j + 1);
+                if (j < n && code.charAt(j) == c) {
+                    j++;
+                }
                 line.add(new Token(code.substring(i, j), "string"));
                 i = j;
             } else if (c == '@' && i + 1 < n && Character.isJavaIdentifierStart(code.charAt(i + 1))) {
@@ -213,6 +246,7 @@ final class SourceViewer {
                     flush(plain, line);
                     line.add(new Token(word, "keyword"));
                 } else if (word.length() > 1 && word.equals(word.toUpperCase()) && Character.isLetter(word.charAt(0))) {
+                    // MAX_SIZE is a constant; a single capital letter (T) falls through to the type rule below.
                     flush(plain, line);
                     line.add(new Token(word, "constant"));
                 } else if (Character.isUpperCase(word.charAt(0))) {
@@ -223,6 +257,7 @@ final class SourceViewer {
                 }
                 i = j;
             } else if (Character.isDigit(c)) {
+                // Letters, '.' and '_' are included so 0x1F, 1_000, 3.5f and 10u32 stay one token.
                 flush(plain, line);
                 int j = i;
                 while (j < n && (Character.isLetterOrDigit(code.charAt(j)) || code.charAt(j) == '.' || code.charAt(j) == '_')) {

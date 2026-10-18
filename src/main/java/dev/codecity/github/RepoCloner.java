@@ -9,6 +9,9 @@ import java.util.List;
 /**
  * Keeps a local mirror of a GitHub repository under {@code ~/.cache/codecity/repos/<host>/<owner>/<name>}. Clones are
  * blobless ({@code --filter=blob:none}): full history for churn metrics, but only the current tree's file contents.
+ *
+ * <p>The cache honours {@code XDG_CACHE_HOME}. A second run on the same repository fetches and resets instead of
+ * cloning again, so repeated analyses of a large repository are cheap.
  */
 public final class RepoCloner {
 
@@ -21,9 +24,20 @@ public final class RepoCloner {
         return base.resolve("codecity").resolve("repos");
     }
 
-    /** Clones the repository, or fast-forwards an existing mirror to the latest remote state. Returns its path. */
+    /**
+     * Clones the repository, or brings an existing mirror to the latest remote state. Returns its path.
+     *
+     * <p>Update path: {@code fetch --prune origin [branch]}, then a hard reset either to {@code FETCH_HEAD} (the branch
+     * just fetched) or to {@code origin/HEAD} (the remote's default branch, as recorded when the mirror was cloned).
+     * Clone path: a blobless clone of the requested branch, or of the default branch when none was given. The
+     * {@code --} stops a URL or path starting with '-' from being read as an option.
+     *
+     * @throws IOException if git fails, or the computed directory would lie outside the cache
+     */
     public static Path cloneOrUpdate(GitHubRepo repo) throws IOException {
         Path dir = cacheRoot().resolve(repo.host()).resolve(repo.owner()).resolve(repo.name()).normalize();
+        // Defence in depth: GitHubRepo already rejects "." and "..", but a path escaping the cache must never be
+        // cloned into or hard-reset.
         if (!dir.startsWith(cacheRoot())) {
             throw new IOException("refusing to clone outside the cache: " + dir);
         }

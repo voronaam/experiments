@@ -1,4 +1,19 @@
 //! CodeCity — explore a Java, TypeScript or Rust code base as an interactive 3D city (native Rust edition).
+//!
+//! The pipeline, and the module for each step:
+//!
+//! ```text
+//!   walk + parse/analyse ─ analysis   (tree-sitter, in parallel, cached per file)
+//!   link dependencies    ─ analysis::{java,typescript,rust_lang}::link
+//!   git history          ─ git        (runs on its own thread while the sources are parsed)
+//!   city model           ─ city       (CityModel::build ties everything together)
+//!   layout               ─ layout     (districts and building lots)
+//!   JSON                 ─ json, city (the data the web viewer loads)
+//!   viewers              ─ server (browser, live updates over SSE), export (one HTML file), gui (native window)
+//! ```
+//!
+//! [`github`] adds clone-by-URL and the pull-request overlay; [`watch`] re-runs the pipeline when files change. The
+//! Java and D editions implement the same pipeline and serve the identical web viewer (see [`assets`]).
 
 mod analysis;
 mod assets;
@@ -51,9 +66,13 @@ overlay of the open pull requests touching each class. Set GH_TOKEN (or log in w
 gh CLI) to fetch every open PR; without a token only the most recent ~30 are loaded.
 ";
 
+/// The parsed command line; see [`USAGE`]. Cloned into the watch-mode rebuild closure.
 #[derive(Clone)]
 struct Options {
+    /// Canonical source tree to analyse. After [`parse_args`] it is set unless `remote` is; [`run`] fills it in for a
+    /// remote after cloning.
     root: Option<PathBuf>,
+    /// A GitHub repository to clone (or update) into the cache and analyse instead of a local path.
     remote: Option<GitHubRepo>,
     port: u16,
     watch: bool,
@@ -65,6 +84,11 @@ struct Options {
     gui: bool,
 }
 
+/// Parses the arguments (without the program name). `Ok(None)` means help was asked for; `Err` is a usage error.
+///
+/// The single positional argument is a path if it names an existing directory, otherwise it is tried as a GitHub
+/// URL or `github:` shorthand; anything that is neither ends up as a path and fails the directory check below. A
+/// local root is canonicalised so that paths from the walker, git and the GitHub prefix all agree.
 fn parse_args(args: Vec<String>) -> Result<Option<Options>, String> {
     let mut o = Options {
         root: None,
@@ -80,6 +104,7 @@ fn parse_args(args: Vec<String>) -> Result<Option<Options>, String> {
     };
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
+        // Takes the option's value from the same iterator, so `-p 8080` consumes two arguments.
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
         match a.as_str() {
             "-h" | "--help" => return Ok(None),
@@ -97,6 +122,8 @@ fn parse_args(args: Vec<String>) -> Result<Option<Options>, String> {
                     return Err("only one path may be given".into());
                 }
                 let as_path = PathBuf::from(s);
+                // An existing directory wins, even if its name would also parse as a GitHub spec. A GitHub spec with
+                // `.`/`..` as owner or name is an error rather than a path.
                 match if as_path.is_dir() { None } else { GitHubRepo::parse(s)? } {
                     Some(repo) => o.remote = Some(repo),
                     None => o.root = Some(as_path),
@@ -114,6 +141,7 @@ fn parse_args(args: Vec<String>) -> Result<Option<Options>, String> {
     Ok(Some(o))
 }
 
+/// Exit codes: 0 on success or `--help`, 2 for a usage error, 1 when the run itself fails.
 fn main() {
     let opts = match parse_args(std::env::args().skip(1).collect()) {
         Ok(Some(o)) => o,
@@ -133,14 +161,19 @@ fn main() {
     }
 }
 
+/// Builds the city once, then either exports it, opens the native window, or serves it to the browser until the
+/// process is killed. With `--watch`, file changes rebuild the model and push it to the viewer.
 fn run(mut opts: Options) -> Result<(), String> {
     if let Some(repo) = &opts.remote {
         let dir = github::clone_or_update(repo)?;
         opts.root = Some(std::fs::canonicalize(&dir).map_err(|e| e.to_string())?);
     }
+    // Set by parse_args for a local path, or just above for a remote.
     let root = opts.root.clone().unwrap();
     let github = if opts.github { load_github(&root) } else { None };
 
+    // Shared with the rebuild closure: the analyser's parse cache is what makes watch-mode rebuilds re-parse only the
+    // files that changed.
     let analyzer = Arc::new(SourceAnalyzer::new());
     println!("Analysing {} …", root.display());
     let model = Arc::new(CityModel::build(&analyzer, &root, opts.include_tests, opts.git, github.clone()));
@@ -155,6 +188,8 @@ fn run(mut opts: Options) -> Result<(), String> {
         return Ok(());
     }
 
+    // Produces a fresh model in watch mode. The GitHub info (including the pull requests) is fetched only once at
+    // startup and reused for every rebuild.
     let rebuild = {
         let analyzer = analyzer.clone();
         let root = root.clone();
@@ -170,6 +205,7 @@ fn run(mut opts: Options) -> Result<(), String> {
         #[cfg(feature = "gui")]
         {
             println!("Opening the CodeCity window …");
+            // The window does its own watching, so it gets the root to watch and the rebuild closure.
             return gui::run(model, opts.watch.then_some((root, Box::new(rebuild) as Box<dyn Fn() -> Arc<CityModel> + Send>)));
         }
         #[cfg(not(feature = "gui"))]
@@ -178,6 +214,9 @@ fn run(mut opts: Options) -> Result<(), String> {
 
     let server = server::CityServer::bind(model, opts.port).map_err(|e| format!("cannot start server: {e}"))?;
     println!("CodeCity is live at {}  (Ctrl+C to stop)", server.url());
+    // The watcher stops when dropped, so it is kept in a named binding (`_` alone would drop it at once) for as long
+    // as server.run() serves. The callback runs on the watcher's debounce thread, rebuilds there and hands the model
+    // to the server.
     let _watcher = if opts.watch {
         let update = server.updater();
         let w = watch::watch(&root, move || update(rebuild())).map_err(|e| format!("cannot watch: {e}"))?;
@@ -187,12 +226,14 @@ fn run(mut opts: Options) -> Result<(), String> {
         None
     };
     if opts.open {
+        // Failing to open a browser is not fatal: the URL has been printed.
         let _ = open_browser(&server.url());
     }
     server.run();
     Ok(())
 }
 
+/// GitHub context for `root`, or None when it has no GitHub remote. Pull requests are fetched here, once.
 fn load_github(root: &std::path::Path) -> Option<GitHubInfo> {
     let mut info = GitHubInfo::detect(root)?;
     println!("GitHub: {} — fetching open pull requests …", info.repo.web_url());
@@ -205,6 +246,8 @@ fn load_github(root: &std::path::Path) -> Option<GitHubInfo> {
     Some(info)
 }
 
+/// One line of analysis statistics, e.g. `120 files, 95 types (Java 95), 12 packages, git history for 118 files — 840
+/// ms`.
 fn print_summary(model: &CityModel) {
     let a = &model.analysis;
     let s = &model.stats;
@@ -221,6 +264,8 @@ fn print_summary(model: &CityModel) {
     );
 }
 
+/// Opens `url` in the default browser with the platform's opener. The child is spawned and not waited for; its
+/// output is discarded.
 fn open_browser(url: &str) -> std::io::Result<()> {
     let cmd = if cfg!(target_os = "macos") {
         vec!["open", url]

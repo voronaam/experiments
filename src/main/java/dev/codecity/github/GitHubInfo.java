@@ -7,6 +7,10 @@ import java.util.Optional;
 /**
  * GitHub context of an analysed source tree.
  *
+ * <p>The viewers use it for two things: permalinks ({@code blob}/{@code blame}/{@code commits} URLs built from
+ * {@code repo}, {@code ref} and {@code prefix} plus a building's root-relative file path) and the pull-request overlay
+ * ({@code pulls}). It is detected and fetched once at start-up and shared by every watch-mode rebuild.
+ *
  * @param ref         commit SHA (if it exists on the remote) or branch name used for permalinks
  * @param prefix      path of the analysed root inside the repository, "" or ending in "/"
  * @param pulls       open pull requests, or null when they were not fetched
@@ -14,7 +18,16 @@ import java.util.Optional;
  */
 public record GitHubInfo(GitHubRepo repo, String ref, String prefix, List<PullRequest> pulls, String pullsSource) {
 
-    /** Finds a GitHub remote for the repository containing {@code root}; empty if there is none. */
+    /**
+     * Finds a GitHub remote for the repository containing {@code root}; empty if there is none (or {@code root} is not
+     * inside a git work tree, or git is not installed).
+     *
+     * <p>The remote called {@code origin} is preferred; otherwise the first remote in {@code git remote -v} output
+     * whose URL parses as a GitHub repository is used. {@code ref} is the HEAD commit SHA when some remote-tracking
+     * branch contains it, otherwise the current branch name (or, on a detached HEAD, the SHA anyway). {@code prefix} is
+     * where {@code root} lies below the repository top level, so that links work when only a sub-directory was
+     * analysed.
+     */
     public static Optional<GitHubInfo> detect(Path root) {
         Optional<String> top = Git.run(root, "rev-parse", "--show-toplevel");
         if (top.isEmpty()) {
@@ -22,6 +35,7 @@ public record GitHubInfo(GitHubRepo repo, String ref, String prefix, List<PullRe
         }
         Optional<GitHubRepo> repo = Git.run(root, "remote", "get-url", "origin").flatMap(GitHubRepo::parse);
         if (repo.isEmpty()) {
+            // "remote -v" prints "<name>\t<url> (fetch|push)" per line; the URL is the second field.
             repo = Git.run(root, "remote", "-v").stream()
                     .flatMap(String::lines)
                     .map(l -> l.split("\\s+"))
@@ -37,6 +51,8 @@ public record GitHubInfo(GitHubRepo repo, String ref, String prefix, List<PullRe
         boolean pushed = Git.run(root, "branch", "-r", "--contains", "HEAD").map(s -> !s.isBlank()).orElse(false);
         String branch = Git.run(root, "rev-parse", "--abbrev-ref", "HEAD").filter(b -> !b.equals("HEAD")).orElse(sha);
         String prefix;
+        // Both sides are resolved to real paths before relativising, so a symlink on the way to either one cannot
+        // turn the prefix into a "../" path. Windows separators become '/' because the prefix goes into URLs.
         try {
             prefix = Path.of(top.get()).toRealPath().relativize(root.toRealPath()).toString().replace('\\', '/');
         } catch (java.io.IOException e) {

@@ -13,6 +13,7 @@
   --shadow: 0 10px 30px rgba(15, 23, 42, 0.12), 0 1px 2px rgba(15, 23, 42, 0.06);
   --radius: 14px;
   --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --crosshair-color: rgba(15, 23, 42, 0.8);
   color-scheme: light;
 }
 
@@ -27,6 +28,7 @@
   --accent-soft: rgba(96, 165, 250, 0.16);
   --input: rgba(148, 163, 184, 0.08);
   --shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  --crosshair-color: rgba(255, 255, 255, 0.85);
   color-scheme: dark;
 }
 
@@ -182,7 +184,8 @@ select option { background: var(--bg); color: var(--text); }
 .toggle input:checked::after { transform: translateX(12px); background: #fff; }
 .toggle input:disabled { opacity: .4; }
 
-.buttons { flex-direction: row !important; gap: 6px !important; }
+.buttons { flex-direction: row !important; flex-wrap: wrap; gap: 6px !important; }
+.buttons button { flex: 1 1 40%; }
 button {
   flex: 1;
   padding: 7px 8px;
@@ -195,6 +198,7 @@ button {
   transition: background .15s, border-color .15s;
 }
 button:hover { border-color: var(--accent); background: var(--accent-soft); }
+button.active { border-color: var(--accent); background: var(--accent); color: #fff; }
 
 /* ---------- inspector ---------- */
 .inspector {
@@ -276,6 +280,18 @@ button:hover { border-color: var(--accent); background: var(--accent-soft); }
   background: var(--panel); border: 1px solid var(--panel-border);
   backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
 }
+
+/* ---------- walk mode ---------- */
+body.walking .hint:not(.walk-hint) { display: none; }
+.walk-hint { opacity: 1; transition: opacity .8s; pointer-events: none; }
+.walk-hint.faded { opacity: 0; }
+.crosshair {
+  position: fixed; left: 50%; top: 50%; width: 18px; height: 18px; margin: -9px 0 0 -9px;
+  pointer-events: none; z-index: 15;
+}
+.crosshair::before, .crosshair::after { content: ""; position: absolute; background: var(--crosshair-color); }
+.crosshair::before { left: 8px; top: 0; width: 2px; height: 18px; }
+.crosshair::after { left: 0; top: 8px; width: 18px; height: 2px; }
 
 .loading {
   position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; gap: 12px;

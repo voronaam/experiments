@@ -8,6 +8,13 @@ import java.util.Map;
 /**
  * Minimal JSON parser for API responses. Produces {@link Map}, {@link List}, {@link String}, {@link Double},
  * {@link Boolean} or {@code null}.
+ *
+ * <p>Used for the GitHub API responses in {@link dev.codecity.github.PullRequests}. It is a recursive-descent parser
+ * with a single cursor {@code i} into the input, and it accepts slightly more than strict JSON: a number is any run of
+ * {@code +-0123456789.eE} handed to {@link Double#parseDouble}, unknown escapes yield the escaped character itself, and
+ * raw control characters inside strings are kept. Objects keep their key order ({@link LinkedHashMap}). Malformed
+ * input raises an {@link IllegalArgumentException}, usually naming the offset (input that ends inside a string escape
+ * raises an {@link IndexOutOfBoundsException} instead); {@code PullRequests} treats both as a failed fetch.
  */
 public final class JsonParser {
 
@@ -18,6 +25,7 @@ public final class JsonParser {
         this.s = s;
     }
 
+    /** Parses one complete JSON document; anything but whitespace after the value is an error. */
     public static Object parse(String json) {
         JsonParser p = new JsonParser(json);
         Object value = p.value();
@@ -39,6 +47,7 @@ public final class JsonParser {
         return node;
     }
 
+    /** Parses the value at the cursor; the first character decides which kind it is. */
     private Object value() {
         ws();
         if (i >= s.length()) {
@@ -56,6 +65,7 @@ public final class JsonParser {
         };
     }
 
+    /** Parses {@code {...}} with the cursor on the opening brace. A duplicate key keeps the last value. */
     private Map<String, Object> object() {
         Map<String, Object> map = new LinkedHashMap<>();
         i++;
@@ -100,6 +110,10 @@ public final class JsonParser {
         }
     }
 
+    /**
+     * Parses a string literal. {@code \}{@code uXXXX} becomes one UTF-16 unit, so a surrogate pair written as two
+     * escapes comes out as the right two chars without special handling.
+     */
     private String string() {
         expect('"');
         StringBuilder sb = new StringBuilder();

@@ -1,4 +1,8 @@
 /// Core data model shared by the analysers, the layout, the JSON output and the viewers.
+///
+/// The analysers (`codecity.analysis`) produce one `TypeDecl` per type and collect them, with the dependency graph
+/// and git history, in an `Analysis`. Everything downstream (`codecity.layout`, `codecity.city`) only reads it.
+/// The Java and Rust editions have the same model.
 module codecity.model;
 
 import std.array : split;
@@ -11,6 +15,7 @@ enum Language
     rust,
 }
 
+/// Lower-case identifier used in the JSON (`"lang"` and the per-language stats).
 string id(Language l) pure nothrow @safe
 {
     final switch (l)
@@ -65,18 +70,24 @@ struct TypeDecl
     string pkg;
     /// Build module / package.json project / crate ("" when there is only one).
     string module_;
+    /// Declaration kind as the viewer shows it, e.g. `class`, `record`, `enum`, `struct`, `type` or `module`.
     string kind;
+    /// Absolute path of the source file, under the analysed root (as `findSources` returns it).
     string file;
+    /// First and last line of the declaration, 1-based.
     uint line;
     uint endLine;
     /// Non-blank, non-comment lines inside the declaration.
     uint loc;
     /// Number of attributes (fields, record components, enum constants, …).
     uint noa;
+    /// Declared in test code; such types are dropped when tests are excluded.
     bool test;
     MethodInfo[] methods;
     /// Raw names referenced in the body, resolved later against the project.
     bool[string] references;
+    /// Java only: single-type imports (`import a.b.C;`) and on-demand import packages (`import a.b.*;` gives `a.b`),
+    /// used to resolve `references` to fqns.
     string[] explicitImports;
     string[] wildcardImports;
 
@@ -90,6 +101,7 @@ struct TypeDecl
         return s;
     }
 
+    /// `pkg` split at the language's separator; empty for a type outside any package.
     string[] packageSegments() const pure @safe
     {
         return pkg.length ? pkg.split(language.separator) : [];
@@ -99,8 +111,10 @@ struct TypeDecl
 /// Git activity for one file.
 struct FileHistory
 {
+    /// Non-merge commits touching the file, and distinct author e-mail addresses among them.
     uint commits;
     uint authors;
+    /// Author timestamps of the newest and oldest of those commits, in Unix seconds.
     long lastCommit;
     long firstCommit;
 }
@@ -108,12 +122,15 @@ struct FileHistory
 /// Result of analysing a source tree.
 struct Analysis
 {
+    /// The analysed directory (absolute).
     string root;
     /// All types, sorted by fqn.
     TypeDecl[] types;
     /// fqn → sorted fqns of other project types it uses.
     string[][string] dependencies;
+    /// Absolute file path → git history; empty without git.
     FileHistory[string] history;
+    /// Source files found, and how many of them had syntax errors (analysed only partially) or could not be read.
     size_t files;
     size_t failedFiles;
 }

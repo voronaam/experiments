@@ -111,4 +111,66 @@ class TypeScriptAnalyzerTest {
         write("types/global.d.ts", "interface Window { x: number }\n");
         assertTrue(analyze().types().isEmpty());
     }
+
+    @Test
+    void repeatedDeclarationsGetUniqueIds() throws IOException {
+        write("a.ts", "interface A { x: number }\ninterface A { y: number }\ninterface A { z: number }\nclass A {}\n");
+        Map<String, TypeInfo> t = byFqn(analyze());
+        assertEquals(java.util.Set.of("a.ts:A", "a.ts:A#interface", "a.ts:A#interface2", "a.ts:A#class"), t.keySet());
+    }
+
+    @Test
+    void commentsAreNotCountedAsMembersOrParameters() throws IOException {
+        write("a.ts", """
+                enum E {
+                  // first
+                  A,
+                  /* second */
+                  B,
+                }
+                function f(a: number, /* the second */ b: number) {}
+                class C { constructor(private a: number, // note
+                                      b: number) {} }
+                const p = 1, q = 2;
+                """);
+        Map<String, TypeInfo> t = byFqn(analyze());
+        assertEquals(2, t.get("a.ts:E").noa());
+        assertEquals(2, t.get("a.ts").methods().getFirst().parameters());
+        assertEquals(1, t.get("a.ts:C").noa());
+        assertEquals(2, t.get("a.ts:C").methods().getFirst().parameters());
+        assertEquals(2, t.get("a.ts").noa());
+        assertEquals(2, t.get("a.ts").loc(), "function line + one line for the two-declarator const");
+    }
+
+    @Test
+    void resolvesLikeTypeScriptAndKeepsPackagesExternal() throws IOException {
+        write("src/a.ts", "export class A {}\n");
+        write("src/a/index.ts", "export class A {}\n");
+        write("src/b.tsx", "export class B {}\n");
+        write("src/b.ts", "export class B {}\n");
+        write("src/lodash/fp.ts", "export class Fp {}\n");
+        write("src/@scope/pkg.ts", "export class Pkg {}\n");
+        write("src/main.ts", """
+                import { A } from './a';
+                import { B } from '@/b';
+                import { Fp } from 'lodash/fp';
+                import { Pkg } from '@scope/pkg';
+                class M { a: A; b: B; f: Fp; p: Pkg; }
+                """);
+        write("src/alias.ts", "import { A } from '~/a';\nclass N { a: A; }\n");
+        Analysis a = analyze();
+        assertEquals(java.util.Set.of("src/a.ts:A", "src/b.ts:B"), a.dependencies().get("src/main.ts:M"));
+        assertEquals(java.util.Set.of("src/a.ts:A"), a.dependencies().get("src/alias.ts:N"));
+    }
+
+    @Test
+    void noticesPackageJsonChangesBetweenAnalyses() throws IOException {
+        write("web/src/App.ts", "export class App {}\n");
+        SourceAnalyzer analyzer = new SourceAnalyzer();
+        assertEquals("", byFqn(analyzer.analyze(root, true)).get("web/src/App.ts:App").module());
+        write("web/package.json", "{}");
+        TypeInfo app = byFqn(analyzer.analyze(root, true)).get("web/src/App.ts:App");
+        assertEquals("web", app.module());
+        assertEquals("src", app.packageName());
+    }
 }

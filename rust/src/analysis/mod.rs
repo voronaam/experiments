@@ -1,5 +1,20 @@
 //! Walks a source tree, parses every supported file with its language's analyser (in parallel, cached by
 //! modification time so watch-mode rebuilds only re-parse what changed), then links each language's files.
+//!
+//! This is the first half of the pipeline (walk → parse/analyse → link dependencies → git history → city model →
+//! layout → JSON → viewers). [`SourceAnalyzer::analyze`] produces an [`Analysis`]; `city.rs` fills in its git history
+//! and turns it into the city model.
+//!
+//! # Two phases per language
+//! 1. **Parse** (per file, in parallel, cacheable): each analyser (`java`, `typescript`, `rust_lang`) turns one file
+//!    into [`TypeInfo`]s with metrics and the *raw* names they reference, plus a language-specific [`Context`]
+//!    (imports, declared names, `impl` blocks) that the linker needs. A file's result depends only on that file and
+//!    on a few manifest files (`package.json`, `Cargo.toml`), which is what makes per-file caching possible.
+//! 2. **Link** (per language, sequential): all parsed files of one language are combined, raw references are
+//!    resolved to fully qualified names of project types, and (Rust only) `impl` blocks are attached to their types.
+//!    Linking is cheap compared with parsing and needs to see every file, so it runs again on every analysis.
+//!
+//! Languages are linked independently: there are no cross-language dependencies.
 
 pub mod java;
 #[cfg(test)]
@@ -17,6 +32,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+/// Directories never descended into: VCS metadata, IDE/build-tool state, build output and installed dependencies.
+/// Analysing them would add generated or third-party code to the city (and `node_modules` alone can be huge).
 pub const IGNORED_DIRS: [&str; 13] = [
     ".git", ".hg", ".svn", ".idea", ".gradle", ".mvn", "target", "build", "out", "node_modules", "dist",
     "coverage", "bower_components",
@@ -24,11 +41,13 @@ pub const IGNORED_DIRS: [&str; 13] = [
 
 /// Language-specific data the linker needs (imports, impl blocks, …).
 pub enum Context {
+    /// Java needs no extra context: its imports are stored on each [`TypeInfo`]. Also used for failed files.
     None,
     TypeScript(typescript::Context),
     Rust(rust_lang::Context),
 }
 
+/// The result of parsing one file. Shared through `Arc` because the cache and the current analysis both hold it.
 pub struct ParsedFile {
     pub types: Vec<TypeInfo>,
     pub context: Context,
@@ -39,9 +58,11 @@ pub struct ParsedFile {
 /// Every parsed file of one language combined into final types and project-internal dependencies.
 pub struct Linked {
     pub types: Vec<TypeInfo>,
+    /// fqn → fqns it depends on. Only project types appear as targets; external references are dropped.
     pub dependencies: HashMap<String, HashSet<String>>,
 }
 
+/// The language a file is analysed as, chosen by file name alone. `None` means the file is skipped.
 pub fn language_of(file: &Path) -> Option<Language> {
     let name = file.file_name()?.to_str()?;
     if name.ends_with(".java") {
@@ -55,19 +76,37 @@ pub fn language_of(file: &Path) -> Option<Language> {
     }
 }
 
+/// True for directories the walk skips: the [`IGNORED_DIRS`] and any hidden directory (`.name`). The length check
+/// keeps `.` itself (the root when given as a relative path) from counting as hidden.
 pub fn is_ignored_dir(name: &str) -> bool {
     IGNORED_DIRS.contains(&name) || (name.starts_with('.') && name.len() > 1)
 }
 
+/// Manifest file names whose content feeds into the parse of other files: a `.rs` file's crate name comes from the
+/// nearest `Cargo.toml`, a `.ts` file's project from the nearest `package.json`.
+const MANIFESTS: [&str; 2] = ["Cargo.toml", "package.json"];
+
+/// Path, modification time and size of every manifest, sorted by path: when this changes, cached parses may be stale.
+type ManifestStamps = Vec<(PathBuf, Option<SystemTime>, u64)>;
+
+/// A cached parse result. The file counts as unchanged while both its modification time and its size match; the size
+/// catches rewrites within the timestamp resolution of the file system.
 struct CacheEntry {
     modified: SystemTime,
     size: u64,
     parsed: Arc<ParsedFile>,
 }
 
+/// Parses source trees, keeping per-file results between runs. One instance lives for the whole process and is
+/// shared (via `Arc`) with the watch-mode rebuild, so each rebuild only re-parses files that changed.
 #[derive(Default)]
 pub struct SourceAnalyzer {
+    /// Absolute file path → last parse. Locked briefly by the rayon workers in `parse_cached`; never held while
+    /// parsing, so workers do not serialise on it.
     cache: Mutex<HashMap<PathBuf, CacheEntry>>,
+    /// The manifests seen by the previous analysis. Any difference (edited, added, removed) empties `cache`.
+    manifests: Mutex<ManifestStamps>,
+    /// Set once the first analyser panic has been reported, so a buggy analyser does not flood stderr.
     reported_failure: AtomicBool,
 }
 
@@ -81,12 +120,33 @@ impl SourceAnalyzer {
         self.cache.lock().unwrap().len()
     }
 
+    /// Analyses every supported file under `root`. Test types are dropped unless `include_tests` is set. The returned
+    /// [`Analysis`] has an empty `history`; the caller adds git history.
     pub fn analyze(&self, root: &Path, include_tests: bool) -> Analysis {
-        let files = find_sources(root);
+        let (files, manifests) = find_sources(root);
         {
+            let mut cache = self.cache.lock().unwrap();
+            // A changed manifest can change the parse of files that did not change themselves (their crate or
+            // project), so start over. Manifests rarely change, so dropping every language's parses is good enough.
+            let stamps: ManifestStamps = manifests
+                .into_iter()
+                .map(|m| {
+                    let meta = std::fs::metadata(&m).ok();
+                    let modified = meta.as_ref().and_then(|x| x.modified().ok());
+                    (m, modified, meta.map(|x| x.len()).unwrap_or(0))
+                })
+                .collect();
+            let mut last = self.manifests.lock().unwrap();
+            if *last != stamps {
+                cache.clear();
+                *last = stamps;
+            }
+            // Forget deleted (or now ignored) files so the cache does not grow without bound in watch mode.
             let keep: HashSet<&PathBuf> = files.iter().collect();
-            self.cache.lock().unwrap().retain(|p, _| keep.contains(p));
+            cache.retain(|p, _| keep.contains(p));
         }
+        // Parse in parallel. Rayon's `collect` keeps the input order, and `files` is sorted, so the order below is
+        // deterministic.
         let parsed: Vec<(Language, Arc<ParsedFile>)> = files
             .par_iter()
             .filter_map(|f| language_of(f).map(|l| (l, self.parse_cached(l, root, f))))
@@ -101,6 +161,7 @@ impl SourceAnalyzer {
             by_language.entry(lang).or_default().push(p);
         }
 
+        // Sorted by fqn, so the type list (and everything built from it) does not depend on parse order.
         let mut by_fqn: BTreeMap<String, TypeInfo> = BTreeMap::new();
         let mut dependencies: HashMap<String, HashSet<String>> = HashMap::new();
         for (lang, files) in &by_language {
@@ -109,12 +170,22 @@ impl SourceAnalyzer {
                 Language::TypeScript => typescript::link(root, files),
                 Language::Rust => rust_lang::link(files),
             };
+            // fqn formats differ per language (`a.b.C`, `src/x.ts:C`, `krate::m::C`), so collisions across
+            // languages are not expected; should one happen, the first language (in `Language` order) wins and the
+            // later duplicate is dropped together with its dependencies.
+            let mut linked_deps = linked.dependencies;
             for t in linked.types {
-                by_fqn.entry(t.fqn.clone()).or_insert(t);
+                if !by_fqn.contains_key(&t.fqn) {
+                    if let Some(d) = linked_deps.remove(&t.fqn) {
+                        dependencies.insert(t.fqn.clone(), d);
+                    }
+                    by_fqn.insert(t.fqn.clone(), t);
+                }
             }
-            dependencies.extend(linked.dependencies);
         }
         let types: Vec<TypeInfo> = by_fqn.into_values().filter(|t| include_tests || !t.test).collect();
+        // Final dependency lists: only edges to types that survived the test filter, no self-edges, and sorted so
+        // the JSON output is stable.
         let kept: HashSet<&str> = types.iter().map(|t| t.fqn.as_str()).collect();
         let mut deps = HashMap::with_capacity(types.len());
         for t in &types {
@@ -135,6 +206,11 @@ impl SourceAnalyzer {
         }
     }
 
+    /// Returns the cached result if the file's modification time and size are unchanged, otherwise parses it and
+    /// caches the result. Files whose modification time cannot be read are parsed every time and never cached.
+    ///
+    /// Called concurrently from rayon workers: the lock is taken for the lookup and again for the insert, never
+    /// across the parse. Two workers never parse the same path because each path occurs once in the file list.
     fn parse_cached(&self, lang: Language, root: &Path, file: &Path) -> Arc<ParsedFile> {
         let meta = std::fs::metadata(file).ok();
         let modified = meta.as_ref().and_then(|m| m.modified().ok());
@@ -156,6 +232,7 @@ impl SourceAnalyzer {
         parsed
     }
 
+    /// Reads and parses one file. Never fails: unreadable files and analyser panics yield an empty, failed result.
     fn parse(&self, lang: Language, root: &Path, file: &Path) -> ParsedFile {
         let code = match std::fs::read(file) {
             Ok(bytes) => match String::from_utf8(bytes) {
@@ -165,6 +242,7 @@ impl SourceAnalyzer {
             },
             Err(_) => return failed(),
         };
+        // Catch panics so that one file the analyser cannot handle does not abort the whole (parallel) analysis.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match lang {
             Language::Java => java::parse(root, file, &code),
             Language::TypeScript => typescript::parse(root, file, &code),
@@ -183,13 +261,21 @@ impl SourceAnalyzer {
     }
 }
 
+/// The result for a file that could not be read or analysed: no types, counted as failed.
 fn failed() -> ParsedFile {
     ParsedFile { types: Vec::new(), context: Context::None, failed: true }
 }
 
-/// Supported files under `root`, skipping build output and VCS directories; walked in parallel.
-fn find_sources(root: &Path) -> Vec<PathBuf> {
+/// Supported files under `root`, and separately the [`MANIFESTS`], skipping build output and VCS directories; walked
+/// in parallel.
+///
+/// `standard_filters(false)` turns off the `ignore` crate's own rules (.gitignore, hidden files), so the result does
+/// not depend on ignore files; only [`is_ignored_dir`] prunes directories. Symlinks are not followed, which also rules
+/// out cycles. The root itself is never pruned, even if its name looks ignored (e.g. a project checked out as
+/// `build/`). The walker threads push into shared vectors, so the lists are sorted afterwards to be deterministic.
+fn find_sources(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let files = Mutex::new(Vec::new());
+    let manifests = Mutex::new(Vec::new());
     let root_buf = root.to_path_buf();
     ignore::WalkBuilder::new(root)
         .standard_filters(false)
@@ -202,11 +288,16 @@ fn find_sources(root: &Path) -> Vec<PathBuf> {
         })
         .build_parallel()
         .run(|| {
-            let files = &files;
+            // Called once per walker thread to create that thread's visitor.
+            let (files, manifests) = (&files, &manifests);
             Box::new(move |entry| {
                 if let Ok(e) = entry {
-                    if e.file_type().map(|t| t.is_file()).unwrap_or(false) && language_of(e.path()).is_some() {
-                        files.lock().unwrap().push(e.into_path());
+                    if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                        if language_of(e.path()).is_some() {
+                            files.lock().unwrap().push(e.into_path());
+                        } else if MANIFESTS.contains(&e.file_name().to_string_lossy().as_ref()) {
+                            manifests.lock().unwrap().push(e.into_path());
+                        }
                     }
                 }
                 ignore::WalkState::Continue
@@ -214,10 +305,16 @@ fn find_sources(root: &Path) -> Vec<PathBuf> {
         });
     let mut files = files.into_inner().unwrap();
     files.sort();
-    files
+    let mut manifests = manifests.into_inner().unwrap();
+    manifests.sort();
+    (files, manifests)
 }
 
 /// Thread-local tree-sitter parser per grammar (parsers are not `Sync`), keyed by grammar name.
+///
+/// Creating a parser and loading a grammar is not free, so each rayon worker keeps one parser per grammar for the life
+/// of the thread and reuses it for every file. `language` is only called the first time a thread needs that grammar.
+/// The TypeScript analyser uses two keys ("typescript" and "tsx"), as `.tsx` files need a different grammar.
 pub fn with_parser<R>(
     grammar: &'static str,
     language: impl FnOnce() -> tree_sitter::Language,
@@ -231,6 +328,7 @@ pub fn with_parser<R>(
         let mut map = cell.borrow_mut();
         let parser = map.entry(grammar).or_insert_with(|| {
             let mut p = tree_sitter::Parser::new();
+            // Fails only if the grammar crate was generated for an incompatible tree-sitter ABI: a build problem.
             p.set_language(&language()).expect("grammar version compatible with tree-sitter");
             p
         });

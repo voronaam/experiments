@@ -58,6 +58,8 @@ JavaFX window it adds:
 * **The browser viewer's night look:** buildings glow in their own colour and office windows light up, via a custom
   shader.
 * **GPU picking**, and every building and district instanced, so even very large cities are a handful of draw calls.
+* **Walk mode** (`G`): walk through the city in first person, as described in the
+  [main README](../README.md#walk-mode).
 
 Snapshots go to `~/Pictures` (or the current directory if that doesn't exist), and settings are saved in
 `~/.config/codecity/desktop.json`. It also runs on software OpenGL (Mesa llvmpipe) with no extra flags.

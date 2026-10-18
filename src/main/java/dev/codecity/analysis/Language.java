@@ -1,6 +1,11 @@
 package dev.codecity.analysis;
 
-/** Supported source languages and how each one names its "packages" (the districts of the city). */
+/**
+ * Supported source languages and how each one names its "packages" (the districts of the city).
+ *
+ * <p>The declaration order matters: {@link SourceAnalyzer} links languages in this order, and when two languages
+ * produce the same fqn the earlier one wins.
+ */
 public enum Language {
     JAVA("java", "Java", "."),
     TYPESCRIPT("typescript", "TypeScript", "/"),

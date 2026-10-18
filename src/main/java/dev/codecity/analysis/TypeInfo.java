@@ -14,9 +14,20 @@ import java.util.Set;
  * @param fqn        unique id, e.g. {@code com.acme.Order.Line}, {@code src/ui/App.tsx:App}, {@code shop::cart::Cart}
  * @param name       name relative to its package, e.g. {@code Order.Line}
  * @param module     build module / package.json project / crate the file belongs to ("" when there is only one)
- * @param loc        non-blank, non-comment lines inside the declaration
+ * @param kind       e.g. {@code class}, {@code abstract}, {@code interface}, {@code enum}, {@code record},
+ *                   {@code annotation}, {@code type}, {@code struct}, {@code union}, {@code trait} or {@code module};
+ *                   the viewers can colour buildings by it
+ * @param file       absolute path of the declaring file
+ * @param line       first line of the declaration (1-based)
+ * @param endLine    last line of the declaration (inclusive)
+ * @param loc        non-blank, non-comment lines inside the declaration (for Rust, plus those of its impl blocks)
  * @param noa        number of attributes (fields, record components, enum constants)
+ * @param test       declared in test code; such types are dropped when tests are excluded
+ * @param methods    methods, constructors or functions in declaration order (for Rust, those of the impl blocks
+ *                   follow the type's own)
  * @param references raw type names referenced in the body, resolved later against the project
+ * @param explicitImports Java only: single-type imports, plus the types named by static imports
+ * @param wildcardImports Java only: packages imported on demand ({@code import a.b.*})
  */
 public record TypeInfo(
         Language language,
@@ -36,7 +47,7 @@ public record TypeInfo(
         List<String> explicitImports,
         List<String> wildcardImports) {
 
-    /** The package split into district segments. */
+    /** The package split into district segments; empty for the root (default) package. */
     public java.util.List<String> packageSegments() {
         if (packageName.isEmpty()) {
             return java.util.List.of();

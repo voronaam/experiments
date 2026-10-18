@@ -1,6 +1,18 @@
 package dev.codecity.json;
 
-/** Minimal streaming JSON writer. Output is safe to embed inside an HTML {@code <script>} element. */
+/**
+ * Minimal streaming JSON writer. Output is safe to embed inside an HTML {@code <script>} element.
+ *
+ * <p>Used for the city model served to the web viewer (and inlined by {@code HtmlExporter}), for the
+ * {@code /api/source} response and for GitHub GraphQL request bodies. Calls are chained in document order, e.g.
+ * {@code beginObject().field("a", 1).name("b").beginArray().value(2).endArray().endObject()}. The writer does not
+ * check nesting; a mismatched begin/end simply produces invalid JSON.
+ *
+ * <p>Comma handling: {@code needComma} is true right after a complete value. Every method that starts a new value or
+ * key ({@code beginObject}, {@code beginArray}, {@code name}, {@code value}, {@code raw}) first emits a comma if it is
+ * set. {@code name} and the {@code begin} methods then clear it, because what follows a key or an opening bracket must
+ * not be preceded by a comma.
+ */
 public final class JsonWriter {
 
     private final StringBuilder out = new StringBuilder(1 << 16);
@@ -58,9 +70,15 @@ public final class JsonWriter {
         return this;
     }
 
+    /**
+     * Writes a number rounded to three decimals. Whole numbers below 10^15 are written without a fraction
+     * ({@code 3}, not {@code 3.0}); larger ones use {@link Double#toString} (e.g. {@code 1.0E15}), which is still valid
+     * JSON. {@link Math#round(double)} rounds halves up (towards positive infinity), which the other editions copy
+     * exactly. JSON has no NaN or infinity, so those are written as {@code 0}.
+     */
     public JsonWriter value(double v) {
         comma();
-        double r = Math.round(v * 1000) / 1000.0;
+        double r = Double.isFinite(v) ? Math.round(v * 1000) / 1000.0 : 0;
         if (r == Math.rint(r) && Math.abs(r) < 1e15) {
             out.append((long) r);
         } else {
@@ -107,6 +125,12 @@ public final class JsonWriter {
         }
     }
 
+    /**
+     * Writes a quoted, escaped string. Beyond the escapes JSON requires, {@code <}, {@code >} and {@code &} are written
+     * as unicode escapes so that {@code </script>} or {@code <!--} inside a value cannot end or confuse an enclosing
+     * HTML script element, and U+2028/U+2029 (line and paragraph separator) are escaped because older JavaScript
+     * engines reject them inside string literals.
+     */
     private void string(String s) {
         out.append('"');
         for (int i = 0; i < s.length(); i++) {

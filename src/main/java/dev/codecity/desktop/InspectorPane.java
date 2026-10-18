@@ -28,7 +28,12 @@ import java.util.function.IntPredicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-/** Right-hand panel describing the selected class. */
+/**
+ * Right-hand panel describing the selected class: name and package, kind/language badges, a grid of metrics, file
+ * location with a Source button, GitHub links and open PRs, the most complex methods, and clickable chips for the types
+ * it uses and is used by. The content is rebuilt from scratch on every {@link #show}; the panel holds no state of its
+ * own and reports user actions through {@link Actions}. Mirrors the web viewer's inspector.
+ */
 final class InspectorPane extends ScrollPane {
 
     interface Actions {
@@ -56,6 +61,11 @@ final class InspectorPane extends ScrollPane {
         setMaxWidth(360);
     }
 
+    /**
+     * Fills the panel for {@code b} and makes it visible. Dependency lists and counts only include buildings that pass
+     * {@code visible}, so they agree with the arcs drawn in the city when test code is hidden. Git metrics are shown
+     * only when the model has git history.
+     */
     void show(CityModel model, Building b, IntPredicate visible) {
         content.getChildren().clear();
         TypeInfo t = b.type();
@@ -131,8 +141,9 @@ final class InspectorPane extends ScrollPane {
             int maxCx = Math.max(1, b.methods().stream().mapToInt(MethodInfo::complexity).max().orElse(1));
             VBox methods = new VBox(4);
             b.methods().stream().limit(15).forEach(m -> methods.getChildren().add(methodRow(m, maxCx)));
-            if (b.methods().size() > 15) {
-                Label more = new Label("+ " + (b.methods().size() - 15) + " more");
+            // Counted on all of the type's methods like the header; b.methods() is capped at 300.
+            if (t.methods().size() > 15) {
+                Label more = new Label("+ " + (t.methods().size() - 15) + " more");
                 more.getStyleClass().add("muted");
                 methods.getChildren().add(more);
             }
@@ -146,11 +157,17 @@ final class InspectorPane extends ScrollPane {
         setManaged(true);
     }
 
+    /** Hides the panel and, by unmanaging it, gives its width back to the layout. */
     void hide() {
         setVisible(false);
         setManaged(false);
     }
 
+    /**
+     * GitHub links for the file and, when pull requests were fetched, the open PRs touching it ({@code b.prs()} holds
+     * indices into {@code gh.pulls()}). When none touch it and the PR list was incomplete, the message names what was
+     * searched ("none among the latest 30 open PRs") instead of claiming there are none.
+     */
     private void gitHub(GitHubInfo gh, Building b) {
         if (gh == null) {
             return;
@@ -192,13 +209,22 @@ final class InspectorPane extends ScrollPane {
         content.getChildren().add(prs);
     }
 
-    /** github.com/owner/repo/{blob|blame|commits}/ref/path#Lx-Ly */
+    /**
+     * github.com/owner/repo/{blob|blame|commits}/ref/path#Lx-Ly
+     *
+     * <p>The path is the analysed root's prefix inside the repository plus the building's root-relative file. The
+     * history ({@code commits}) page takes no line anchor.
+     */
     static String link(GitHubInfo gh, String kind, Building b) {
         String path = encodePath(gh.prefix() + b.file());
         String url = gh.repo().webUrl() + "/" + kind + "/" + encodePath(gh.ref()) + "/" + path;
         return kind.equals("commits") ? url : url + "#L" + b.type().line() + "-L" + b.type().endLine();
     }
 
+    /**
+     * Percent-encodes each path segment but keeps the slashes. {@link URLEncoder} does form encoding, which writes a
+     * space as '+', so that is turned into {@code %20} for use in a URL path.
+     */
     private static String encodePath(String path) {
         return Stream.of(path.split("/"))
                 .map(s -> URLEncoder.encode(s, StandardCharsets.UTF_8).replace("+", "%20"))
@@ -219,6 +245,7 @@ final class InspectorPane extends ScrollPane {
         return java.util.Arrays.stream(indices).filter(visible).toArray();
     }
 
+    /** Adds one value/label tile to the three-column grid at position {@code cell}; returns the next position. */
     private static int metric(GridPane grid, int cell, String value, String label) {
         Label v = new Label(value);
         v.getStyleClass().add("metric-value");
@@ -244,6 +271,11 @@ final class InspectorPane extends ScrollPane {
         return row;
     }
 
+    /**
+     * One method: name, complexity and size, and a bar. The bar's length is relative to the most complex method of
+     * this type; its colour is on an absolute scale where complexity 10 and above is the hot end of the ramp (unless
+     * the type's maximum is higher, then that is the hot end).
+     */
     private static Node methodRow(MethodInfo m, int maxCx) {
         Label name = new Label(m.name() + (m.parameters() > 0 ? "(…)" : "()"));
         name.getStyleClass().add("method-name");
@@ -271,6 +303,7 @@ final class InspectorPane extends ScrollPane {
         return row;
     }
 
+    /** Chips for dependency targets; {@code direction} ("out"/"in") is a style class, colouring them like the arcs. */
     private Node deps(CityModel model, int[] indices, String direction, String empty) {
         FlowPane pane = new FlowPane(4, 4);
         pane.setPrefWrapLength(300);

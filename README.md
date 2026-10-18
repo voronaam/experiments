@@ -123,6 +123,27 @@ Differences from the browser viewer:
 * Night mode lights the windows and makes hot spots glow (bloom). Ambient occlusion can be toggled.
 * **Snapshot** saves a PNG.
 
+### Walk mode
+
+Press `G` (or the **Walk** button) to walk through the city at street level, first-person-shooter style. All four
+viewers (browser, and the Java, Rust and D desktop windows) behave the same way.
+
+| | |
+|---|---|
+| Mouse | look around (the cursor is captured) |
+| `W` `A` `S` `D` / arrows | walk · hold `Shift` to run |
+| `Space` | jump |
+| Click | select the building under the crosshair (inspector and dependency arcs, as usual) |
+| `G` / `Esc` | back to the orbit camera, exactly where you left it |
+
+* You start on the street in front of the selected building, facing it, or otherwise where the camera was looking.
+* Buildings are solid and you slide along their walls. You step up onto district platforms and low buildings
+  automatically, and can jump onto roofs and drop off them.
+* At eye level (0.6 units, against 0.8-wide streets) busy classes tower over you and the smallest ones are knee-high.
+* The building under the crosshair is highlighted and its metrics are shown below it. District labels are hidden
+  while walking, because they would show through walls.
+* `/` and `F` leave walk mode first, then search or frame the city. Losing focus also leaves it.
+
 ## How it is built
 
 | | |

@@ -137,6 +137,72 @@ export const TAX = 0.2;
     foreach (t; a.types) assert(!t.fqn.canFind("global.d.ts"));
 }
 
+unittest // TypeScript: repeated declarations get unique ids
+{
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    f.put("a.ts", "interface A { x: number }\ninterface A { y: number }\ninterface A { z: number }\nclass A {}\n");
+    auto a = f.analyze();
+    string[] fqns;
+    foreach (t; a.types) fqns ~= t.fqn;
+    fqns.sort();
+    assert(fqns == ["a.ts:A", "a.ts:A#class", "a.ts:A#interface", "a.ts:A#interface2"]);
+}
+
+unittest // TypeScript: comments are not members or parameters; a statement's lines count once
+{
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    f.put("a.ts", `
+enum E {
+  // first
+  A,
+  /* second */
+  B,
+}
+function f(a: number, /* the second */ b: number) {}
+class C { constructor(private a: number, // note
+                      b: number) {} }
+const p = 1, q = 2;
+`);
+    auto a = f.analyze();
+    assert(get(a, "a.ts:E").noa == 2);
+    assert(get(a, "a.ts").methods[0].parameters == 2);
+    assert(get(a, "a.ts:C").noa == 1 && get(a, "a.ts:C").methods[0].parameters == 2);
+    // function line + one line for the two-declarator const
+    assert(get(a, "a.ts").noa == 2 && get(a, "a.ts").loc == 2);
+}
+
+unittest // TypeScript: resolution order like tsc; scoped and deep package imports stay external
+{
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    f.put("src/a.ts", "export class A {}\n");
+    f.put("src/a/index.ts", "export class A {}\n");
+    f.put("src/b.tsx", "export class B {}\n");
+    f.put("src/b.ts", "export class B {}\n");
+    f.put("src/lodash/fp.ts", "export class Fp {}\n");
+    f.put("src/@scope/pkg.ts", "export class Pkg {}\n");
+    f.put("src/main.ts", "import { A } from './a';\nimport { B } from '@/b';\nimport { Fp } from 'lodash/fp';\nimport { Pkg } from '@scope/pkg';\nclass M { a: A; b: B; f: Fp; p: Pkg; }\n");
+    f.put("src/alias.ts", "import { A } from '~/a';\nclass N { a: A; }\n");
+    auto a = f.analyze();
+    assert(a.dependencies["src/main.ts:M"] == ["src/a.ts:A", "src/b.ts:B"]);
+    assert(a.dependencies["src/alias.ts:N"] == ["src/a.ts:A"]);
+}
+
+unittest // TypeScript: a package.json added between analyses is noticed
+{
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    f.put("web/src/App.ts", "export class App {}\n");
+    auto analyzer = new SourceAnalyzer;
+    auto first = analyzer.analyze(f.root, true);
+    assert(get(first, "web/src/App.ts:App").module_ == "");
+    f.put("web/package.json", "{}");
+    auto second = analyzer.analyze(f.root, true);
+    assert(get(second, "web/src/App.ts:App").module_ == "web" && get(second, "web/src/App.ts:App").pkg == "src");
+}
+
 unittest // Rust: types, impl blocks across files, use paths, cfg(test) modules
 {
     auto f = Fixture.create();
@@ -210,4 +276,60 @@ unittest // unchanged files are not re-parsed
     analyzer.analyze(f.root, true);
     auto second = analyzer.analyze(f.root, true);
     assert(analyzer.cacheLength == 1 && second.types.length == 1);
+}
+
+unittest // Java: default-package types are invisible from named packages; member types come first
+{
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    f.put("src/main/java/Line.java", "class Line {}");
+    f.put("src/main/java/Util.java", "class Util {}");
+    f.put("src/main/java/Order.java", "class Order { Line l; static class Line {} }");
+    f.put("src/main/java/shop/Cart.java", "package shop;\nimport other.Util;\nclass Cart { Line l; Util u; Order o; other.Helper h; }");
+    f.put("src/main/java/shop/Line.java", "package shop; class Line {}");
+    f.put("src/main/java/other/Util.java", "package other; public class Util {}");
+    f.put("src/main/java/other/Helper.java", "package other; public class Helper {}");
+    auto a = f.analyze();
+    assert(a.dependencies["Order"] == ["Order.Line"]);
+    assert(a.dependencies["shop.Cart"] == ["other.Helper", "other.Util", "shop.Line"]);
+}
+
+unittest // Java: line numbers follow tree-sitter rows (no lone \r breaks); trailing block comments are tracked
+{
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    f.put("src/main/java/a/A.java", "package a;\rclass A {\n  int x; /* start\n  comment\n  end */\n  int y;\n}\n");
+    auto a = f.analyze();
+    auto t = get(a, "a.A");
+    assert(t.line == 1 && t.endLine == 6 && t.loc == 4);
+}
+
+unittest // a duplicate fqn from a later language is dropped together with its dependencies
+{
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    // The Java type `App.tsx` and the TypeScript module building `App.tsx` share an fqn; Java (first) wins.
+    f.put("App.java", "package App; class tsx { Other o; }");
+    f.put("Other.java", "package App; class Other {}");
+    f.put("App.tsx", "import { f } from \"./b\";\nexport function g() { return f(); }\n");
+    f.put("b.ts", "export function f() { return 1; }\n");
+    auto a = f.analyze();
+    get(a, "b.ts"); // TypeScript module buildings exist, so App.tsx really was produced twice
+    assert(get(a, "App.tsx").language == Language.java);
+    assert(a.dependencies["App.tsx"] == ["App.Other"]);
+}
+
+unittest // cached parses see manifest changes: same .rs file, renamed crate
+{
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    auto analyzer = new SourceAnalyzer;
+    f.put("Cargo.toml", "[package]\nname = \"before\"\n");
+    f.put("src/lib.rs", "pub struct A;\n");
+    auto first = analyzer.analyze(f.root, true);
+    get(first, "before::A");
+    // Only the manifest changes (a different size, so the change is seen even within the mtime resolution).
+    f.put("Cargo.toml", "[package]\nname = \"after_rename\"\n");
+    auto second = analyzer.analyze(f.root, true);
+    get(second, "after_rename::A");
 }

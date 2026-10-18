@@ -1,4 +1,12 @@
 /// CodeCity — explore a Java, TypeScript or Rust code base as an interactive 3D city (D edition).
+///
+/// Entry point: parses the command line, optionally clones a GitHub repository, builds the city model once and then
+/// hands it to one of three outputs: a self-contained HTML file (`--export`), the native desktop window (`--gui`,
+/// only in the `gui` dub configuration) or the local web server. The model itself is built by
+/// `CityModel.build` (walk → parse/analyse → link dependencies → git history → layout); see `codecity.city`.
+///
+/// With `--watch`, a background thread re-runs that build whenever sources change and swaps the new model into the
+/// server or window. The same `SourceAnalyzer` is reused for every rebuild, so only changed files are parsed again.
 module app;
 
 import codecity.analysis : SourceAnalyzer;
@@ -50,6 +58,7 @@ overlay of the open pull requests touching each class. Set GH_TOKEN (or log in w
 gh CLI) to fetch every open PR; without a token only the most recent ~30 are loaded.
 `;
 
+/// The parsed command line. Exactly one of `root` (a local directory) and `remote` (`hasRemote`) is the source.
 struct Options
 {
     string root;
@@ -60,13 +69,20 @@ struct Options
     string export_;
 }
 
-/// false: help was requested.
+/// Parses `args` (without the program name) into `o`. Returns false when help was requested; throws with a
+/// user-facing message on a bad option or path.
+///
+/// A positional argument is taken as a GitHub repository only when it is not an existing directory, so a local
+/// directory always wins over a URL-like name. A local root is made absolute and canonical (symlinks resolved), so
+/// that the analysed file paths match the keys `codecity.git.load` builds from `git rev-parse --show-toplevel` and
+/// the prefix `GitHubInfo.detect` computes.
 bool parseArgs(string[] args, out Options o)
 {
     o = Options.init;
     for (size_t i = 0; i < args.length; i++)
     {
         const a = args[i];
+        // The option's argument: consumes the next element, so the loop skips it.
         string value()
         {
             if (++i >= args.length) throw new Exception(a ~ " needs a value");
@@ -99,6 +115,7 @@ bool parseArgs(string[] args, out Options o)
     return true;
 }
 
+/// Exit codes: 0 on success or `--help`, 2 for a command-line error (with the usage text), 1 for any other error.
 int main(string[] args)
 {
     Options opts;
@@ -125,10 +142,13 @@ int main(string[] args)
     }
 }
 
+/// Builds the city and runs the chosen output. Blocks forever when serving (the server never returns).
 int run(Options opts)
 {
+    // A remote repository is cloned into (or updated in) the cache, then analysed like any local directory.
     if (opts.hasRemote) opts.root = realPath(cloneOrUpdate(opts.remote));
     const root = opts.root;
+    // GitHub context (remote, permalink ref, open PRs) is fetched once up front and reused by every rebuild.
     GitHubInfo github;
     const hasGithub = opts.github && loadGithub(root, github);
 
@@ -145,6 +165,7 @@ int run(Options opts)
         return 0;
     }
 
+    // Runs on the watcher's thread (in both server and GUI mode); reuses the analyser and its parse cache.
     CityModel rebuild()
     {
         auto next = CityModel.build(analyzer, root, opts.includeTests, opts.git, hasGithub, github);
@@ -170,6 +191,7 @@ int run(Options opts)
         watch(root, { server.update(rebuild()); });
         writeln("Watching for changes …");
     }
+    // Failing to launch a browser is not an error: the URL has been printed above.
     if (opts.open)
         try browse(server.url);
         catch (Exception) {}
@@ -177,6 +199,8 @@ int run(Options opts)
     return 0;
 }
 
+/// Detects a GitHub remote for `root` and fetches its open pull requests. Returns false only when there is no
+/// GitHub remote; if just the PR fetch fails, it still returns true (file links work) with `info.hasPulls` unset.
 bool loadGithub(string root, out GitHubInfo info)
 {
     if (!GitHubInfo.detect(root, info)) return false;
@@ -194,6 +218,7 @@ bool loadGithub(string root, out GitHubInfo info)
     return true;
 }
 
+/// One line of totals after a build, e.g. `120 files, 340 types (Java 300, TypeScript 40), 25 packages — 812 ms`.
 void printSummary(CityModel model)
 {
     auto a = &model.analysis;

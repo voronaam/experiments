@@ -1,6 +1,19 @@
 /// Rust support (tree-sitter). Crates and modules are districts; structs, enums, unions and traits are buildings
 /// whose methods are collected from every `impl` block in the crate; each module's free functions and constants
 /// form a "module" building. `use` paths are resolved so dependencies connect across files.
+///
+/// Naming: fqns are absolute Rust paths starting with the crate name (`shop::cart::Cart`); a module's function
+/// building is `shop::cart::{fn}` (see `functionsId`). The district is the module path without the crate
+/// (`cart`), and the crate is the build module.
+///
+/// Unlike Java and TypeScript, a Rust type's methods are not inside its declaration: they live in `impl` blocks,
+/// possibly in other files. So `parse` records each impl block in the file's `RustContext` and `link` attaches the
+/// impls to their types once every file is known, adding the methods, lines and references to the type.
+///
+/// Every module (file or inline `mod`) gets a `Scope` with its `use` imports; `link` resolves the names a type
+/// mentions in its module's scope with `Resolver`, following Rust's path rules closely enough for the city: `use`
+/// aliases, `crate::`/`self::`/`super::`, other crates of the workspace, the current module and glob imports.
+/// Standard library and external crate names resolve to nothing.
 module codecity.analysis.rustlang;
 
 import codecity.analysis : Context, Linked, ParsedFile;
@@ -17,6 +30,8 @@ import std.path : baseName, buildPath, dirName, pathSplitter;
 import std.regex : ctRegex, matchFirst;
 import std.uni : isLower, isWhite;
 
+/// Last fqn segment of a module's function building. Braces cannot occur in a Rust identifier, so it never clashes
+/// with a real item.
 enum functionsId = "{fn}";
 
 /// Name-resolution scope of one module.
@@ -24,7 +39,8 @@ final class Scope
 {
     /// Absolute module path, starting with the crate name.
     string[] path;
-    /// alias → path as written in the `use` declaration
+    /// alias → path as written in the `use` declaration (it may start with `crate`, `self`, `super` or a crate
+    /// name; `Resolver.absolute` makes it absolute when it is used)
     string[][string] uses;
     /// paths imported with `::*`
     string[][] globs;
@@ -37,31 +53,45 @@ final class Scope
 /// An `impl` block, attached to its type during linking.
 struct Impl
 {
+    /// The module the impl is written in: its names resolve there, not in the type's module.
     Scope scope_;
+    /// District scope and name of a module building created for the impl, as `visitItems` would give it.
+    Scope district;
+    string label;
+    /// Implemented type and trait as written (`Cart`, `crate::m::Cart`, `fmt::Display`); trait_ is null for an
+    /// inherent impl.
     string type;
     string trait_;
     MethodInfo[] methods;
+    /// Names referenced in the impl body.
     bool[string] refs;
+    /// LOC of the whole impl block, added to the type's LOC.
     uint loc;
     string file;
     uint line;
     bool test;
 }
 
+/// What `link` needs from one file: the scope each building's names resolve in, and the file's impl blocks.
 final class RustContext : Context
 {
     /// type / module-building fqn → its scope
     Scope[string] scopeOf;
+    /// Every scope of the file (its own and those of inline modules), used to collect the crate names.
     Scope[] scopes;
     Impl[] impls;
 }
 
+/// A Cargo package: its name as Rust code writes it (hyphens become underscores) and the directory of its
+/// Cargo.toml.
 private struct Crate
 {
     string name;
     string dir;
 }
 
+/// Analyses one Rust file. The module path comes from the file's location (`src/net/http.rs` is `crate::net::http`);
+/// `#[path]` attributes are not followed. Files under the crate's `tests/` or `benches/` are test code.
 ParsedFile parse(string root, string file, string code)
 {
     auto tree = codecity.analysis.syntax.parse("rust", &tree_sitter_rust, code);
@@ -74,6 +104,7 @@ ParsedFile parse(string root, string file, string code)
     const first = inCrate.pathSplitter.front;
     const test = first == "tests" || first == "benches";
 
+    // The crate is the build module of every type in it.
     auto st = new FileState(Src(code), lines(code), file, crate.name);
     auto scope_ = st.addScope(new Scope([crate.name] ~ modulePath));
     auto rootNode = ts_tree_root_node(tree);
@@ -82,6 +113,8 @@ ParsedFile parse(string root, string file, string code)
 }
 
 /// The directory module paths are relative to: the nearest one (within the crate) holding `lib.rs` or `main.rs`.
+/// Falls back to the crate directory, e.g. for `tests/*.rs`; `modulePathOf` then drops a leading `src`. A binary in
+/// `src/bin/tool/main.rs` thus has its own source root and its items get the crate-root module path.
 private string sourceRootOf(string crateDir, string dir)
 {
     string d = dir;
@@ -99,6 +132,9 @@ private string sourceRootOf(string crateDir, string dir)
 }
 
 /// `src/lib.rs` → [], `src/net/mod.rs` → [net], `src/net/http.rs` → [net, http].
+///
+/// `lib.rs`/`main.rs` only denote the crate root at the top of the path; elsewhere they are ordinary modules. A
+/// `mod.rs` stands for its directory.
 string[] modulePathOf(string inCrate)
 {
     string[] parts;
@@ -113,6 +149,9 @@ string[] modulePathOf(string inCrate)
     return parts;
 }
 
+/// A missing Cargo.toml also maps to "", as does a workspace root without [package]. Shared by all parsing threads
+/// and guarded by `crateLock`; cleared by `link`, so each analysis reads the manifests afresh and a Cargo.toml added,
+/// removed or edited while watching applies to the files parsed after it.
 private __gshared string[string] crateNames; // dir → crate name ("" = no [package])
 private __gshared Mutex crateLock;
 
@@ -123,6 +162,9 @@ private Mutex crateLockInstance()
     return initOnce!crateLock(new Mutex);
 }
 
+/// The crate of a file in `dir`: the nearest Cargo.toml with a `[package]` name at or above `dir`, not looking above
+/// `root`. Without one, the whole tree is a single crate named after the root directory. The lock is held while a
+/// manifest is read, so each directory is looked up once.
 private Crate crateOf(string root, string dir)
 {
     string d = dir;
@@ -142,23 +184,31 @@ private Crate crateOf(string root, string dir)
     return Crate(root.baseName.replace("-", "_"), root);
 }
 
+/// The `name` in the `[package]` table of `dir`'s Cargo.toml, with hyphens turned into underscores as the crate is
+/// written in Rust paths, or "" when missing or unreadable.
+///
+/// A regex rather than a TOML parser: `(?m)` lets `^` match at every line start; the lines lazily skipped before
+/// `name` must not start with `[` (after indentation), so the match cannot run into the next `[table]`. A `[`
+/// elsewhere on a line (`authors = ["a"]`) does not stop it.
 private string readCrateName(string dir)
 {
     const manifest = buildPath(dir, "Cargo.toml");
     if (!manifest.exists || !manifest.isFile) return "";
     try
     {
-        auto m = readText(manifest).matchFirst(ctRegex!(`(?ms)^\[package\][^\[]*?^\s*name\s*=\s*"([^"]+)"`));
+        auto m = readText(manifest).matchFirst(ctRegex!(`(?m)^\[package\][^\n]*\n(?:[ \t\r]*(?:[^\[\s][^\n]*)?\n)*?[ \t]*name\s*=\s*"([^"]+)"`));
         return m.empty ? "" : m[1].replace("-", "_");
     }
     catch (Exception)
         return "";
 }
 
+/// Everything collected while walking one file.
 private final class FileState
 {
     Src src;
     string[] lines;
+    /// module_ is the crate name.
     string file, module_;
     TypeDecl[] types;
     RustContext ctx;
@@ -178,6 +228,7 @@ private final class FileState
         return s;
     }
 
+    /// The district of a scope: its module path without the crate name ("" for the crate root).
     static string packageOf(Scope s) { return s.path[1 .. $].join("::"); }
 
     static string fqn(Scope s, string name) { return s.path.join("::") ~ "::" ~ name; }
@@ -186,6 +237,11 @@ private final class FileState
 
     /// `district`: scope whose module path decides the district; differs from `scope_` inside `#[cfg(test)]`
     /// modules, which stay in their parent's district instead of adding one.
+    ///
+    /// Visits the items of a file or of an inline `mod` body. Types become buildings; impl blocks are recorded for
+    /// linking; free functions, `const` and `static` items are collected into the module's function building
+    /// (named `label`: the file name, or `mod name` for an inline module), which is only emitted when there is at
+    /// least one of them. `mod x;` without a body is skipped here: its file is parsed on its own.
     void visitItems(TSNode container, Scope scope_, Scope district, string label, bool test)
     {
         MethodInfo[] functions;
@@ -196,6 +252,9 @@ private final class FileState
         foreach (item; namedChildren(container))
         {
             const k = kind(item);
+            // In tree-sitter-rust an outer attribute is a sibling node *before* the item it applies to, so remember
+            // `#[cfg(test)]` until the next item (cfgTest is reset after every item). Only spaces are removed before
+            // the check, so `#[cfg( test )]` matches; `#[cfg(all(test, …))]` does not.
             if (k == "attribute_item")
             {
                 string attr;
@@ -203,6 +262,8 @@ private final class FileState
                 if (attr.canFind("cfg(test)")) cfgTest = true;
                 continue;
             }
+            // Applies to types, impls and inline modules. Free functions and constants always share the module
+            // building, which is test code only when the whole module is.
             const isTest = test || cfgTest;
             switch (k)
             {
@@ -219,11 +280,12 @@ private final class FileState
                 if (!isNull(b)) foreach (v; namedChildren(b)) if (kind(v) == "enum_variant") variants++;
                 addType(item, scope_, district, "enum", variants, null, isTest);
                 break;
+            // A trait's attributes are 0; its methods are its declared functions, with or without default bodies.
             case "trait_item":
                 addType(item, scope_, district, "trait", 0, functionsIn(child(item, "body")), isTest);
                 break;
             case "impl_item":
-                addImpl(item, scope_, isTest);
+                addImpl(item, scope_, district, label, isTest);
                 break;
             case "function_item", "const_item", "static_item":
                 if (k == "function_item") functions ~= function_(item);
@@ -295,13 +357,15 @@ private final class FileState
         types ~= t;
     }
 
-    void addImpl(TSNode item, Scope scope_, bool test)
+    /// Records an impl block. Its references come from the body only: the implemented type is the impl's target and
+    /// the trait becomes a dependency through `trait_` in `link`.
+    void addImpl(TSNode item, Scope scope_, Scope district, string label, bool test)
     {
         auto body_ = child(item, "body");
         bool[string] refs;
         collectRefs(src, isNull(body_) ? item : body_, refs);
         auto traitNode = child(item, "trait");
-        ctx.impls ~= Impl(scope_, typeName(child(item, "type")), isNull(traitNode) ? null : typeName(traitNode),
+        ctx.impls ~= Impl(scope_, district, label, typeName(child(item, "type")), isNull(traitNode) ? null : typeName(traitNode),
             functionsIn(body_), refs, loc(item), file, firstLine(item), test);
     }
 
@@ -318,6 +382,7 @@ private final class FileState
         }
     }
 
+    /// The functions of an impl or trait body. function_signature_item is a trait method without a default body.
     MethodInfo[] functionsIn(TSNode body_)
     {
         MethodInfo[] list;
@@ -327,6 +392,8 @@ private final class FileState
         return list;
     }
 
+    /// Metrics of one function. Only `parameter` nodes count, so `self`/`&mut self` (a self_parameter) is not a
+    /// parameter. Without a body the complexity is 1.
     MethodInfo function_(TSNode f)
     {
         uint parameters;
@@ -337,6 +404,10 @@ private final class FileState
     }
 
     /// Flattens a use tree into alias → path entries and glob imports.
+    ///
+    /// `prefix` is the path of the enclosing `a::b::{…}` group. For example
+    /// `use a::b::{self, C as D, e::F, g::*};` gives uses b → a::b, D → a::b::C, F → a::b::e::F and the glob a::b::g.
+    /// `metavariable` covers `$crate` in macro bodies.
     void expandUse(TSNode n, string[] prefix, Scope scope_)
     {
         switch (kind(n))
@@ -347,6 +418,7 @@ private final class FileState
             else scope_.uses[name] = prefix ~ name;
             break;
         case "scoped_identifier":
+            // `use a::b::C;` binds the last segment; `use a::b::self` binds `b`.
             auto path = prefix ~ segments(n);
             string alias_ = path.length ? path[$ - 1] : "";
             if (alias_ == "self")
@@ -358,6 +430,7 @@ private final class FileState
             break;
         case "use_as_clause":
             const alias_ = src.fieldText(n, "alias").idup;
+            // `use Trait as _;` only brings trait methods into scope and binds no name.
             if (alias_ != "_") scope_.uses[alias_] = prefix ~ segments(child(n, "path"));
             break;
         case "scoped_use_list":
@@ -368,6 +441,7 @@ private final class FileState
             foreach (c; namedChildren(n)) expandUse(c, prefix, scope_);
             break;
         case "use_wildcard":
+            // `use a::*;` has the path as its only named child; `*` inside a group (`a::{*}`) has none.
             scope_.globs ~= prefix ~ (ts_node_named_child_count(n) ? segments(ts_node_named_child(n, 0)) : null);
             break;
         default:
@@ -375,6 +449,7 @@ private final class FileState
         }
     }
 
+    /// The segments of a (possibly scoped) path node: `a::b::C` → [a, b, C].
     string[] segments(TSNode n)
     {
         if (isNull(n)) return null;
@@ -384,6 +459,8 @@ private final class FileState
     }
 }
 
+/// Attributes of a struct or union: named fields (`field_declaration_list`) or tuple fields
+/// (`ordered_field_declaration_list`); a unit struct has no body and no fields.
 private uint fieldCount(TSNode body_)
 {
     if (isNull(body_)) return 0;
@@ -393,11 +470,18 @@ private uint fieldCount(TSNode body_)
         foreach (f; namedChildren(body_)) if (kind(f) == "field_declaration") n++;
         return n;
     }
-    // tuple struct: count the "type" fields
+    // tuple struct: count the "type" fields. Each tuple element's type is a child in the grammar field "type";
+    // visibility modifiers and attributes are children too, but in no field.
     foreach (i; 0 .. ts_node_child_count(body_)) if (fieldNameForChild(body_, i) == "type") n++;
     return n;
 }
 
+/// Names a type might depend on, as written: every type identifier, every path (`net::http::get`,
+/// `crate::cart::Cart`) as a whole, and plain identifiers starting with an upper-case letter (unit structs, enum
+/// variants, tuple-struct constructors or constants used as values). Lower-case identifiers are locals or
+/// functions and are skipped. A path is not descended into, so `Cart::new()` contributes only `Cart::new`, which
+/// `Resolver.resolve` maps to the type `Cart`. A qualified path (`<T as Trait>::Item`) names nothing resolvable as
+/// text, so the types inside its brackets are collected instead.
 private void collectRefs(ref Src src, TSNode node, ref bool[string] refs)
 {
     walk(node, (TSNode n) {
@@ -407,6 +491,12 @@ private void collectRefs(ref Src src, TSNode node, ref bool[string] refs)
             refs[src.text(n).idup] = true;
             return true;
         case "scoped_type_identifier", "scoped_identifier":
+            auto path = child(n, "path");
+            if (!isNull(path) && kind(path) == "bracketed_type")
+            {
+                collectRefs(src, path, refs);
+                return false;
+            }
             string s;
             foreach (dchar c; src.text(n)) if (!isWhite(c)) s ~= c;
             refs[s] = true;
@@ -421,8 +511,12 @@ private void collectRefs(ref Src src, TSNode node, ref bool[string] refs)
     });
 }
 
+/// Cyclomatic complexity: 1 + `if`, `while`, `loop`, `for`, `&&`/`||`, plus k - 1 for a `match` with k arms
+/// (`if let`/`while let` parse as if/while expressions; `?` does not count). Nested closures count towards the
+/// enclosing function.
 uint complexity(TSNode body_)
 {
+    // Signed: a match is visited (and decremented) before its arms, and a match without arms would go below 1.
     int cx = 1;
     walk(body_, (TSNode n) {
         switch (kind(n))
@@ -447,8 +541,22 @@ uint complexity(TSNode body_)
 
 // ------------------------------------------------------------------ linking
 
+/// Links all Rust files of the project.
+///
+/// 1. Collect types (first fqn wins), the scope of every building, all impl blocks and the set of crate names.
+/// 2. Attach each impl to the type it implements, resolved in the impl's scope. An impl for a type outside the
+///    project (`impl From<Cart> for String`) goes to the function building of the module it is written in, which is
+///    created if the module has no free functions. The implemented trait and the impl body's references become
+///    dependencies of the target.
+/// 3. For every building: add the attached impls' methods and LOC, and resolve its own references in its own scope.
 Linked link(ParsedFile[] files)
 {
+    // Every file of this analysis is parsed by now: the next analysis reads the manifests again.
+    {
+        crateLockInstance.lock();
+        scope (exit) crateLockInstance.unlock();
+        crateNames = null;
+    }
     string[] order;
     TypeDecl[string] byFqn;
     Scope[string] scopes;
@@ -479,12 +587,17 @@ Linked link(ParsedFile[] files)
     foreach (ref imp; impls)
     {
         auto target = resolver.resolveType(imp.type, imp.scope_);
+        // resolveType never returns a function building; kept as a guard so impls only attach to real types.
         if (target !is null && byFqn[target].kind == "module") target = null;
         if (target is null)
         {
             target = imp.scope_.path.join("::") ~ "::" ~ functionsId;
             if (target !in byFqn)
             {
+                // Synthesise the missing function building. Its build module is copied from the first known type of
+                // the same crate (all of a crate's types share it); it starts with no LOC of its own, the impl's LOC
+                // is added below like for any other target. District and name are those visitItems would have given
+                // it (a #[cfg(test)] module stays in its parent's district).
                 string module_;
                 foreach (fqn; order)
                     if (fqn.startsWith(imp.scope_.crate ~ "::"))
@@ -495,8 +608,8 @@ Linked link(ParsedFile[] files)
                 TypeDecl t;
                 t.language = Language.rust;
                 t.fqn = target;
-                t.name = imp.file.baseName;
-                t.pkg = imp.scope_.path[1 .. $].join("::");
+                t.name = imp.label;
+                t.pkg = imp.district.path[1 .. $].join("::");
                 t.module_ = module_;
                 t.kind = "module";
                 t.file = imp.file;
@@ -541,15 +654,27 @@ Linked link(ParsedFile[] files)
 /// Resolves names as written in a scope to fqns of project types (or of a module's function building).
 private struct Resolver
 {
+    /// Every building's fqn.
     bool[string] known;
+    /// Crate names of the project, so `other_crate::x` is recognised as an absolute path.
     bool[string] crates;
 
+    /// Like `resolve`, but only types: used for impl targets and traits.
     string resolveType(string written, Scope s)
     {
         auto r = resolve(written, s);
         return r !is null && !r.endsWith("::" ~ functionsId) ? r : null;
     }
 
+    /// Candidate paths, in order:
+    ///   - the first segment is a `use` alias: only the imported path plus the remaining segments;
+    ///   - it is `crate`, `self`, `super` or a crate name: that absolute path;
+    ///   - otherwise: an item of the current module, then of each glob import.
+    /// The first candidate that is a known building wins. A candidate whose last segment is lower-case and whose
+    /// parent module has a function building resolves to that building (a call such as `http::get`); else one whose
+    /// parent is a known type resolves to that type (`Cart::new`, `Shape::Circle`). Generic arguments
+    /// (`Vec<Cart>` → `Vec`) are cut off first; `Self` resolves to nothing, as it is the type itself, and so does a
+    /// qualified path (`<T as Trait>::Item`), whose types `collectRefs` collects separately.
     string resolve(string written, Scope s)
     {
         if (written.length == 0 || written == "Self") return null;
@@ -558,6 +683,7 @@ private struct Resolver
         const cleaned = lt < 0 ? written : written[0 .. lt];
         auto segs = cleaned.split("::");
         const first = segs[0];
+        if (first.length == 0) return null;
         string[][] candidates;
         if (auto used = first in s.uses)
             candidates ~= absolute(*used, s) ~ segs[1 .. $];
@@ -575,10 +701,13 @@ private struct Resolver
             // a function path like net::http::get → the function building of net::http
             if (c.length > 1)
             {
-                const functions = c[0 .. $ - 1].join("::") ~ "::" ~ functionsId;
+                const parent = c[0 .. $ - 1].join("::");
+                const functions = parent ~ "::" ~ functionsId;
                 import std.utf : decodeFront;
                 auto lastSeg = c[$ - 1];
                 if (functions in known && lastSeg.length && isLower(decodeFront(lastSeg))) return functions;
+                // an associated item or variant of a type (Cart::new, Shape::Circle) → the type
+                if (parent in known) return parent;
             }
         }
         return null;
@@ -597,7 +726,8 @@ private struct Resolver
             size_t i;
             while (i < path.length && path[i] == "super")
             {
-                if (base.length > 1) base = base[0 .. $ - 1];
+                // Never climb above the crate root: the crate name stays.
+            if (base.length > 1) base = base[0 .. $ - 1];
                 i++;
             }
             return base ~ path[i .. $];
@@ -605,4 +735,108 @@ private struct Resolver
         if (first in crates) return path;
         return s.path ~ path; // 2018-edition relative path
     }
+}
+
+version (unittest)
+{
+    import codecity.analysis : SourceAnalyzer;
+    import codecity.model : Analysis;
+
+    /// A temporary project directory; `put` writes a file into it.
+    private struct RustFixture
+    {
+        string root;
+
+        static RustFixture create()
+        {
+            import codecity.git : realPath;
+            import std.file : mkdirRecurse, tempDir;
+            import std.uuid : randomUUID;
+            auto dir = buildPath(tempDir, "codecity-rust-test-" ~ randomUUID.toString);
+            mkdirRecurse(dir);
+            return RustFixture(realPath(dir));
+        }
+
+        void put(string rel, string code)
+        {
+            import std.file : mkdirRecurse, write;
+            const f = buildPath(root, rel);
+            mkdirRecurse(f.dirName);
+            write(f, code);
+        }
+
+        Analysis analyze() { return new SourceAnalyzer().analyze(root, true); }
+
+        void cleanup()
+        {
+            import std.file : rmdirRecurse;
+            rmdirRecurse(root);
+        }
+    }
+
+    private const(TypeDecl)* find(ref Analysis a, string fqn)
+    {
+        foreach (ref t; a.types) if (t.fqn == fqn) return &t;
+        return null;
+    }
+}
+
+unittest // a qualified path (<T as Tr>::Item) resolves the types inside the brackets
+{
+    auto f = RustFixture.create();
+    scope (exit) f.cleanup();
+    f.put("Cargo.toml", "[package]\nname = \"q\"\n");
+    f.put("src/lib.rs", "pub fn helper() {}\npub trait Tr { type Item; }\npub struct S;\nimpl S { fn f<T>(x: <T as Tr>::Item) {} }\n");
+    auto a = f.analyze();
+    assert(a.dependencies["q::S"].canFind("q::Tr"));
+}
+
+unittest // the package name is found after an array value
+{
+    auto f = RustFixture.create();
+    scope (exit) f.cleanup();
+    f.put("Cargo.toml", "[package]\nauthors = [\"a\"]\nname = \"named\"\n[dependencies]\nname = \"no\"\n");
+    f.put("src/lib.rs", "pub struct A;\n");
+    auto a = f.analyze();
+    assert(find(a, "named::A") !is null);
+}
+
+unittest // a path into a type (Cart::new(), Shape::Circle) depends on the type
+{
+    auto f = RustFixture.create();
+    scope (exit) f.cleanup();
+    f.put("Cargo.toml", "[package]\nname = \"p\"\n");
+    f.put("src/lib.rs", "pub mod cart;\npub enum Shape { Circle }\n");
+    f.put("src/cart.rs", "pub struct Cart;\nimpl Cart { pub fn new() -> Self { Cart } }\npub struct Shop;\nimpl Shop { fn open(&self) { Cart::new(); let _s = crate::Shape::Circle; } }\n");
+    auto a = f.analyze();
+    assert(a.dependencies["p::cart::Shop"].canFind("p::cart::Cart"));
+    assert(a.dependencies["p::cart::Shop"].canFind("p::Shape"));
+}
+
+unittest // a module building created for impls is named and placed like other module buildings
+{
+    auto f = RustFixture.create();
+    scope (exit) f.cleanup();
+    f.put("Cargo.toml", "[package]\nname = \"m\"\n");
+    f.put("src/lib.rs", "pub mod cart;\npub trait Probe { fn probe(&self); }\n");
+    f.put("src/cart.rs", "pub struct Cart;\n#[cfg(test)]\nmod tests {\n    impl crate::Probe for u32 { fn probe(&self) {} }\n}\n");
+    auto a = f.analyze();
+    auto tests = find(a, "m::cart::tests::{fn}");
+    assert(tests !is null && tests.pkg == "cart" && tests.name == "mod tests" && tests.test);
+    assert(a.dependencies["m::cart::tests::{fn}"].canFind("m::Probe"));
+}
+
+unittest // Cargo.toml changes are seen on reanalysis
+{
+    auto f = RustFixture.create();
+    scope (exit) f.cleanup();
+    auto analyzer = new SourceAnalyzer;
+    f.put("Cargo.toml", "[package]\nname = \"before\"\n");
+    f.put("src/lib.rs", "pub struct A;\n");
+    auto first = analyzer.analyze(f.root, true);
+    assert(find(first, "before::A") !is null);
+    f.put("Cargo.toml", "[package]\nname = \"after\"\n");
+    f.put("src/lib.rs", "pub struct A; // changed, so the file is parsed again\n");
+    auto second = analyzer.analyze(f.root, true);
+    assert(find(second, "after::A") !is null);
 }

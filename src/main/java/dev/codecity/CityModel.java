@@ -25,9 +25,21 @@ import java.util.Set;
 /**
  * An analysed and laid-out city, consumed by both the web viewer (as JSON) and the desktop viewer (as objects).
  * Immutable; watch mode swaps in a new instance.
+ *
+ * <p>This is where the pipeline comes together: {@link #build} runs the analysis ({@link SourceAnalyzer}), the git
+ * history ({@link GitHistory}) and the layout ({@link CityLayout}), and the constructor then resolves everything the
+ * viewers need per building into index-based {@link Building} records. The JSON form is produced lazily by
+ * {@link #json}.
+ *
+ * <p>Buildings are indexed in the order of {@link Analysis#types()}, i.e. sorted by fqn; {@code deps},
+ * {@code incoming} and the JSON {@code deps} arrays all use these indices, so the viewers never handle fqns for edges.
  */
 public final class CityModel {
 
+    /**
+     * At most this many methods are kept per building (the most complex first), which bounds the JSON size for
+     * generated or huge classes. The building's own metrics ({@code nom}, {@code cx}) still count all methods.
+     */
     private static final int MAX_METHODS = 300;
 
     /**
@@ -44,7 +56,12 @@ public final class CityModel {
                            int[] deps, int[] incoming, int[] prs, List<MethodInfo> methods) {
     }
 
-    /** @param languages type count per language, most common first */
+    /**
+     * Totals for the viewers' statistics.
+     *
+     * @param packages  distinct (language, module, package) triples, i.e. districts that hold buildings directly
+     * @param languages type count per language, most common first
+     */
     public record Stats(int files, int failedFiles, int types, long packages, int methods, int loc,
                         Map<Language, Integer> languages) {
     }
@@ -56,6 +73,10 @@ public final class CityModel {
     private final List<Building> buildings;
     private final Stats stats;
     private final long buildMillis;
+    /**
+     * Cached JSON. Several server threads may call {@link #json} at once; at worst each computes the same string,
+     * and volatile makes the published string visible to all of them.
+     */
     private volatile String json;
 
     private CityModel(String name, Analysis analysis, CityLayout.Result layout, GitHubInfo github, long buildMillis) {
@@ -73,12 +94,19 @@ public final class CityModel {
         this.buildMillis = buildMillis;
     }
 
-    /** @param github GitHub context for permalinks and pull requests, or null */
+    /**
+     * Runs the whole pipeline for {@code root}. Called once at start-up and, in watch mode, again on the rebuild
+     * thread after every change; reusing the same {@code analyzer} lets it re-parse only the changed files.
+     *
+     * @param useGit false skips {@link GitHistory} (the {@code --no-git} option)
+     * @param github GitHub context for permalinks and pull requests, or null
+     */
     public static CityModel build(SourceAnalyzer analyzer, Path root, boolean includeTests, boolean useGit,
                                   GitHubInfo github) throws IOException {
         long start = System.nanoTime();
         Analysis parsed = analyzer.analyze(root, includeTests);
         Map<Path, FileHistory> history = useGit ? GitHistory.load(root) : Map.of();
+        // The analyser leaves history empty; add it here so the model has a single, complete Analysis.
         Analysis analysis = new Analysis(root, parsed.types(), parsed.dependencies(), history,
                 parsed.files(), parsed.failedFiles());
         String name = root.getFileName() == null ? root.toString() : root.getFileName().toString();
@@ -131,6 +159,7 @@ public final class CityModel {
         return buildMillis;
     }
 
+    /** Types per language, most first; ties keep the Language declaration order, as the sort is stable. */
     private static Map<Language, Integer> languageCounts(List<TypeInfo> types) {
         Map<Language, Integer> counts = new java.util.EnumMap<>(Language.class);
         types.forEach(t -> counts.merge(t.language(), 1, Integer::sum));
@@ -140,7 +169,10 @@ public final class CityModel {
         return sorted;
     }
 
-    /** The model as served to the web viewer; computed on first use. */
+    /**
+     * The model as served to the web viewer (and embedded by the HTML export); computed on first use. Its
+     * {@code generatedAt} is therefore the time of that first call, not of the build.
+     */
     public String json() {
         String j = json;
         if (j == null) {
@@ -150,6 +182,13 @@ public final class CityModel {
         return j;
     }
 
+    /**
+     * Turns the fqn-keyed analysis into index-based buildings: outgoing and incoming edges as index arrays, the lot,
+     * the file's git history, the open pull requests touching the file, and the capped, sorted method list.
+     *
+     * <p>Pull requests list files relative to the repository root, while buildings know their path relative to the
+     * analysed root; {@link GitHubInfo#prefix()} (the analysed root's path inside the repository) bridges the two.
+     */
     private static List<Building> resolve(Analysis analysis, CityLayout.Result layout, GitHubInfo github) {
         List<TypeInfo> types = analysis.types();
         Map<String, Integer> index = new HashMap<>();
@@ -171,6 +210,7 @@ public final class CityModel {
             incoming.add(new ArrayList<>());
         }
         for (int i = 0; i < types.size(); i++) {
+            // Unknown targets are skipped defensively; SourceAnalyzer already guarantees that every target exists.
             int[] out = analysis.dependencies().getOrDefault(types.get(i).fqn(), Set.of()).stream()
                     .map(index::get).filter(j -> j != null).mapToInt(Integer::intValue).toArray();
             deps.add(out);
@@ -189,6 +229,7 @@ public final class CityModel {
                     .limit(MAX_METHODS)
                     .toList();
             result.add(new Building(i, t, layout.lots().get(t.fqn()), file,
+                    // Same key form as GitHistory: absolute and normalised.
                     analysis.history().get(t.file().toAbsolutePath().normalize()),
                     deps.get(i),
                     incoming.get(i).stream().mapToInt(Integer::intValue).toArray(),
@@ -198,6 +239,12 @@ public final class CityModel {
         return List.copyOf(result);
     }
 
+    /**
+     * Serialises the model for the web viewer. The format is compact on purpose: edges are building indices, a
+     * method is a positional array {@code [name, line, loc, complexity, parameters]}, and optional data (history,
+     * pull requests) is left out instead of written as null. Incoming edges are not written; the viewer can derive
+     * them from {@code deps}. Coordinates are those of {@link CityLayout}.
+     */
     private String toJson() {
         JsonWriter w = new JsonWriter().beginObject()
                 .field("name", name)
@@ -290,6 +337,7 @@ public final class CityModel {
         return w.endObject().toString();
     }
 
+    /** Repository info for permalinks; the pull request list only when it was fetched ({@code pulls} non-null). */
     private static void writeGitHub(JsonWriter w, GitHubInfo github) {
         w.name("github").beginObject()
                 .field("host", github.repo().host())

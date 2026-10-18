@@ -1,4 +1,13 @@
 /// Java support (tree-sitter-java), mirroring the metrics the JavaParser-based Java edition computes.
+///
+/// `parse` turns one `.java` file into a `TypeDecl` per class, interface, enum, record and annotation type, including
+/// member types (`Outer.Inner`), with these metrics: lines of code, number of attributes (fields, record components,
+/// enum constants), methods (and constructors) with their LOC, cyclomatic complexity and parameter count. It also
+/// records the raw type names each type mentions and the file's imports.
+///
+/// `link` then resolves those names with (a simplified form of) Java's own scoping rules to the fqns of project
+/// types, which gives the dependency edges. Names that resolve to nothing in the project (JDK, libraries) are
+/// dropped. No `Context` is needed: the imports travel on every `TypeDecl`.
 module codecity.analysis.java;
 
 import codecity.analysis : Linked, ParsedFile;
@@ -13,11 +22,15 @@ import std.path : baseName;
 import std.string : indexOf, lastIndexOf;
 import std.uni : isWhite;
 
+/// tree-sitter-java node kinds that declare a type (a building).
 private immutable string[] typeDeclarations = [
     "class_declaration", "interface_declaration", "enum_declaration", "record_declaration",
     "annotation_type_declaration",
 ];
 
+/// Analyses one Java file. `root` is the analysed directory, used for the build module (`moduleOf`) and the
+/// test-directory check. The file counts as failed when the tree contains syntax errors; whatever was recognised is
+/// still returned.
 ParsedFile parse(string root, string file, string code)
 {
     auto tree = codecity.analysis.syntax.parse("java", &tree_sitter_java, code);
@@ -30,6 +43,7 @@ ParsedFile parse(string root, string file, string code)
     const module_ = moduleOf(relative);
     const test = isTest(relative);
 
+    // First pass over the top level: the package and the imports, which apply to every type in the file.
     string pkg;
     string[] explicit, wildcard;
     foreach (n; namedChildren(program))
@@ -37,6 +51,8 @@ ParsedFile parse(string root, string file, string code)
         switch (kind(n))
         {
         case "package_declaration":
+            // `@Deprecated package a.b;` (package-info.java): skip annotations, the name is the first other child.
+            // Whitespace is removed because the grammar allows it between the dots.
             foreach (c; namedChildren(n))
                 if (kind(c) != "annotation" && kind(c) != "marker_annotation")
                 {
@@ -45,6 +61,13 @@ ParsedFile parse(string root, string file, string code)
                 }
             break;
         case "import_declaration":
+            // `static` is an anonymous token, `*` a named `asterisk` node; the name is a scoped_identifier
+            // (`a.b.C`) or, for a class in the default package, a plain identifier.
+            //   import a.B;              → explicit "a.B"
+            //   import a.*;              → wildcard "a"
+            //   import static a.B.c;     → explicit "a.B" (the member's type)
+            //   import static a.B.*;     → explicit "a.B" (all members of that type)
+            // Static imports thus make the type they import from a dependency.
             bool isStatic, asterisk;
             foreach (c; children(n)) if (kind(c) == "static") isStatic = true;
             TSNode name;
@@ -77,6 +100,7 @@ ParsedFile parse(string root, string file, string code)
         }
     }
 
+    // Second pass: only top-level type declarations; collectType recurses into member types.
     auto ctx = FileCtx(&src, lines, file, pkg, module_, test, explicit, wildcard);
     TypeDecl[] types;
     foreach (n; namedChildren(program))
@@ -84,6 +108,7 @@ ParsedFile parse(string root, string file, string code)
     return ParsedFile(types, null, ts_node_has_error(program));
 }
 
+/// Per-file facts shared by every type in the file.
 private struct FileCtx
 {
     Src* src;
@@ -97,6 +122,12 @@ private struct FileCtx
 }
 
 /// Adds a type and, recursively, the member types declared in its body (local classes are not types).
+///
+/// `outer` is the enclosing type's package-relative name ("" at top level), so a member type is named `Outer.Inner`
+/// and its fqn is `pkg.Outer.Inner`. Only direct members of the body are inspected for attributes, methods and
+/// member types; classes declared inside methods, initialisers or anonymous classes are part of the enclosing
+/// type. The outer type's LOC span and references cover its member types' text too, because both are computed over
+/// the whole declaration. The outer type is emitted before its member types.
 private void collectType(ref FileCtx ctx, TSNode decl, string outer, ref TypeDecl[] output)
 {
     const simple = ctx.src.fieldText(decl, "name");
@@ -107,6 +138,8 @@ private void collectType(ref FileCtx ctx, TSNode decl, string outer, ref TypeDec
     MethodInfo[] methods;
     uint noa;
     TSNode[] nested;
+    // Record components (`record P(int x, int y)`) are the record's fields; the grammar has them as the
+    // declaration's formal parameters.
     if (kind(decl) == "record_declaration")
     {
         auto params = child(decl, "parameters");
@@ -125,6 +158,8 @@ private void collectType(ref FileCtx ctx, TSNode decl, string outer, ref TypeDec
         foreach (m; members)
         {
             const k = kind(m);
+            // `int a, b;` declares two attributes: count declarators, not declarations. constant_declaration is a
+            // field in an interface (or annotation type) body.
             if (k == "field_declaration" || k == "constant_declaration")
             {
                 foreach (d; namedChildren(m)) if (kind(d) == "variable_declarator") noa++;
@@ -156,6 +191,7 @@ private void collectType(ref FileCtx ctx, TSNode decl, string outer, ref TypeDec
     foreach (n; nested) collectType(ctx, n, name, output);
 }
 
+/// The building kind shown in the viewer. Classes with an `abstract` modifier are reported as "abstract".
 private string kindOf(ref const Src src, TSNode decl)
 {
     switch (kind(decl))
@@ -175,6 +211,8 @@ private string kindOf(ref const Src src, TSNode decl)
     }
 }
 
+/// Metrics of one method or constructor. Varargs (`String... args`) is a spread_parameter in the grammar and counts
+/// as one parameter; the receiver parameter (`Foo this`) is neither kind and does not count.
 private MethodInfo method(ref FileCtx ctx, TSNode m)
 {
     const begin = firstLine(m), end = lastLine(m);
@@ -187,6 +225,11 @@ private MethodInfo method(ref FileCtx ctx, TSNode m)
 }
 
 /// McCabe cyclomatic complexity: 1 + number of decision points.
+///
+/// Decision points: `if`, the loops, `catch`, `?:`, every non-default `case` label (old `case X:` and arrow
+/// `case X ->` both parse as switch_label; `case A, B:` is one label and counts once) and every `&&`/`||`. `else`
+/// and `finally` do not branch and do not count. The walk covers the whole subtree, so lambdas and anonymous classes
+/// inside a method add to that method.
 uint complexity(TSNode node)
 {
     uint cx = 1;
@@ -213,6 +256,11 @@ uint complexity(TSNode node)
 }
 
 /// Type names used in a declaration: types, annotations, and upper-case call/field scopes (`Util.run()`).
+///
+/// The names are raw source text (`List`, `Map.Entry`, `com.acme.Order`); `resolve` turns them into fqns later.
+/// For `x.run()` and `Util.run()` the grammar cannot tell a variable from a type, so the Java convention decides: an
+/// identifier starting with an upper-case letter is taken to be a type. Unresolvable guesses (constants such as
+/// `MAX.foo`) are harmless, since `link` drops names that are not project types.
 private bool[string] references(ref const Src src, TSNode decl)
 {
     bool[string] refs;
@@ -234,6 +282,7 @@ private bool[string] references(ref const Src src, TSNode decl)
                 refs[prefix] = true;
             }
             refs[text] = true;
+            // Do not descend: its type_identifier parts would add "Entry" on its own.
             return false;
         case "marker_annotation", "annotation":
             refs[stripWs(src.fieldText(n, "name"))] = true;
@@ -256,6 +305,7 @@ private bool[string] references(ref const Src src, TSNode decl)
     return refs;
 }
 
+/// True when the first code point of `s` is an upper-case letter (Unicode-aware, so `Ärger` counts).
 bool isUpperStart(string s) @safe
 {
     import std.uni : isUpper;
@@ -264,6 +314,7 @@ bool isUpperStart(string s) @safe
     return copy.length && isUpper(decodeFront(copy));
 }
 
+/// `s` without any whitespace: qualified names may be split over lines (`com.acme\n    .Order`).
 string stripWs(string s) @safe
 {
     string output;
@@ -271,7 +322,7 @@ string stripWs(string s) @safe
     return output;
 }
 
-/// `root`-relative path with forward slashes.
+/// `root`-relative path with forward slashes. Also used by the TypeScript and Rust analysers.
 string relativeTo(string file, string root) @safe
 {
     import std.path : relativePath;
@@ -280,6 +331,9 @@ string relativeTo(string file, string root) @safe
 }
 
 /// "core/api" for `core/api/src/main/java/...`; "" when sources sit directly under the root.
+///
+/// The build module is everything before the first `src` path segment (the Maven/Gradle layout). A file without
+/// any `src` segment also gets "".
 string moduleOf(string relative) @safe
 {
     import std.path : pathSplitter;
@@ -292,6 +346,7 @@ string moduleOf(string relative) @safe
     return "";
 }
 
+/// Test code: anything in a test directory, plus the JUnit/Failsafe naming conventions `*Test`, `*Tests`, `*IT`.
 private bool isTest(string relative) @safe
 {
     const name = relative.baseName;
@@ -300,6 +355,8 @@ private bool isTest(string relative) @safe
 
 // ------------------------------------------------------------------ linking
 
+/// Resolves every type's references against all Java types of the project. `files` arrive in sorted path order,
+/// so which duplicate wins is deterministic.
 Linked link(ParsedFile[] files)
 {
     // The same FQN can occur in several modules (or as a test fixture); keep the first.
@@ -329,9 +386,22 @@ Linked link(ParsedFile[] files)
 }
 
 /// Java's own lookup order: enclosing types, single-type imports, same package, on-demand imports.
+///
+/// A qualified reference `A.B` is resolved by its first segment `A`; each candidate for `A` is tried as `cand.B`
+/// first and then as `cand` alone, so a nested type the analysis does not know still yields a dependency on its
+/// outer type. Simplifications compared with the language: inherited member types and `java.lang` are not
+/// considered, and a name shadowed by a type parameter or local class is still resolved. Only when no candidate is a
+/// project type is the reference taken as already fully qualified (`com.acme.Order`); returns null when that fails
+/// too. Types in the default package are found only from the default package itself (as its "same package"
+/// candidate): as in Java, they are invisible from named packages.
+///
+/// Example, from `com.acme.Order.Line` referring to `Item`:
+///   com.acme.Order.Line.Item, com.acme.Order.Item   (member types, innermost first)
+///   <explicit import ending in .Item>
+///   com.acme.Item                                   (same package)
+///   <wildcard>.Item for every `import x.*`
 private string resolve(string reference, ref const TypeDecl from, const TypeDecl[string] known)
 {
-    if (reference in known) return reference;
     const dot = reference.indexOf('.');
     const first = dot < 0 ? reference : reference[0 .. dot];
     const rest = dot < 0 ? "" : reference[dot .. $];
@@ -346,7 +416,7 @@ private string resolve(string reference, ref const TypeDecl from, const TypeDecl
         enclosing = enclosing[0 .. i];
     }
     foreach (imp; from.explicitImports)
-        if (imp == first || imp.endsWith("." ~ first)) candidates ~= imp;
+        if (imp.endsWith("." ~ first)) candidates ~= imp;
     candidates ~= prefix ~ first;
     foreach (w; from.wildcardImports) candidates ~= w ~ "." ~ first;
     foreach (c; candidates)
@@ -358,5 +428,8 @@ private string resolve(string reference, ref const TypeDecl from, const TypeDecl
         }
         if (c in known) return c;
     }
+    // Already fully qualified, which a default-package type never is from outside that package.
+    if (auto target = reference in known)
+        if (target.pkg.length) return reference;
     return null;
 }
