@@ -293,6 +293,35 @@ body.walking .hint:not(.walk-hint) { display: none; }
 .crosshair::before { left: 8px; top: 0; width: 2px; height: 18px; }
 .crosshair::after { left: 0; top: 8px; width: 18px; height: 2px; }
 
+/* ---------- history replay ---------- */
+/* The timeline takes the hint bar's place at the bottom centre; the walk hint, toast and inspector move up above it. */
+body.replaying .hint:not(.walk-hint) { display: none; }
+body.replaying .walk-hint { bottom: 76px; }
+body.replaying .toast { bottom: 84px; }
+body.replaying .inspector { bottom: 84px; }
+.timeline {
+  position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 12;
+  width: min(880px, calc(100vw - 32px));
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px;
+}
+.timeline button { flex: none; padding: 5px 9px; }
+.timeline .tl-icon { width: 34px; padding: 5px 0; font-size: 13px; line-height: 1; }
+.timeline .tl-speed { width: 44px; font-variant-numeric: tabular-nums; }
+#tl-slider { flex: 0 1 260px; min-width: 80px; accent-color: var(--accent); margin: 0; }
+.tl-info {
+  flex: 1 1 auto; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-size: 12px; color: var(--muted);
+}
+.tl-info b { color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; }
+.tl-info code { font: 11.5px var(--mono); color: var(--text); }
+.replay-note { margin-top: 12px; padding: 8px 10px; border-radius: 10px; background: var(--accent-soft); font-size: 12px; }
+.replay-note .metrics { margin-top: 8px; grid-template-columns: repeat(4, 1fr); }
+.replay-note .metric { background: var(--panel); }
+.replay-note .gone { display: block; font-weight: 600; margin-bottom: 4px; }
+.tooltip .t-at { color: #94a3b8; }
+
 .loading {
   position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; gap: 12px;
   background: var(--bg); z-index: 50; font-weight: 500; color: var(--muted);
@@ -322,6 +351,8 @@ body.walking .hint:not(.walk-hint) { display: none; }
   .controls { top: auto; bottom: 56px; width: auto; right: 16px; flex-direction: row; flex-wrap: wrap; padding: 10px; gap: 10px; }
   .controls section { flex: 1 1 140px; }
   .stats, .hint { display: none; }
+  body.replaying .controls, body.replaying .inspector { bottom: 84px; }
+  #tl-slider { flex-basis: 120px; }
   .inspector { left: 16px; right: 16px; width: auto; top: auto; height: 50vh; }
   .project { max-width: 120px; }
 }

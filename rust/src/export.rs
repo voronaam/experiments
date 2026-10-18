@@ -3,8 +3,8 @@
 //! `--export` takes the viewer's `index.html` and replaces its three external references (stylesheet, favicon,
 //! script) with inline copies, plus the city JSON in a `<script id="city-data">` element. The viewer's `app.js` looks
 //! for that element and uses the embedded data instead of fetching `api/city`, so the file works from disk with no
-//! server. `app.js` imports `./walk.js`, which an inline module cannot load from disk, so the page's import map also
-//! gets an entry mapping `./walk.js` to a base64 `data:` URL of that module.
+//! server. `app.js` imports `./walk.js` and `./replay.js`, which an inline module cannot load from disk, so the page's
+//! import map also gets an entry for each, mapping it to a base64 `data:` URL of that module.
 
 use crate::assets;
 use crate::city::CityModel;
@@ -19,11 +19,16 @@ pub fn export(model: &CityModel, target: &Path) -> std::io::Result<()> {
     let favicon = assets::FAVICON_SVG.replace('"', "'").replace('#', "%23").replace('\n', " ");
     replace_once(&mut html, r#"<link rel="icon" href="favicon.svg" type="image/svg+xml">"#, &format!(r#"<link rel="icon" href="data:image/svg+xml,{favicon}">"#));
     // "./walk.js" in the import map resolves against the page URL, exactly like app.js's import from the inline
-    // module, so the import is served from the data: URL. Base64 needs no escaping inside the JSON string.
+    // module, so the import is served from the data: URL (likewise "./replay.js"). Base64 needs no escaping inside the
+    // JSON string.
     replace_once(
         &mut html,
         r#""imports": {"#,
-        &format!("\"imports\": {{\n        \"./walk.js\": \"data:text/javascript;base64,{}\",", base64(assets::WALK_JS.as_bytes())),
+        &format!(
+            "\"imports\": {{\n        \"./walk.js\": \"data:text/javascript;base64,{}\",\n        \"./replay.js\": \"data:text/javascript;base64,{}\",",
+            base64(assets::WALK_JS.as_bytes()),
+            base64(assets::REPLAY_JS.as_bytes())
+        ),
     );
     // The JSON writer escapes '<', so the data cannot terminate the script element early. The script stays a module,
     // as in index.html.

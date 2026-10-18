@@ -92,15 +92,16 @@ pub struct World {
 }
 
 impl World {
-    /// The solids of a laid-out city at the given (possibly mid-animation) building heights. Buildings of height
-    /// ≤ 0.001 are hidden (see `Scene::set_buildings`) and left out.
+    /// The solids of a laid-out city at the given (possibly mid-animation) building heights and footprint sides.
+    /// Buildings of height ≤ 0.001 are hidden (see `Scene::set_buildings`) and left out, and so are the districts
+    /// whose `districts` entry is false (a history replay hides districts without buildings yet).
     ///
     /// A district at nesting depth `n` is a box from the ground to `(n + 1) · PLATFORM` (the platforms below it are
     /// separate boxes, which changes nothing for collisions); a building is a box from its lot's `y`, the top of its
     /// platform, up to `y + height`.
-    pub fn from_model(model: &CityModel, heights: &[f32]) -> World {
+    pub fn from_model(model: &CityModel, heights: &[f32], sides: &[f32], districts: &[bool]) -> World {
         let mut solids = Vec::with_capacity(model.districts.len() + model.buildings.len());
-        for d in &model.districts {
+        for (d, _) in model.districts.iter().zip(districts).filter(|(_, &shown)| shown) {
             solids.push(Solid {
                 min_x: (d.x - d.w / 2.0) as f32,
                 max_x: (d.x + d.w / 2.0) as f32,
@@ -116,7 +117,7 @@ impl World {
             if h <= 0.001 {
                 continue;
             }
-            let half = (b.lot.side / 2.0) as f32;
+            let half = sides[b.index] / 2.0;
             let (x, z, y) = (b.lot.x as f32, b.lot.z as f32, b.lot.y as f32);
             solids.push(Solid { min_x: x - half, max_x: x + half, min_z: z - half, max_z: z + half, bottom: y, top: y + h, building: true });
         }

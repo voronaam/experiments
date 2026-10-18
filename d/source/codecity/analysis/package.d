@@ -105,8 +105,8 @@ final class SourceAnalyzer
 
     /// File path, as `findSources` returns it → last parse result.
     private Entry[string] cache;
-    /// Path, modification time and size of every manifest seen by the previous analysis, sorted by path. Any
-    /// difference (edited, added, removed) empties `cache`.
+    /// Path and parse-relevant content (see `manifestStamp`) of every manifest seen by the previous analysis, sorted
+    /// by path. Any difference (a crate renamed, a manifest added or removed) empties `cache`.
     private string[] manifestStamps;
     /// Set once the first analyser crash has been reported, so a systematic bug does not print one line per file.
     /// Shared and updated with `cas` because the parsing workers race on it.
@@ -130,15 +130,10 @@ final class SourceAnalyzer
         string[] manifests;
         auto files = findSources(root, manifests);
         // A changed manifest can change the parse of files that did not change themselves (their crate or project),
-        // so start over. Manifests rarely change, so dropping every language's parses is good enough.
+        // so start over. Manifests rarely change in a way that matters, so dropping every language's parses is good
+        // enough.
         string[] manifestNow;
-        foreach (m; manifests)
-        {
-            try
-                manifestNow ~= m ~ "\0" ~ m.timeLastModified.toISOExtString ~ "\0" ~ m.getSize.to!string;
-            catch (Exception)
-                manifestNow ~= m;
-        }
+        foreach (m; manifests) manifestNow ~= manifestStamp(m);
         if (manifestNow != manifestStamps)
         {
             cache = null;
@@ -231,6 +226,20 @@ final class SourceAnalyzer
             deps[t.fqn] = list;
         }
         return Analysis(root, types, deps, null, files.length, failed);
+    }
+
+    /**
+     * What a manifest contributes to the parse of other files, as a string that changes exactly when that does: the
+     * path plus, for a `Cargo.toml`, the crate name it declares (the Rust analyser uses nothing else from it); a
+     * `package.json` matters only by existing (the TypeScript analyser only looks for one). So an edit that only
+     * bumps a version or a dependency keeps the parse cache, which matters for the history replay
+     * (`codecity.history`), where such edits come with most snapshots.
+     */
+    private static string manifestStamp(string manifest)
+    {
+        import std.path : dirName;
+        if (manifest.baseName == "Cargo.toml") return manifest ~ "\0" ~ rustlang.readCrateName(manifest.dirName);
+        return manifest;
     }
 
     /**

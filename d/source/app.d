@@ -7,12 +7,16 @@
 ///
 /// With `--watch`, a background thread re-runs that build whenever sources change and swaps the new model into the
 /// server or window. The same `SourceAnalyzer` is reused for every rebuild, so only changed files are parsed again.
+///
+/// With `--history[=N]`, the build also replays the code base at N sampled commits (`codecity.history`), so the
+/// viewers can show the city growing; this is a one-off computation and cannot be combined with `--watch`.
 module app;
 
 import codecity.analysis : SourceAnalyzer;
 import codecity.city : CityModel;
 import codecity.git : realPath;
 import codecity.github;
+import codecity.history : defaultSamples, maxSamples, minSamples;
 import codecity.htmlexport : exportHtml;
 import codecity.model : displayName;
 import codecity.server : CityServer;
@@ -43,6 +47,7 @@ Usage: codecity [options] [path | github-url]
   --no-tests        leave test code out of the city
   --no-git          skip mining git history (churn, authors, recency)
   --no-github       no GitHub links or pull-request overlay
+  --history[=N]     replay the city's growth over N sampled commits (default 60)
   --no-open         don't open a browser
   --export FILE     write a self-contained HTML file and exit
   -h, --help        show this help
@@ -67,6 +72,8 @@ struct Options
     ushort port = 7070;
     bool watch, includeTests = true, git = true, github = true, open = true, gui;
     string export_;
+    /// Number of commits to sample for the history replay; 0 when `--history` was not given.
+    uint history;
 }
 
 /// Parses `args` (without the program name) into `o`. Returns false when help was requested; throws with a
@@ -76,6 +83,9 @@ struct Options
 /// directory always wins over a URL-like name. A local root is made absolute and canonical (symlinks resolved), so
 /// that the analysed file paths match the keys `codecity.git.load` builds from `git rev-parse --show-toplevel` and
 /// the prefix `GitHubInfo.detect` computes.
+///
+/// `--history` takes its optional value only in the attached form `--history=N`, never from the next argument, so
+/// a path after it is not mistaken for the count.
 bool parseArgs(string[] args, out Options o)
 {
     o = Options.init;
@@ -99,7 +109,19 @@ bool parseArgs(string[] args, out Options o)
         case "--no-github": o.github = false; break;
         case "--no-open": o.open = false; break;
         case "--export": o.export_ = value(); break;
+        case "--history": o.history = defaultSamples; break;
         default:
+            if (a.startsWith("--history="))
+            {
+                import std.conv : ConvException;
+                uint n;
+                try n = a["--history=".length .. $].to!uint;
+                catch (ConvException) n = 0;
+                if (n < minSamples || n > maxSamples)
+                    throw new Exception(format("--history needs a number of commits from %d to %d", minSamples, maxSamples));
+                o.history = n;
+                break;
+            }
             if (a.startsWith("-")) throw new Exception("unknown option " ~ a);
             if (o.root.length || o.hasRemote) throw new Exception("only one path may be given");
             if (!(a.exists && a.isDir) && GitHubRepo.parse(a, o.remote)) o.hasRemote = true;
@@ -112,6 +134,8 @@ bool parseArgs(string[] args, out Options o)
         if (!(dir.exists && dir.isDir)) throw new Exception("not a directory: " ~ dir);
         o.root = realPath(dir.absolutePath);
     }
+    // a live-updating city has no fixed history to replay
+    if (o.history && o.watch) throw new Exception("--history cannot be combined with --watch");
     return true;
 }
 
@@ -154,7 +178,7 @@ int run(Options opts)
 
     auto analyzer = new SourceAnalyzer;
     writefln("Analysing %s …", root);
-    auto model = CityModel.build(analyzer, root, opts.includeTests, opts.git, hasGithub, github);
+    auto model = CityModel.build(analyzer, root, opts.includeTests, opts.git, hasGithub, github, opts.history);
     printSummary(model);
     if (model.buildings.length == 0) stderr.writefln("No Java, TypeScript or Rust types found under %s", root);
 
@@ -224,9 +248,33 @@ void printSummary(CityModel model)
     auto a = &model.analysis;
     auto s = &model.stats;
     const languages = s.languages.map!(l => format("%s %d", l.language.displayName, l.count)).join(", ");
-    writefln("  %d files, %d types%s, %d packages%s%s — %d ms", a.files, a.types.length,
+    // `s.types`, not `a.types.length`: with the history replay the analysis also holds types that are gone today
+    writefln("  %d files, %d types%s, %d packages%s%s — %d ms", a.files, s.types,
         languages.length ? " (" ~ languages ~ ")" : "", s.packages,
         a.failedFiles ? format(", %d with parse errors", a.failedFiles) : "",
         a.history.length ? format(", git history for %d files", a.history.length) : "",
         model.buildMillis);
+}
+
+unittest
+{
+    // `--history` alone uses the default; `--history=N` must be within 2..500; the value is never taken from the
+    // next argument, so a path after `--history` stays the path; `--history` with `--watch` is refused.
+    Options o;
+    assert(parseArgs(["--history", "."], o) && o.history == defaultSamples && o.root.length);
+    assert(parseArgs(["--history=2"], o) && o.history == 2);
+    assert(parseArgs(["--history=500"], o) && o.history == 500);
+    assert(parseArgs([], o) && o.history == 0);
+    bool fails(string[] args...)
+    {
+        try parseArgs(args.dup, o);
+        catch (Exception e) return true;
+        return false;
+    }
+    assert(fails("--history=1"));
+    assert(fails("--history=501"));
+    assert(fails("--history=x"));
+    assert(fails("--history", "60"));
+    assert(fails("--history", "--watch"));
+    assert(fails("-w", "--history=10"));
 }

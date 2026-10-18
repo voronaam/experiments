@@ -7,8 +7,10 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -29,13 +31,11 @@ public final class GitHistory {
     private GitHistory() {
     }
 
-    /** Running totals for one file while the log is streamed. */
-    private static final class Acc {
-        int commits;
-        final Set<String> authors = new HashSet<>();
-        // Sentinels for max/min; an Acc is only created for a file that has at least one commit, so they never leak.
-        long last = Long.MIN_VALUE;
-        long first = Long.MAX_VALUE;
+    /**
+     * One commit touching a file: its author time (epoch seconds) and author e-mail. The history replay
+     * ({@link dev.codecity.history.CityHistory}) counts these up to each snapshot's time.
+     */
+    public record Touch(long time, String author) {
     }
 
     /**
@@ -49,6 +49,36 @@ public final class GitHistory {
      * build. The exit status of {@code git log} is not checked, so whatever was read before it ended is used.
      */
     public static Map<Path, FileHistory> load(Path root) {
+        return summarise(touches(root));
+    }
+
+    /**
+     * Folds each file's commits into its {@link FileHistory}: the commit count, the number of distinct authors and the
+     * newest and oldest author time. {@link #load} is exactly {@code summarise(touches(root))}; the history replay
+     * calls the two steps separately so that the log is read only once.
+     */
+    public static Map<Path, FileHistory> summarise(Map<Path, List<Touch>> touches) {
+        Map<Path, FileHistory> result = new HashMap<>();
+        touches.forEach((file, list) -> {
+            Set<String> authors = new HashSet<>();
+            // Sentinels for max/min; every list holds at least one commit, so they never leak.
+            long last = Long.MIN_VALUE;
+            long first = Long.MAX_VALUE;
+            for (Touch t : list) {
+                authors.add(t.author());
+                last = Math.max(last, t.time());
+                first = Math.min(first, t.time());
+            }
+            result.put(file, new FileHistory(list.size(), authors.size(), last, first));
+        });
+        return result;
+    }
+
+    /**
+     * The raw log behind {@link #load}: every commit that touched each file, newest first (the order of
+     * {@code git log}). Same keys, same failure handling (an empty map) as {@link #load}.
+     */
+    public static Map<Path, List<Touch>> touches(Path root) {
         try {
             // git log prints paths relative to the top of the work tree, not to root, so find the top first.
             String topLevel = Git.run(root, "rev-parse", "--show-toplevel").orElse("");
@@ -70,34 +100,27 @@ public final class GitHistory {
                     "log", "--no-merges", "--no-renames", "--format=%x1e%at%x1f%aE", "--name-only", "--",
                     "*.java", "*.ts", "*.tsx", "*.mts", "*.cts", "*.rs")
                     .redirectError(ProcessBuilder.Redirect.DISCARD).start();
-            Map<String, Acc> files = new HashMap<>();
+            Map<String, List<Touch>> files = new HashMap<>();
             try (BufferedReader in = new BufferedReader(
                     new InputStreamReader(log.getInputStream(), StandardCharsets.UTF_8))) {
-                long time = 0;
-                String author = "";
+                Touch commit = null;
                 String line;
                 while ((line = in.readLine()) != null) {
                     if (line.startsWith("\u001e")) {
                         // Commit header: remember who and when for the file names that follow.
                         int sep = line.indexOf('\u001f');
-                        time = Long.parseLong(line.substring(1, sep));
-                        author = line.substring(sep + 1);
-                    } else if (!line.isBlank()) {
+                        commit = new Touch(Long.parseLong(line.substring(1, sep)), line.substring(sep + 1));
+                    } else if (!line.isBlank() && commit != null) {
                         // A file changed by the current commit (git separates the list from the header by a blank).
-                        Acc acc = files.computeIfAbsent(line, k -> new Acc());
-                        acc.commits++;
-                        acc.authors.add(author);
-                        acc.last = Math.max(acc.last, time);
-                        acc.first = Math.min(acc.first, time);
+                        files.computeIfAbsent(line, k -> new ArrayList<>()).add(commit);
                     }
                 }
             }
             // The stream is exhausted, so git is finishing; its exit status is not checked.
             log.waitFor(10, TimeUnit.SECONDS);
 
-            Map<Path, FileHistory> result = new HashMap<>();
-            files.forEach((rel, acc) -> result.put(topPath.resolve(rel).normalize(),
-                    new FileHistory(acc.commits, acc.authors.size(), acc.last, acc.first)));
+            Map<Path, List<Touch>> result = new HashMap<>();
+            files.forEach((rel, list) -> result.put(topPath.resolve(rel).normalize(), List.copyOf(list)));
             return result;
         } catch (IOException | RuntimeException e) {
             return Map.of();

@@ -11,6 +11,9 @@
 //!   picking). The app only pushes data into it: heights, colours, selection.
 //! - [`walk`] is the first-person walk mode's movement and collision logic (toggled with G or the Walk button);
 //!   the app feeds it raw winit input ([`RawInput`]) and grabs the cursor while walking ([`Capture`]).
+//! - [`replay`] is the history replay's playback state and interpolation rules (Replay button or R, for a city built
+//!   with `--history`); the app draws its timeline bar and feeds the interpolated heights, sides and colours to the
+//!   scene.
 //! - [`look`] holds metrics, colour scales and palettes; [`source`] the syntax-highlighted source window; [`png`]
 //!   the snapshot encoder.
 //!
@@ -32,6 +35,7 @@
 mod look;
 mod material;
 mod png;
+mod replay;
 mod scene;
 mod source;
 mod walk;
@@ -39,6 +43,7 @@ mod walk;
 use crate::city::CityModel;
 use crate::github::GitHubInfo;
 use look::{ColorMetric, HeightMetric, Scale, Theme};
+use replay::Replay;
 use scene::{Hit, Scene};
 use source::SourceView;
 use std::collections::{HashMap, HashSet};
@@ -425,6 +430,8 @@ struct Actions {
     open_url: Option<String>,
     /// Enter or leave walk mode (the Walk button).
     walk: bool,
+    /// Enter or leave the history replay (the Replay and Now buttons, R, Esc).
+    replay: bool,
 }
 
 /// First-person walk mode in progress (see [`walk`]).
@@ -472,8 +479,14 @@ struct App {
     matches: Option<HashSet<usize>>,
     /// The best few matches, in rank order, for the dropdown under the search field.
     results: Vec<usize>,
-    /// Current, possibly mid-animation, height of every building. 0 hides it (filtered-out test code).
+    /// Current, possibly mid-animation, height of every building. 0 hides it (filtered-out test code, gone types).
     heights: Vec<f32>,
+    /// Footprint side of every building: its lot's side, except during a replay, where it follows the snapshots.
+    sides: Vec<f32>,
+    /// Which districts are drawn (indexed like `model.districts`): all of them, except during a replay.
+    district_shown: Vec<bool>,
+    /// The history replay, when active.
+    replay: Option<Replay>,
     animation: Option<Animation>,
     /// Final colour of every building, after search/selection dimming and hover highlight.
     colors: Vec<Srgba>,
@@ -483,8 +496,9 @@ struct App {
     buildings_dirty: bool,
     /// Heights changed (a subset of `buildings_dirty`): the shadow map must be re-rendered too.
     geometry_dirty: bool,
-    /// District labels: text and the world position of its anchor (front edge, on top of the platform).
-    labels: Vec<(String, Vec3)>,
+    /// District labels: text, the world position of its anchor (front edge, on top of the platform) and the district's
+    /// index.
+    labels: Vec<(String, Vec3, usize)>,
     source: Option<SourceView>,
     /// Message and the time (in `time` seconds) until which it is shown.
     toast: Option<(String, f64)>,
@@ -530,6 +544,9 @@ impl App {
             matches: None,
             results: vec![],
             heights: vec![],
+            sides: vec![],
+            district_shown: vec![],
+            replay: None,
             animation: None,
             colors: vec![],
             buildings_dirty: true,
@@ -549,9 +566,22 @@ impl App {
         app
     }
 
-    /// Whether building `i` is shown: test code can be hidden with the "Test code" checkbox.
+    /// Whether building `i` is shown: test code can be hidden with the "Test code" checkbox, and a type that exists
+    /// only in the past (a gone type of a history city) only appears during a replay. During a replay, a building is
+    /// shown when it exists in the current snapshot (`round(p)`): this is what search results and arcs include.
     fn visible(&self, i: usize) -> bool {
-        self.prefs.show_tests || !self.model.types()[self.model.buildings[i].index].test
+        let b = &self.model.buildings[i];
+        let tests_ok = self.prefs.show_tests || !self.model.types()[b.index].test;
+        match &self.replay {
+            Some(r) => tests_ok && b.hist.as_ref().is_some_and(|h| h.exists(r.snapshot())),
+            None => tests_ok && !b.gone,
+        }
+    }
+
+    /// Whether building `i` is part of the present-day city as displayed: [`App::visible`] outside a replay.
+    fn present(&self, i: usize) -> bool {
+        let b = &self.model.buildings[i];
+        !b.gone && (self.prefs.show_tests || !self.model.types()[b.index].test)
     }
 
     /// Switches to a new model: on start-up (`live == false`) or after a rebuild by the file watcher (`live == true`).
@@ -573,6 +603,9 @@ impl App {
         self.model = next;
         self.selected = None;
         self.hovered = None;
+        self.replay = None;
+        self.sides = self.model.buildings.iter().map(|b| b.lot.side as f32).collect();
+        self.district_shown = self.present_districts();
         // The saved metric if this model supports it, else churn when there is git history, else complexity.
         self.color_metric = match self.prefs.color {
             Some(c) if c.unavailable(&self.model).is_none() => c,
@@ -583,6 +616,7 @@ impl App {
         self.heights = self.model.buildings.iter().map(|b| old.get(&types[b.index].fqn).copied().unwrap_or(0.0)).collect();
         self.geometry_dirty = true;
         self.scene.set_model(&self.model, &self.prefs.theme.palette());
+        self.scene.set_district_mask(&self.model, &self.prefs.theme.palette(), Some(self.district_shown.clone()));
         self.scene.apply_palette(&self.model, &self.prefs.theme.palette());
         self.scene.shadows = self.prefs.shadows;
         self.build_labels();
@@ -618,18 +652,18 @@ impl App {
     /// Each label is anchored at the middle of the district's front edge (`z + d/2`, as `z` runs back to front), just
     /// above its platform: a district at depth `n` has its top at `(n + 1) * PLATFORM`, as in the layout.
     fn build_labels(&mut self) {
-        let mut candidates: Vec<_> = self.model.districts.iter().filter(|d| (1..=2).contains(&d.depth) && d.types > 0).collect();
-        candidates.sort_by(|a, b| (b.w * b.d).total_cmp(&(a.w * a.d)));
+        let mut candidates: Vec<_> = self.model.districts.iter().enumerate().filter(|(_, d)| (1..=2).contains(&d.depth) && d.types > 0).collect();
+        candidates.sort_by(|(_, a), (_, b)| (b.w * b.d).total_cmp(&(a.w * a.d)));
         let mut anchors: Vec<(f64, f64)> = vec![];
         self.labels.clear();
-        for d in candidates.into_iter().take(24) {
+        for (index, d) in candidates.into_iter().take(24) {
             let front = d.z + d.d / 2.0;
             if anchors.len() >= 16 || anchors.iter().any(|(x, z)| (x - d.x).abs() < 8.0 && (z - front).abs() < 3.0) {
                 continue;
             }
             anchors.push((d.x, front));
             let y = (d.depth + 1) as f64 * crate::layout::PLATFORM + 0.2;
-            self.labels.push((d.label.clone(), vec3(d.x as f32, y as f32, front as f32)));
+            self.labels.push((d.label.clone(), vec3(d.x as f32, y as f32, front as f32), index));
         }
     }
 
@@ -638,25 +672,41 @@ impl App {
     /// Heights are linear in the metric, scaled so that the 95th-percentile visible building is 20% of the city's
     /// radius tall, kept between 8 and 16 units. Scaling to a percentile rather than the maximum keeps one giant
     /// class from flattening everything else; the outliers above it are capped at 75% of the radius instead. Every
-    /// visible building gets a 0.35 base so that types with a metric of 0 still show up. Hidden test types get 0,
+    /// visible building gets a 0.35 base so that types with a metric of 0 still show up. Hidden test types (and the gone
+    /// types of a history city) get 0,
     /// which [`Scene::set_buildings`] treats as "not drawn".
     ///
     /// `rise` starts from the ground (initial load); otherwise buildings morph from their current heights.
+    ///
+    /// During a replay this only re-measures the present-day scale the replay draws with (see [`App::replay_geometry`]).
     fn reheight(&mut self, rise: bool) {
         let metric = self.prefs.height;
         let types = self.model.types();
-        let mut values: Vec<f64> = (0..types.len()).filter(|&i| self.visible(i)).map(|i| metric.value(&types[i])).collect();
-        values.sort_by(f64::total_cmp);
-        // Nearest-rank percentile; at least 1 so an all-zero metric does not divide by zero.
-        let p95 = if values.is_empty() { 1.0 } else { values[((0.95 * (values.len() - 1) as f64) as usize).min(values.len() - 1)] }.max(1.0);
+        let scale = self.height_scale();
+        if let Some(r) = &mut self.replay {
+            r.scale = scale;
+            r.drawn = None;
+            return;
+        }
         let r = self.scene.radius as f64;
-        let scale = (r * 0.2).clamp(8.0, 16.0) / p95;
         let to: Vec<f32> = (0..types.len())
             .map(|i| if self.visible(i) { (0.35 + metric.value(&types[i]) * scale).min(r * 0.75) as f32 } else { 0.0 })
             .collect();
         // A morph starts from the current, possibly mid-animation, heights, so interrupting an animation is smooth.
         let from = if rise { vec![0.0; to.len()] } else { self.heights.clone() };
         self.animation = Some(Animation { from, to, start: self.time, duration: if rise { 1.4 } else { 0.65 } });
+    }
+
+    /// Height per unit of the height metric, for the present-day city (see [`App::reheight`]): the 95th-percentile
+    /// visible building is 20% of the city's radius tall, kept between 8 and 16 units. A replay keeps this scale.
+    fn height_scale(&self) -> f64 {
+        let metric = self.prefs.height;
+        let types = self.model.types();
+        let mut values: Vec<f64> = (0..types.len()).filter(|&i| self.present(i)).map(|i| metric.value(&types[i])).collect();
+        values.sort_by(f64::total_cmp);
+        // Nearest-rank percentile; at least 1 so an all-zero metric does not divide by zero.
+        let p95 = if values.is_empty() { 1.0 } else { values[((0.95 * (values.len() - 1) as f64) as usize).min(values.len() - 1)] }.max(1.0);
+        (self.scene.radius as f64 * 0.2).clamp(8.0, 16.0) / p95
     }
 
     /// Recomputes every building's colour from the colour metric, then layers on the interaction state:
@@ -668,11 +718,16 @@ impl App {
     ///
     /// Called whenever any of these change, including on every hover change; the result reaches the GPU in the next
     /// frame via `buildings_dirty`.
+    ///
+    /// During a replay the colours are those of the snapshot `round(p)` on the present-day scale (see
+    /// [`replay::color_value`]).
     fn recolor(&mut self) {
         let m = &self.model;
+        let at = self.replay.as_ref().map(|r| r.snapshot()).zip(m.history.as_ref());
+        let metric = if at.is_some() { replay::color_metric(self.color_metric) } else { self.color_metric };
         // The scale (value range) depends only on the metric and the model, but recomputing it here is cheap and
         // keeps it in step after a model or metric change.
-        self.scale = Scale::of(self.color_metric, m);
+        self.scale = Scale::of(metric, m);
         let palette = self.prefs.theme.palette();
         let mut related = HashSet::new();
         if let Some(s) = self.selected {
@@ -684,7 +739,11 @@ impl App {
             .buildings
             .iter()
             .map(|b| {
-                let mut c = self.scale.color(&m.types()[b.index], b);
+                let t = &m.types()[b.index];
+                let mut c = match (at, &b.hist) {
+                    (Some((k, snapshots)), Some(h)) => self.scale.color_of(replay::color_value(metric, h, k, &snapshots[k]), t.kind),
+                    _ => self.scale.color(t, b),
+                };
                 let out_of_search = self.matches.as_ref().is_some_and(|ms| !ms.contains(&b.index));
                 let out_of_focus = self.selected.is_some() && !related.contains(&b.index);
                 if out_of_search || out_of_focus {
@@ -711,7 +770,7 @@ impl App {
         // Collected up front because show_arcs borrows the scene mutably and so cannot call self.visible.
         let visible: Vec<bool> = (0..self.model.buildings.len()).map(|j| self.visible(j)).collect();
         self.scene.show_arcs(&self.model, i, &heights, |j| visible[j], night);
-        self.scene.set_marker(&self.model, i, &heights, night);
+        self.scene.set_marker(&self.model, i, &heights, &self.sides, night);
         self.recolor();
         if let (Some(i), true) = (i, fly) {
             self.fly_to_building(i);
@@ -879,6 +938,7 @@ impl App {
             self.handle_events(&frame.events, dpr, viewport, &mut actions);
         }
         self.apply(&actions);
+        self.update_replay(dt as f64);
 
         // height animation
         if let Some(a) = &self.animation {
@@ -907,7 +967,8 @@ impl App {
             }
         }
         // Dependency-arc particles and PR beacons move every frame.
-        self.scene.animate(&self.model, &self.heights, dt, self.time as f32, self.prefs.beacons);
+        // PR beacons are a present-day overlay: off during a replay.
+        self.scene.animate(&self.model, &self.heights, dt, self.time as f32, self.prefs.beacons && self.replay.is_none());
 
         self.camera.set_viewport(viewport);
         let r = self.scene.radius;
@@ -918,7 +979,7 @@ impl App {
             // Mouse look, then one physics step against the city at its current (possibly animating) heights.
             let (dx, dy) = std::mem::take(&mut self.raw.mouse);
             w.walker.look(dx, dy);
-            let world = walk::World::from_model(&self.model, &self.heights);
+            let world = walk::World::from_model(&self.model, &self.heights, &self.sides, &self.district_shown);
             w.walker.step(dt, self.raw.movement(), &world);
             let ([ex, ey, ez], [vx, vy, vz]) = (w.walker.eye(), w.walker.direction());
             let eye = vec3(ex, ey, ez);
@@ -939,7 +1000,7 @@ impl App {
         // Rewrites all building instances (marking the shadow map stale only if heights changed); done at most once
         // per frame however many changes asked for it.
         if self.buildings_dirty {
-            self.scene.set_buildings(&self.model, &self.heights, &self.colors, self.geometry_dirty);
+            self.scene.set_buildings(&self.model, &self.heights, &self.sides, &self.colors, self.geometry_dirty);
             self.buildings_dirty = false;
             self.geometry_dirty = false;
         }
@@ -982,6 +1043,13 @@ impl App {
                 self.enter_walk();
             }
         }
+        if a.replay {
+            if self.replay.is_some() {
+                self.exit_replay();
+            } else {
+                self.enter_replay();
+            }
+        }
         if a.frame_all {
             self.frame_all(true);
         }
@@ -995,6 +1063,99 @@ impl App {
         }
     }
 
+    // -------------------------------------------------------------- history replay
+
+    /// The districts of the present-day view: all of them, except in a history city those whose `types` is 0, which
+    /// hold only gone types (and so would be empty platforms today).
+    fn present_districts(&self) -> Vec<bool> {
+        let history = self.model.history.is_some();
+        self.model.districts.iter().map(|d| !history || d.types > 0).collect()
+    }
+
+    /// Starts the replay at the first snapshot, playing (the Replay button or R). The present-day height scale is
+    /// measured now and kept, so the city grows rather than being renormalised at every snapshot. The next
+    /// [`App::update_replay`] draws the first snapshot.
+    fn enter_replay(&mut self) {
+        let Some(snapshots) = &self.model.history else { return };
+        if self.replay.is_some() || snapshots.is_empty() {
+            return;
+        }
+        let replay = Replay::new(snapshots.len(), self.height_scale());
+        self.replay = Some(replay);
+        self.animation = None;
+    }
+
+    /// Leaves the replay (the Now button, R or Esc) and puts the present-day city back as it was: present footprints,
+    /// districts and colours at once, heights animating back as after a height-metric change, and the search and arcs for today's buildings. A
+    /// gone type cannot stay selected, as it is not part of today's city.
+    fn exit_replay(&mut self) {
+        if self.replay.take().is_none() {
+            return;
+        }
+        self.sides = self.model.buildings.iter().map(|b| b.lot.side as f32).collect();
+        self.district_shown = self.present_districts();
+        self.scene.set_district_mask(&self.model, &self.prefs.theme.palette(), Some(self.district_shown.clone()));
+        if self.selected.is_some_and(|i| self.model.buildings[i].gone) {
+            self.selected = None;
+        }
+        // Heights morph back like after a height-metric change; everything else has switched at once.
+        self.reheight(false);
+        if !self.search.is_empty() {
+            self.run_search();
+        }
+        let s = self.selected;
+        self.select(s, false);
+    }
+
+    /// Advances playback by `dt` seconds and brings the scene up to date: geometry whenever the position moved, and
+    /// whatever depends on the nearest snapshot (colours, districts, search, arcs) whenever that changed.
+    fn update_replay(&mut self, dt: f64) {
+        let Some(r) = &mut self.replay else { return };
+        r.advance(dt);
+        let (p, k) = (r.p, r.snapshot());
+        let redraw = r.drawn != Some(p);
+        let reshow = r.shown != Some(k);
+        r.drawn = Some(p);
+        r.shown = Some(k);
+        if redraw {
+            self.replay_geometry();
+        }
+        if reshow {
+            self.district_shown = self.model.district_hist.iter().map(|alive| alive[k]).collect();
+            self.scene.set_district_mask(&self.model, &self.prefs.theme.palette(), Some(self.district_shown.clone()));
+            if !self.search.is_empty() {
+                self.run_search();
+            }
+            // Rebuilds the arcs (to the buildings that exist now) and recolours.
+            let s = self.selected;
+            self.select(s, false);
+        }
+    }
+
+    /// Heights and footprint sides at the replay position (see [`replay::metric_at`] and [`replay::side_at`]): the
+    /// height metric interpolated between the snapshots on either side, on the present-day scale with the usual 0.35
+    /// base and cap; hidden where the type exists in neither snapshot, or is filtered-out test code.
+    fn replay_geometry(&mut self) {
+        let Some(r) = &self.replay else { return };
+        let at = r.frame();
+        let cap = self.scene.radius as f64 * 0.75;
+        let metric = self.prefs.height;
+        let types = self.model.types();
+        for (i, b) in self.model.buildings.iter().enumerate() {
+            let tests_ok = self.prefs.show_tests || !types[b.index].test;
+            let shape = b.hist.as_ref().filter(|_| tests_ok).and_then(|h| replay::metric_at(h, metric, at).map(|v| (v, replay::side_at(h, at))));
+            (self.heights[i], self.sides[i]) = match shape {
+                Some((v, side)) => ((0.35 + v * r.scale).min(cap) as f32, side as f32),
+                None => (0.0, 0.0),
+            };
+        }
+        self.animation = None;
+        self.buildings_dirty = true;
+        self.geometry_dirty = true;
+        let night = self.prefs.theme == Theme::Night;
+        self.scene.set_marker(&self.model, self.selected, &self.heights, &self.sides, night);
+    }
+
     // -------------------------------------------------------------- walk mode
 
     /// Starts walking. With a building selected, the player stands on the street in front of it (its `+z` side, just
@@ -1005,7 +1166,7 @@ impl App {
             return;
         }
         self.flight = None;
-        let world = walk::World::from_model(&self.model, &self.heights);
+        let world = walk::World::from_model(&self.model, &self.heights, &self.sides, &self.district_shown);
         let (x, z, yaw) = match self.selected {
             Some(i) => {
                 let lot = &self.model.buildings[i].lot;
@@ -1261,8 +1422,15 @@ impl App {
             Some(w) => ("WASD move · Mouse look · Shift run · Space jump · Click select · G/Esc exit", (1.0 - (self.time - w.since - 6.0) / 0.5).clamp(0.0, 1.0) as f32),
             None => ("drag to orbit · right-drag to pan · scroll to zoom · click a building · / search · F frame · N night · G walk · Esc clear", 1.0),
         };
-        if opacity > 0.0 {
-            egui::Area::new("hint".into()).anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -14.0)).interactable(false).show(&ctx, |ui| {
+        // During a replay the timeline bar takes the bottom centre: the orbit hint gives way, the walk hint and the
+        // toast move up above the bar.
+        let replaying = self.replay.is_some();
+        if replaying {
+            self.timeline(&ctx, actions);
+        }
+        let lift = if replaying { 50.0 } else { 0.0 };
+        if opacity > 0.0 && (self.walk.is_some() || !replaying) {
+            egui::Area::new("hint".into()).anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -14.0 - lift)).interactable(false).show(&ctx, |ui| {
                 ui.multiply_opacity(opacity);
                 card(night).corner_radius(CornerRadius::same(255)).inner_margin(Margin::symmetric(12, 6)).show(ui, |ui| {
                     ui.label(RichText::new(hint).small().weak());
@@ -1282,7 +1450,7 @@ impl App {
         // The toast expires lazily: it is dropped by the first frame drawn after its deadline.
         if let Some((text, until)) = self.toast.clone() {
             if self.time < until {
-                egui::Area::new("toast".into()).anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -58.0)).interactable(false).show(&ctx, |ui| {
+                egui::Area::new("toast".into()).anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -58.0 - lift)).interactable(false).show(&ctx, |ui| {
                     card(night).corner_radius(CornerRadius::same(255)).inner_margin(Margin::symmetric(14, 8)).show(ui, |ui| ui.strong(text));
                 });
             } else {
@@ -1297,9 +1465,13 @@ impl App {
         ctx.input(|i| {
             // Escape always works, even in the search field, and peels back one layer at a time: source window,
             // then selection, then search.
+            // During a replay, leaving it comes right after the source window (walk mode, which comes first, takes
+            // its own keys) and before the selection and the search.
             if i.key_pressed(egui::Key::Escape) {
                 if self.source.as_ref().is_some_and(|s| s.open) {
                     self.source = None;
+                } else if self.replay.is_some() {
+                    actions.replay = true;
                 } else if self.selected.is_some() {
                     actions.select = Some(None);
                 } else if !self.search.is_empty() {
@@ -1308,6 +1480,28 @@ impl App {
                 }
             }
             if !typing {
+                // R toggles the replay (a city built with --history). While replaying: P plays or pauses, comma and
+                // period step a snapshot back or forward, Home and End jump to the first or last one.
+                if i.key_pressed(egui::Key::R) && self.model.history.is_some() {
+                    actions.replay = true;
+                }
+                if let Some(r) = &mut self.replay {
+                    if i.key_pressed(egui::Key::P) {
+                        r.toggle();
+                    }
+                    if i.key_pressed(egui::Key::Comma) {
+                        r.step(-1);
+                    }
+                    if i.key_pressed(egui::Key::Period) {
+                        r.step(1);
+                    }
+                    if i.key_pressed(egui::Key::Home) {
+                        r.seek(0);
+                    }
+                    if i.key_pressed(egui::Key::End) {
+                        r.seek(r.count - 1);
+                    }
+                }
                 if i.key_pressed(egui::Key::F) {
                     actions.frame_all = true;
                 }
@@ -1325,6 +1519,48 @@ impl App {
             self.search_dirty = false;
             self.run_search();
         }
+    }
+
+    /// The replay's timeline bar at the bottom centre: play/pause, a slider over the snapshots, the date, short commit
+    /// id, subject and author of the nearest snapshot, the speed (cycling 1×, 2×, 4×, 0.5×) and Now, which leaves the
+    /// replay. Dragging the slider moves the position and pauses.
+    fn timeline(&mut self, ctx: &egui::Context, actions: &mut Actions) {
+        let night = self.prefs.theme == Theme::Night;
+        let model = self.model.clone();
+        let (Some(snapshots), Some(r)) = (&model.history, &mut self.replay) else { return };
+        egui::Area::new("timeline".into()).anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -14.0)).show(ctx, |ui| {
+            card(night).corner_radius(CornerRadius::same(255)).inner_margin(Margin::symmetric(14, 8)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // ▶ when paused, ❚❚ when playing. egui's fonts have no ❚, so the two bars are painted onto an
+                    // empty button in the text colour instead.
+                    let play = ui.add_sized([30.0, 24.0], egui::Button::new(if r.playing { "" } else { "▶" }));
+                    if r.playing {
+                        let c = play.rect.center();
+                        let color = ui.visuals().widgets.style(&play).fg_stroke.color;
+                        for dx in [-3.5, 3.5] {
+                            ui.painter().rect_filled(egui::Rect::from_center_size(c + Vec2::new(dx, 0.0), Vec2::new(3.0, 11.0)), CornerRadius::same(1), color);
+                        }
+                    }
+                    if play.on_hover_text("Play / pause (P)").clicked() {
+                        r.toggle();
+                    }
+                    ui.spacing_mut().slider_width = 260.0;
+                    // A single snapshot leaves nothing to slide over.
+                    let end = (r.count - 1) as f64;
+                    let slider = ui.add_enabled(r.count > 1, egui::Slider::new(&mut r.p, 0.0..=end.max(1.0)).show_value(false));
+                    if slider.changed() || slider.dragged() {
+                        r.playing = false;
+                    }
+                    ui.add_sized([440.0, 20.0], egui::Label::new(RichText::new(replay::caption(&snapshots[r.snapshot()])).small()).truncate());
+                    if ui.add_sized([44.0, 24.0], egui::Button::new(r.speed_label())).on_hover_text("Playback speed").clicked() {
+                        r.next_speed();
+                    }
+                    if ui.button("Now").on_hover_text("Back to today (R / Esc)").clicked() {
+                        actions.replay = true;
+                    }
+                });
+            });
+        });
     }
 
     /// Marks the search for re-running at the end of [`App::ui`].
@@ -1345,7 +1581,11 @@ impl App {
         let cam = self.camera.position();
         let dir = self.camera.view_direction();
         let font = FontId::proportional(11.0);
-        for (text, pos) in &self.labels {
+        for (text, pos, d) in &self.labels {
+            // A district without buildings yet (during a replay) has no label either.
+            if !self.district_shown[*d] {
+                continue;
+            }
             // Behind the camera: the projection would mirror it back onto the screen, so skip it.
             if (*pos - cam).dot(dir) <= 0.0 {
                 continue;
@@ -1469,6 +1709,7 @@ impl App {
     /// toggles (labels, beacons, shadows) take effect directly and are saved straight away.
     fn controls(&mut self, ctx: &egui::Context, actions: &mut Actions) {
         let night = self.prefs.theme == Theme::Night;
+        let replaying = self.replay.is_some();
         egui::Area::new("controls".into()).fixed_pos(egui::pos2(16.0, 92.0)).show(ctx, |ui| {
             card(night).inner_margin(Margin::same(14)).show(ui, |ui| {
                 ui.set_width(210.0);
@@ -1482,11 +1723,13 @@ impl App {
                 });
                 ui.add_space(8.0);
                 caption(ui, "COLOUR");
-                egui::ComboBox::from_id_salt("colour").width(210.0).selected_text(self.color_metric.label()).show_ui(ui, |ui| {
+                // During a replay, open PRs (which only exist today) show as churn.
+                let shown = if replaying { replay::color_metric(self.color_metric) } else { self.color_metric };
+                egui::ComboBox::from_id_salt("colour").width(210.0).selected_text(shown.label()).show_ui(ui, |ui| {
                     for m in ColorMetric::ALL {
                         // Metrics without data (no git history, no GitHub PRs) are listed but disabled, with the
-                        // reason appended to the label.
-                        let why = m.unavailable(&self.model);
+                        // reason appended to the label; so are open PRs during a replay.
+                        let why = if replaying && m == ColorMetric::Prs { Some(" (today only)") } else { m.unavailable(&self.model) };
                         let label = format!("{}{}", m.label(), why.unwrap_or(""));
                         if ui.add_enabled(why.is_none(), egui::Button::selectable(self.color_metric == m, label)).clicked() {
                             self.color_metric = m;
@@ -1534,9 +1777,16 @@ impl App {
                     }
                 });
                 // Full width below the three; drawn selected while walking.
-                let walk = egui::Button::selectable(self.walk.is_some(), if self.walk.is_some() { "Walking  (G / Esc to stop)" } else { "Walk  (G)" });
+                let walk = egui::Button::new(if self.walk.is_some() { "Walking  (G / Esc to stop)" } else { "Walk  (G)" }).selected(self.walk.is_some());
                 if ui.add_sized([210.0, 28.0], walk).on_hover_text("Walk through the city in first person").clicked() {
                     actions.walk = true;
+                }
+                // Only for a city built with --history; drawn selected while replaying.
+                if self.model.history.is_some() {
+                    let label = if replaying { "Replaying  (R / Esc to stop)" } else { "Replay  (R)" };
+                    if ui.add_sized([210.0, 28.0], egui::Button::new(label).selected(replaying)).on_hover_text("Watch the city grow commit by commit").clicked() {
+                        actions.replay = true;
+                    }
                 }
             });
         });
@@ -1622,6 +1872,25 @@ impl App {
                             badge(ui, "test", ui.visuals().faint_bg_color, ui.visuals().text_color());
                         }
                     });
+                    // A gone type, and during a replay the snapshot's own numbers above the present-day ones.
+                    if b.gone {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Removed before today").small().strong().weak());
+                    }
+                    if let (Some(r), Some(h), Some(snapshots)) = (&self.replay, &b.hist, &model.history) {
+                        let k = r.snapshot();
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(format!("Replaying — values at {}", replay::local_date(snapshots[k].time))).small().strong());
+                        let v = |x: i32| if h.exists(k) { look::fmt(x as f64) } else { "—".into() };
+                        egui::Grid::new("replay-metrics").num_columns(4).spacing([6.0, 4.0]).show(ui, |ui| {
+                            for (value, label) in [(v(h.nom[k]), "methods"), (v(h.noa[k]), "attributes"), (v(h.loc[k]), "LOC"), (v(h.cx[k]), "complexity")] {
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(value).strong());
+                                    ui.label(RichText::new(label).small().weak());
+                                });
+                            }
+                        });
+                    }
                     ui.add_space(6.0);
                     let visible = |j: &&usize| self.visible(**j);
                     let out: Vec<usize> = b.deps.iter().filter(visible).copied().collect();
@@ -1764,7 +2033,16 @@ impl App {
             if let Some(h) = b.history {
                 row.push_str(&format!(" · {} commits", h.commits));
             }
-            if !b.prs.is_empty() {
+            // During a replay: the snapshot's numbers instead, and no PRs (they belong to today).
+            if let (Some(r), Some(h), Some(snapshots)) = (&self.replay, &b.hist, &self.model.history) {
+                let k = r.snapshot();
+                let date = replay::local_date(snapshots[k].time);
+                row = if h.exists(k) {
+                    format!("{} methods · {} attrs · {} loc · cx {} · {} commits · at {date}", h.nom[k], h.noa[k], look::fmt(h.loc[k] as f64), h.cx[k], h.commits[k])
+                } else {
+                    format!("not in this snapshot · at {date}")
+                };
+            } else if !b.prs.is_empty() {
                 row.push_str(&format!(" · {} open PR{}", b.prs.len(), if b.prs.len() > 1 { "s" } else { "" }));
             }
             Some((format!("{}  ·  {}", t.name, t.kind), t.package.clone(), row))

@@ -7,6 +7,12 @@ It is a joke. You do not need to spend any time here. Have fun!
 An interactive 3D "software city" for **Java, TypeScript and Rust** code bases. It is a modern take on Richard Wettel's
 [CodeCity](https://wettel.github.io/codecity.html), which was originally written in Smalltalk.
 
+![google/gson as a city by day: the Gson class is selected, with its dependency arcs and the inspector open](docs/screenshots/day.png)
+
+| Night mode | History replay | Walk mode |
+|---|---|---|
+| ![gson at night: lit windows and glowing hot spots](docs/screenshots/night.png) | ![gson in July 2012, half-built, with the replay timeline](docs/screenshots/replay.png) | ![Street-level view in walk mode with the crosshair on a class](docs/screenshots/walk.png) |
+
 * **Packages become districts.** They are stacked platforms, one level per nesting depth. Chains like
   `com → acme → shop` are collapsed, and multi-module builds get one district per module.
   * For TypeScript, districts are directories. For Rust, they are crates and modules.
@@ -46,6 +52,7 @@ java -jar target/codecity.jar --export city.html # one self-contained, shareable
 | `--no-github` | no GitHub links or pull-request overlay |
 | `--no-open` | don't launch a browser |
 | `--export FILE` | write a standalone HTML file and exit |
+| `--history[=N]` | replay the city's growth over N sampled commits (default 60); not with `--watch` |
 
 ## Languages
 
@@ -123,7 +130,31 @@ Differences from the browser viewer:
 * Night mode lights the windows and makes hot spots glow (bloom). Ambient occlusion can be toggled.
 * **Snapshot** saves a PNG.
 
+### History replay
+
+![History replay of google/gson, paused in July 2012](docs/screenshots/replay.png)
+
+Start with `--history` and press **Replay** (or `R`) to watch the city being built, commit by commit, from the first
+commit to today.
+
+* **Real metrics at every step.** Up to N commits (60 by default) along the first-parent history are sampled, the
+  source tree of each is rebuilt in a temporary directory and analysed, so methods, attributes, LOC and complexity
+  are the real values at that time. Only files that changed between samples are re-parsed (gson's 18 years in about
+  5 s with the Rust and D editions, about 20 s with Java).
+* **The city grows in place.** The layout includes every type that ever existed, with each lot sized for that
+  building's largest footprint. Buildings rise, widen and shrink smoothly between commits, measured against today's
+  height scale; districts appear as they fill up. Types deleted before today only appear during replay.
+* **Colours follow time too:** churn, author count and recency are counted as they were at that commit.
+* The timeline bar shows the commit's date, short sha, subject and author, with play/pause, a slider, speed
+  (1×, 2×, 4×, 0.5×) and **Now**. Keys: `P` play/pause, `,` / `.` previous/next commit, `Home` / `End` first/last,
+  `R` or `Esc` back to today.
+* Tooltips and the inspector show the values at the replayed commit. Walk mode works during replay, so you can
+  stand in a street while the city grows around you.
+* Blobless clones (the GitHub clone cache) are completed once with a single batched fetch of the missing objects.
+
 ### Walk mode
+
+![Walking through gson at street level](docs/screenshots/walk.png)
 
 Press `G` (or the **Walk** button) to walk through the city at street level, first-person-shooter style. All four
 viewers (browser, and the Java, Rust and D desktop windows) behave the same way.

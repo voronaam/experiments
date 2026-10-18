@@ -8,6 +8,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.function.ToIntFunction;
 
 /**
  * Lays the city out: packages become nested, stacked districts and types become buildings whose footprint grows with
@@ -74,7 +75,12 @@ public final class CityLayout {
      * footprint area grows roughly linearly with it, and even a type without attributes gets a visible 1.2 × 1.2 lot.
      */
     public static double side(TypeInfo t) {
-        return 1.2 + 0.8 * Math.sqrt(t.noa());
+        return side(t.noa());
+    }
+
+    /** {@link #side(TypeInfo)} for an attribute count; the history replay sizes footprints with it. */
+    public static double side(int noa) {
+        return 1.2 + 0.8 * Math.sqrt(noa);
     }
 
     /** A district while the layout is being computed. */
@@ -132,12 +138,22 @@ public final class CityLayout {
     }
 
     public static Result layout(String cityName, List<TypeInfo> types) {
+        return layout(cityName, types, TypeInfo::noa);
+    }
+
+    /**
+     * Lays the city out with each lot sized for {@code noa(type)} attributes instead of the type's own count. The
+     * history replay passes the largest count the type ever had, so that every lot is big enough for the building at
+     * its widest. A {@link Lot} still has the type's own {@link #side(TypeInfo)}, centred in the larger lot; everything
+     * else is the same as {@link #layout(String, List)}.
+     */
+    public static Result layout(String cityName, List<TypeInfo> types, ToIntFunction<TypeInfo> noa) {
         Node root = buildTree(cityName, types);
-        measure(root);
+        measure(root, noa);
         List<District> districts = new ArrayList<>();
         Map<String, Lot> lots = new HashMap<>();
         // Start at the top-left corner that puts the whole city's centre on the origin.
-        place(root, -root.w / 2, -root.d / 2, 0, districts, lots);
+        place(root, -root.w / 2, -root.d / 2, 0, districts, lots, noa);
         return new Result(districts, lots, root.w, root.d);
     }
 
@@ -218,14 +234,14 @@ public final class CityLayout {
      * sub-districts and buildings go into one packing, which is why buildings and sub-districts mix freely on a
      * platform.
      */
-    private static void measure(Node node) {
+    private static void measure(Node node, ToIntFunction<TypeInfo> noa) {
         List<Item> items = new ArrayList<>();
         for (Node child : node.children.values()) {
-            measure(child);
+            measure(child, noa);
             items.add(new Item(child.w + GAP, child.d + GAP, child, null));
         }
         for (TypeInfo t : node.types) {
-            double s = side(t);
+            double s = side(noa.applyAsInt(t));
             items.add(new Item(s + GAP, s + GAP, null, t));
         }
         double[] size = pack(items);
@@ -244,7 +260,7 @@ public final class CityLayout {
      * district's position in it.
      */
     private static void place(Node node, double left, double top, int depth,
-                              List<District> districts, Map<String, Lot> lots) {
+                              List<District> districts, Map<String, Lot> lots, ToIntFunction<TypeInfo> noa) {
         int index = districts.size();
         districts.add(new District(node.id, node.label, depth,
                 left + node.w / 2, top + node.d / 2, node.w, node.d, node.typeCount()));
@@ -253,12 +269,14 @@ public final class CityLayout {
             double x = left + PAD + item.x;
             double z = top + PAD + item.z;
             if (item.node != null) {
-                place(item.node, x, z, depth + 1, districts, lots);
+                place(item.node, x, z, depth + 1, districts, lots, noa);
             } else {
                 // The item is the footprint plus the street; the building sits in its top-left corner, and the lot
                 // stores the footprint's centre. It stands on this district's platform, one level above depth.
-                double s = side(item.type);
-                lots.put(item.type.fqn(), new Lot(x + s / 2, z + s / 2, s, (depth + 1) * PLATFORM, index));
+                // With a larger lot (history replay), the building keeps its own side, centred in the lot.
+                double s = side(noa.applyAsInt(item.type));
+                lots.put(item.type.fqn(), new Lot(x + s / 2, z + s / 2, side(item.type), (depth + 1) * PLATFORM,
+                        index));
             }
         }
     }

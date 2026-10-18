@@ -2,7 +2,10 @@ package dev.codecity.desktop;
 
 import dev.codecity.CityModel;
 import dev.codecity.CityModel.Building;
+import dev.codecity.history.Snapshot;
+import dev.codecity.history.TypeHistory;
 import dev.codecity.layout.CityLayout;
+import javafx.animation.AnimationTimer;
 import javafx.animation.FadeTransition;
 import javafx.animation.PauseTransition;
 import javafx.animation.SequentialTransition;
@@ -23,6 +26,7 @@ import javafx.scene.control.Hyperlink;
 import javafx.scene.control.Label;
 import javafx.scene.control.ListCell;
 import javafx.scene.control.ListView;
+import javafx.scene.control.Slider;
 import javafx.scene.control.TextField;
 import javafx.scene.control.TextInputControl;
 import javafx.scene.control.ToggleButton;
@@ -59,6 +63,9 @@ import java.util.BitSet;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Locale;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.prefs.Preferences;
 
 /**
@@ -78,6 +85,14 @@ import java.util.prefs.Preferences;
  * <h2>Walk mode</h2>
  * G or the Walk button switches to a first-person walk through the city ({@link #setWalking}). This class tracks the
  * movement keys and shows the crosshair and the key hint; {@link CityView3D} and {@link Walker} do the rest.
+ *
+ * <h2>History replay</h2>
+ * When the model has history, R or the Replay button plays the city's growth snapshot by snapshot
+ * ({@link #setReplaying}). {@link Replay} holds the playback position; a timeline bar at the bottom replaces the
+ * orbit hint. Every frame, {@link #applyReplayFrame} blends heights and footprints between the two snapshots around
+ * the position (scaled like the present-day city, so growth shows), and whenever the nearest snapshot changes,
+ * {@link #applyReplaySnapshot} updates colours, districts, arcs, search and the inspector. While replaying, "visible"
+ * means present in the nearest snapshot; outside replay, types that exist only in history are always hidden.
  *
  * <p>Buildings are referred to by their index in {@link CityModel#buildings()} throughout, the same index the view
  * uses for boxes and palette cells. Indices are only valid for one model; across a rebuild the selection is carried
@@ -166,6 +181,47 @@ public final class DesktopApp extends Application {
     /** Movement keys held while walking. */
     private final EnumSet<KeyCode> held = EnumSet.noneOf(KeyCode.class);
 
+    /** The running history replay, or null when showing the present-day city. */
+    private Replay replay;
+    /**
+     * Present-day height scale for the replay, {scale, cap} as computed by {@link #heightScale}: taken on entering
+     * and kept, so the city visibly grows instead of being renormalised every frame.
+     */
+    private double[] replayHeight;
+    /** The snapshot {@link #applyReplaySnapshot} last applied, -1 to force the next one. */
+    private int replayShown = -1;
+    /** Districts drawn in the present-day view (those holding a type that exists today); null for all. */
+    private boolean[] presentDistricts;
+    private final ToggleButton replayButton = new ToggleButton("Replay (R)");
+    /** The timeline bar: play/pause, position slider, snapshot description, speed and "Now". */
+    private final HBox timeline = new HBox(10);
+    private final Button playButton = new Button();
+    private final Slider slider = new Slider();
+    private final Label timelineText = new Label();
+    private final Button speedButton = new Button();
+    /** Set while the code moves the slider, so that only the user's drags seek. */
+    private boolean syncingSlider;
+    /** Advances a playing replay once per frame; running only while replaying. */
+    private final AnimationTimer replayTimer = new AnimationTimer() {
+        private long last;
+
+        @Override
+        public void start() {
+            last = 0;
+            super.start();
+        }
+
+        @Override
+        public void handle(long now) {
+            // Capped at 0.25 s, so a stall does not skip snapshots, while slow renderers still play at full speed.
+            double dt = last == 0 ? 0 : Math.min(0.25, (now - last) / 1e9);
+            last = now;
+            if (replay != null && replay.advance(dt)) {
+                replayChanged();
+            }
+        }
+    };
+
     /**
      * Builds the window. The scene is a stack of layers, bottom to top: the 3D viewport, district labels, the HUD,
      * the hover tooltip and the toast. Every layer but the HUD is mouse-transparent and the HUD only picks on its
@@ -241,9 +297,12 @@ public final class DesktopApp extends Application {
         hud.setRight(inspector);
         Label hint = orbitHint;
         hint.getStyleClass().addAll("panel", "hint");
-        hud.setBottom(hint);
-        BorderPane.setAlignment(hint, Pos.CENTER);
-        BorderPane.setMargin(hint, new Insets(12, 0, 0, 0));
+        // The hint and the replay timeline share the bottom edge; only one of them is visible at a time.
+        StackPane bottom = new StackPane(hint, timeline());
+        bottom.setPickOnBounds(false);
+        hud.setBottom(bottom);
+        BorderPane.setAlignment(bottom, Pos.CENTER);
+        BorderPane.setMargin(bottom, new Insets(12, 0, 0, 0));
 
         Pane tooltipLayer = new Pane(tooltip);
         tooltipLayer.setMouseTransparent(true);
@@ -330,11 +389,16 @@ public final class DesktopApp extends Application {
         }
         heightBox.getSelectionModel().select(heightMetric);
         colorBox.getSelectionModel().select(colorMetric);
+        replayButton.setVisible(next.hasHistory());
+        replayButton.setManaged(next.hasHistory());
         boolean hasPulls = next.github() != null && next.github().pulls() != null;
         beaconsBox.setVisible(hasPulls);
         beaconsBox.setManaged(hasPulls);
         renderStats();
         city.setModel(next, live);
+        // With history, districts holding only types that no longer exist stay empty today: leave them out.
+        presentDistricts = next.hasHistory() ? next.districtsHolding(b -> !b.gone()) : null;
+        city.setDistrictsShown(presentDistricts);
         city.setBeaconsVisible(beaconsBox.isSelected());
         applyTheme();
         reheight(!live);
@@ -353,9 +417,22 @@ public final class DesktopApp extends Application {
         }
     }
 
-    /** Whether building {@code i} is shown; only test code can be hidden. */
+    /**
+     * Whether building {@code i} is shown: test code can be hidden, a type that exists only in history is hidden in the
+     * present-day view, and during replay only types present in the nearest snapshot count.
+     */
     private boolean visible(int i) {
-        return showTests || !model.buildings().get(i).type().test();
+        Building b = model.buildings().get(i);
+        if (!showTests && b.type().test()) {
+            return false;
+        }
+        return replay == null ? !b.gone() : b.hist().exists(replay.snapshot());
+    }
+
+    /** {@link #visible} in the present-day view, whether or not a replay is running. */
+    private boolean presentVisible(int i) {
+        Building b = model.buildings().get(i);
+        return (showTests || !b.type().test()) && !b.gone();
     }
 
     /**
@@ -366,21 +443,38 @@ public final class DesktopApp extends Application {
      * height 0, which also hides them from picking. Same formula as the web viewer.
      */
     private void reheight(boolean rise) {
+        if (replay != null) {
+            // The metric or the test filter changed: rescale (still on present-day values) and redraw the frame.
+            replayHeight = heightScale();
+            applyReplayFrame();
+            if (selected >= 0) {
+                city.showArcs(selected, this::visible);
+            }
+            return;
+        }
         List<Building> buildings = model.buildings();
-        double[] values = buildings.stream().filter(b -> visible(b.index()))
-                .mapToDouble(heightMetric.value).sorted().toArray();
-        double p95 = Math.max(1, values.length == 0 ? 1 : values[Math.min(values.length - 1, (int) (0.95 * (values.length - 1)))]);
-        double r = city.radius();
-        double scale = Math.min(16, Math.max(8, r * 0.2)) / p95;
+        double[] scale = heightScale();
         double[] heights = new double[buildings.size()];
         for (Building b : buildings) {
             heights[b.index()] = visible(b.index())
-                    ? Math.min(0.35 + heightMetric.value.applyAsDouble(b) * scale, r * 0.75) : 0;
+                    ? Math.min(0.35 + heightMetric.value.applyAsDouble(b) * scale[0], scale[1]) : 0;
         }
         city.setHeights(heights, rise);
         if (selected >= 0) {
             city.showArcs(selected, this::visible);
         }
+    }
+
+    /**
+     * The present-day height scale for the height metric, {units per metric unit, height cap}: the p95 of the buildings
+     * visible today and the city radius, as described at {@link #reheight}.
+     */
+    private double[] heightScale() {
+        double[] values = model.buildings().stream().filter(b -> presentVisible(b.index()))
+                .mapToDouble(heightMetric.value).sorted().toArray();
+        double p95 = Math.max(1, values.length == 0 ? 1 : values[Math.min(values.length - 1, (int) (0.95 * (values.length - 1)))]);
+        double r = city.radius();
+        return new double[]{Math.min(16, Math.max(8, r * 0.2)) / p95, r * 0.75};
     }
 
     /**
@@ -392,7 +486,12 @@ public final class DesktopApp extends Application {
      */
     private void recolor() {
         List<Building> buildings = model.buildings();
-        Look.Scale scale = Look.Scale.of(colorMetric, buildings);
+        // During replay the PR overlay has no history, so churn stands in for it; the scale stays the present-day one.
+        Look.ColorMetric metric = replay != null && colorMetric == Look.ColorMetric.PRS ? Look.ColorMetric.COMMITS
+                : colorMetric;
+        Look.Scale scale = Look.Scale.of(metric, buildings);
+        int k = replay == null ? -1 : replay.snapshot();
+        long time = replay == null ? 0 : model.history().get(k).time();
         BitSet related = new BitSet();
         if (selected >= 0) {
             Building s = buildings.get(selected);
@@ -403,7 +502,7 @@ public final class DesktopApp extends Application {
         Color[] colors = new Color[buildings.size()];
         for (Building b : buildings) {
             int i = b.index();
-            Color c = scale.color(b);
+            Color c = replay == null ? scale.color(b) : scale.color(b, metric.replayValue(b, k, time));
             boolean outOfSearch = matches != null && !matches.get(i);
             boolean outOfFocus = selected >= 0 && !related.get(i);
             if (outOfSearch || outOfFocus) {
@@ -424,7 +523,7 @@ public final class DesktopApp extends Application {
         if (i < 0) {
             inspector.hide();
         } else {
-            inspector.show(model, model.buildings().get(i), this::visible);
+            showInspector();
         }
         city.showArcs(i, this::visible);
         recolor();
@@ -571,7 +670,7 @@ public final class DesktopApp extends Application {
             reheight(false);
             recolor();
             if (selected >= 0) {
-                inspector.show(model, model.buildings().get(selected), this::visible);
+                showInspector();
             }
             if (!search.getText().isBlank()) {
                 runSearch(search.getText());
@@ -586,7 +685,8 @@ public final class DesktopApp extends Application {
         beaconsBox.setSelected(prefs.getBoolean("beacons", true));
         beaconsBox.setOnAction(e -> {
             prefs.putBoolean("beacons", beaconsBox.isSelected());
-            city.setBeaconsVisible(beaconsBox.isSelected());
+            // Beacons stay off during replay; leaving it applies the box.
+            city.setBeaconsVisible(beaconsBox.isSelected() && replay == null);
         });
 
         themeButton.setOnAction(e -> toggleTheme());
@@ -601,14 +701,19 @@ public final class DesktopApp extends Application {
             HBox.setHgrow(b, Priority.ALWAYS);
             ((Button) b).setMaxWidth(Double.MAX_VALUE);
         }
-        // Full width on its own row: four buttons side by side do not fit the panel.
-        walkButton.setMaxWidth(Double.MAX_VALUE);
+        // Their own row: four buttons side by side do not fit the panel. Replay only shows when there is history.
+        replayButton.setOnAction(e -> setReplaying(replay == null));
+        HBox modes = new HBox(6, walkButton, replayButton);
+        for (Node b : modes.getChildren()) {
+            HBox.setHgrow(b, Priority.ALWAYS);
+            ((ToggleButton) b).setMaxWidth(Double.MAX_VALUE);
+        }
 
         VBox box = new VBox(6,
                 styled(new Label("HEIGHT"), "caption"), heightBox,
                 spacer(8), styled(new Label("COLOUR"), "caption"), colorBox, legend,
                 spacer(8), testsBox, labelsBox, beaconsBox,
-                spacer(8), buttons, walkButton);
+                spacer(8), buttons, modes);
         box.getStyleClass().addAll("panel", "controls");
         box.setPrefWidth(236);
         box.setMaxWidth(236);
@@ -736,13 +841,23 @@ public final class DesktopApp extends Application {
             Building b = model.buildings().get(building);
             var t = b.type();
             StringBuilder sb = new StringBuilder(t.name()).append("  ·  ").append(t.kind()).append('\n')
-                    .append(t.packageName()).append('\n')
-                    .append(t.nom()).append(" methods · ").append(t.noa()).append(" attrs · ")
-                    .append(Look.fmt(t.loc())).append(" loc · cx ").append(t.complexity());
-            if (b.history() != null) {
-                sb.append(" · ").append(b.history().commits()).append(" commits");
+                    .append(t.packageName()).append('\n');
+            if (replay != null) {
+                // The nearest snapshot's values; "—" while the type does not exist in it (growing in or fading out).
+                int k = replay.snapshot();
+                TypeHistory h = b.hist();
+                sb.append(orDash(h.nom[k])).append(" methods · ").append(orDash(h.noa[k])).append(" attrs · ")
+                        .append(orDash(h.loc[k])).append(" loc · cx ").append(orDash(h.cx[k]))
+                        .append(" · ").append(h.commits[k]).append(" commits")
+                        .append(" · at ").append(day(model.history().get(k).time()));
+            } else {
+                sb.append(t.nom()).append(" methods · ").append(t.noa()).append(" attrs · ")
+                        .append(Look.fmt(t.loc())).append(" loc · cx ").append(t.complexity());
+                if (b.history() != null) {
+                    sb.append(" · ").append(b.history().commits()).append(" commits");
+                }
             }
-            if (b.prs().length > 0) {
+            if (b.prs().length > 0 && replay == null) {
                 sb.append(" · ").append(b.prs().length).append(" open PR").append(b.prs().length > 1 ? "s" : "");
             }
             text = sb.toString();
@@ -819,8 +934,8 @@ public final class DesktopApp extends Application {
     }
 
     /**
-     * Global shortcuts. Esc undoes one thing at a time: closes the result popup, else clears the selection, else
-     * clears the search, and always returns focus to the 3D view. The letter shortcuts are ignored while typing in a
+     * Global shortcuts. Esc undoes one thing at a time: closes the result popup, else leaves the history replay, else
+     * clears the selection, else clears the search, and always returns focus to the 3D view. The letter shortcuts are ignored while typing in a
      * text field or with Ctrl/Cmd/Alt held. While walking, movement keys are only recorded, Esc and G leave walk mode
      * (Esc then does nothing else), and '/' and F leave it before doing their usual thing. '/' is recognised by its key code or by the key's text;
      * {@link #swallowSlash} stops the same keystroke from being typed into the field it focuses.
@@ -841,6 +956,8 @@ public final class DesktopApp extends Application {
         if (e.getCode() == KeyCode.ESCAPE) {
             if (resultPopup.isShowing()) {
                 resultPopup.hide();
+            } else if (replay != null) {
+                setReplaying(false);
             } else if (selected >= 0) {
                 select(-1, false);
             } else if (!search.getText().isEmpty()) {
@@ -867,7 +984,28 @@ public final class DesktopApp extends Application {
             city.frameAll(true);
         } else if (e.getCode() == KeyCode.N) {
             toggleTheme();
+        } else if (e.getCode() == KeyCode.R && model.hasHistory()) {
+            setReplaying(replay == null);
+            e.consume();
+        } else if (replay != null) {
+            replayKey(e);
         }
+    }
+
+    /** Replay keys: P play/pause, comma/period previous/next snapshot, Home/End first/last snapshot. */
+    private void replayKey(KeyEvent e) {
+        switch (e.getCode()) {
+            case P -> replay.togglePlay();
+            case COMMA -> replay.step(-1);
+            case PERIOD -> replay.step(1);
+            case HOME -> replay.seek(0);
+            case END -> replay.seek(replay.count() - 1);
+            default -> {
+                return;
+            }
+        }
+        e.consume();
+        replayChanged();
     }
 
     /** Keys that move the walker; JavaFX reports key codes by layout, not physical position. */
@@ -897,7 +1035,7 @@ public final class DesktopApp extends Application {
             walkHint.setVisible(false);
         }
         pushWalkInput();
-        orbitHint.setVisible(!city.walking());
+        updateHints();
         crosshair.setVisible(city.walking());
         walkButton.setSelected(city.walking());
     }
@@ -911,6 +1049,192 @@ public final class DesktopApp extends Application {
 
     private boolean has(KeyCode a, KeyCode b) {
         return held.contains(a) || held.contains(b);
+    }
+
+    // ------------------------------------------------------------------ history replay
+
+    /** The orbit hint shows unless walking or replaying; the timeline bar shows exactly while replaying. */
+    private void updateHints() {
+        orbitHint.setVisible(!city.walking() && replay == null);
+        timeline.setVisible(replay != null);
+    }
+
+    /**
+     * The timeline bar: {@code [⏸/▶] [slider] date · sha · subject — author [speed] [Now]}. Dragging the slider seeks
+     * (and pauses); the speed button cycles through {@link Replay#SPEEDS}; Now leaves the replay.
+     */
+    private Node timeline() {
+        playButton.getStyleClass().add("icon-button");
+        playButton.setFocusTraversable(false);
+        playButton.setOnAction(e -> {
+            replay.togglePlay();
+            replayChanged();
+        });
+        slider.setMin(0);
+        slider.setPrefWidth(260);
+        slider.setFocusTraversable(false);
+        slider.valueProperty().addListener((o, was, now) -> {
+            if (!syncingSlider && replay != null) {
+                replay.seek(now.doubleValue());
+                replayChanged();
+            }
+        });
+        timelineText.getStyleClass().add("timeline-text");
+        timelineText.setPrefWidth(660);
+        timelineText.setMinWidth(200);
+        speedButton.setFocusTraversable(false);
+        speedButton.setOnAction(e -> {
+            replay.cycleSpeed();
+            syncTimeline();
+        });
+        Button now = new Button("Now");
+        now.setFocusTraversable(false);
+        now.setOnAction(e -> setReplaying(false));
+        timeline.getChildren().setAll(playButton, slider, timelineText, speedButton, now);
+        timeline.setAlignment(Pos.CENTER_LEFT);
+        timeline.getStyleClass().addAll("panel", "timeline");
+        timeline.setMaxWidth(Region.USE_PREF_SIZE);
+        timeline.setVisible(false);
+        return timeline;
+    }
+
+    /**
+     * Enters or leaves the history replay. Entering starts at snapshot 0 and plays; the height scale is taken from the
+     * present-day city at that moment, PR beacons are hidden and the timeline replaces the hint. Leaving restores the
+     * present-day city as it was before (heights animate back), dropping a selection of a type that no longer exists.
+     */
+    private void setReplaying(boolean on) {
+        if (on == (replay != null) || (on && !model.hasHistory())) {
+            replayButton.setSelected(replay != null);
+            return;
+        }
+        if (on) {
+            replayHeight = heightScale();
+            replay = new Replay(model.history().size());
+            replayShown = -1;
+            slider.setMax(Math.max(1, replay.count() - 1));
+            city.setBeaconsVisible(false);
+            replay.play();
+            replayTimer.start();
+            replayChanged();
+        } else {
+            replay = null;
+            replayTimer.stop();
+            city.setDistrictsShown(presentDistricts);
+            city.setBeaconsVisible(beaconsBox.isSelected());
+            if (selected >= 0 && !visible(selected)) {
+                select(-1, false);
+            }
+            reheight(false);
+            recolor();
+            if (selected >= 0) {
+                showInspector();
+            }
+            if (!search.getText().isBlank()) {
+                runSearch(search.getText());
+            }
+        }
+        replayButton.setSelected(replay != null);
+        updateHints();
+        tooltip.setVisible(false); // its values belong to the mode just left
+    }
+
+    /** Redraws after the replay position moved: the frame always, the snapshot-dependent state when it changed. */
+    private void replayChanged() {
+        applyReplayFrame();
+        applyReplaySnapshot();
+        syncTimeline();
+    }
+
+    /**
+     * Heights and footprints at the current position. The height metric is blended between snapshots {@code a} and
+     * {@code b} ({@link Replay#lerp}) and scaled with the present-day {@link #replayHeight}, with the usual 0.35 base;
+     * a building absent from both is hidden. The footprint blends the layout's side for the two attribute counts and
+     * stays centred on the lot. Hidden test code stays hidden.
+     */
+    private void applyReplayFrame() {
+        List<Building> buildings = model.buildings();
+        int a = replay.a();
+        int b = replay.b();
+        double f = replay.f();
+        double[] heights = new double[buildings.size()];
+        double[] sides = new double[buildings.size()];
+        for (Building x : buildings) {
+            if (!showTests && x.type().test()) {
+                continue;
+            }
+            int[] values = heightMetric.hist.apply(x.hist());
+            double v = Replay.lerp(values[a], values[b], f);
+            if (Double.isNaN(v)) {
+                continue;
+            }
+            int i = x.index();
+            heights[i] = Math.min(0.35 + v * replayHeight[0], replayHeight[1]);
+            double sa = Replay.side(x.hist().noa[a]);
+            sides[i] = sa + (Replay.side(x.hist().noa[b]) - sa) * f;
+        }
+        city.showFrame(heights, sides);
+    }
+
+    /**
+     * Everything that follows the nearest snapshot rather than the exact position, redone only when that snapshot
+     * changes: districts (shown when they hold a building existing then), colours, arcs, search results and the
+     * inspector.
+     */
+    private void applyReplaySnapshot() {
+        int k = replay.snapshot();
+        if (k == replayShown) {
+            return;
+        }
+        replayShown = k;
+        boolean[] shown = new boolean[model.districts().size()];
+        for (int d = 0; d < shown.length; d++) {
+            shown[d] = model.districtExists(d, k);
+        }
+        city.setDistrictsShown(shown);
+        if (!search.getText().isBlank()) {
+            runSearch(search.getText()); // also recolours
+        } else {
+            recolor();
+        }
+        if (selected >= 0) {
+            city.showArcs(selected, this::visible);
+            showInspector();
+        }
+    }
+
+    /** Play button, slider position, snapshot description and speed label. */
+    private void syncTimeline() {
+        if (replay == null) {
+            return;
+        }
+        playButton.setText(replay.playing() ? "❚❚" : "▶");
+        syncingSlider = true;
+        slider.setValue(replay.position());
+        syncingSlider = false;
+        Snapshot s = model.history().get(replay.snapshot());
+        String subject = s.subject().length() > 60 ? s.subject().substring(0, 59) + "…" : s.subject();
+        timelineText.setText(day(s.time()) + " · " + s.commit().substring(0, Math.min(7, s.commit().length()))
+                + " · " + subject + " — " + s.author());
+        double speed = replay.speed();
+        speedButton.setText((speed == Math.rint(speed) ? String.valueOf((int) speed) : String.valueOf(speed)) + "×");
+    }
+
+    /** The inspector for the selected building, with the replayed snapshot's values while replaying. */
+    private void showInspector() {
+        Building b = model.buildings().get(selected);
+        InspectorPane.ReplayAt at = replay == null ? null
+                : new InspectorPane.ReplayAt(replay.snapshot(), day(model.history().get(replay.snapshot()).time()));
+        inspector.show(model, b, this::visible, at);
+    }
+
+    /** A date as {@code YYYY-MM-DD} in the local time zone. */
+    private static String day(long epochSeconds) {
+        return LocalDate.ofInstant(Instant.ofEpochSecond(epochSeconds), ZoneId.systemDefault()).toString();
+    }
+
+    private static String orDash(int v) {
+        return v < 0 ? "—" : Look.fmt(v);
     }
 
     private void snapshot() {

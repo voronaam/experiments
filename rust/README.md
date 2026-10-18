@@ -51,6 +51,8 @@ referencing `Map`. The layout is a line-by-line port, so floating-point results 
 
 ## Desktop mode
 
+![The Rust edition's desktop window showing google/gson, with soft shadows](../docs/screenshots/desktop.png)
+
 `--gui` opens a native OpenGL window (three-d + egui) with the same features as the other viewers. Compared with the
 JavaFX window it adds:
 
@@ -58,6 +60,8 @@ JavaFX window it adds:
 * **The browser viewer's night look:** buildings glow in their own colour and office windows light up, via a custom
   shader.
 * **GPU picking**, and every building and district instanced, so even very large cities are a handful of draw calls.
+* **History replay** (`--history`, then `R`): watch the city grow commit by commit, as described in the
+  [main README](../README.md#history-replay).
 * **Walk mode** (`G`): walk through the city in first person, as described in the
   [main README](../README.md#walk-mode).
 

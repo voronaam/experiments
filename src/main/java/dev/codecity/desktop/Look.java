@@ -2,12 +2,14 @@ package dev.codecity.desktop;
 
 import dev.codecity.CityModel;
 import dev.codecity.CityModel.Building;
+import dev.codecity.history.TypeHistory;
 import javafx.scene.paint.Color;
 
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 import java.util.function.ToDoubleFunction;
 
 /**
@@ -118,19 +120,24 @@ final class Look {
         }
     }
 
-    /** What a building's height stands for. Heights are scaled in {@code DesktopApp.reheight}. */
+    /**
+     * What a building's height stands for. Heights are scaled in {@code DesktopApp.reheight}; {@code hist} picks the
+     * same metric's per-snapshot values for the history replay.
+     */
     enum HeightMetric {
-        NOM("Methods (NOM)", b -> b.type().nom()),
-        LOC("Lines of code", b -> b.type().loc()),
-        CX("Complexity (WMC)", b -> b.type().complexity()),
-        NOA("Attributes (NOA)", b -> b.type().noa());
+        NOM("Methods (NOM)", b -> b.type().nom(), h -> h.nom),
+        LOC("Lines of code", b -> b.type().loc(), h -> h.loc),
+        CX("Complexity (WMC)", b -> b.type().complexity(), h -> h.cx),
+        NOA("Attributes (NOA)", b -> b.type().noa(), h -> h.noa);
 
         final String label;
         final ToDoubleFunction<Building> value;
+        final Function<TypeHistory, int[]> hist;
 
-        HeightMetric(String label, ToDoubleFunction<Building> value) {
+        HeightMetric(String label, ToDoubleFunction<Building> value, Function<TypeHistory, int[]> hist) {
             this.label = label;
             this.value = value;
+            this.hist = hist;
         }
 
         @Override
@@ -197,6 +204,25 @@ final class Look {
             };
         }
 
+        /**
+         * The metric for building {@code b} as it was in replay snapshot {@code k} (author time {@code time}): the
+         * snapshot's metrics and its git counts, recency measured from the snapshot's time rather than from now. A
+         * type absent from the snapshot counts as 0 (and as dormant for recency). The open-PR metric has no history;
+         * the caller replaces it with churn during replay.
+         */
+        double replayValue(Building b, int k, long time) {
+            TypeHistory h = b.hist();
+            return switch (this) {
+                case COMMITS, PRS -> h.commits[k];
+                case AGE -> h.last[k] < 0 ? Double.POSITIVE_INFINITY : Math.max(0, (time - h.last[k]) / 86400.0);
+                case AUTHORS -> h.authors[k];
+                case CX -> Math.max(0, h.cx[k]);
+                case DENSITY -> h.nom[k] <= 0 ? 0 : (double) h.cx[k] / h.nom[k];
+                case LOC -> Math.max(0, h.loc[k]);
+                case KIND -> 0;
+            };
+        }
+
         String unavailableReason() {
             return requires == Requires.GIT ? " (no git)" : requires == Requires.PULLS ? " (no GitHub)" : "";
         }
@@ -217,12 +243,13 @@ final class Look {
     record Scale(ColorMetric metric, double lo, double hi) {
 
         /**
-         * Computes the scale over all buildings (hidden test code included). Infinite values are left out of the
-         * percentile. {@code hi} is at least 1 on a log scale (so {@code log1p(hi)} is never 0) and a tiny positive
+         * Computes the scale over all present-day buildings (hidden test code included, types that exist only in the
+         * history replay left out). Infinite values are left out of the percentile. {@code hi} is at least 1 on a log scale (so {@code log1p(hi)} is never 0) and a tiny positive
          * number on a linear one, which avoids dividing by zero.
          */
         static Scale of(ColorMetric metric, List<Building> buildings) {
-            double[] finite = buildings.stream().mapToDouble(metric.value).filter(Double::isFinite).sorted().toArray();
+            double[] finite = buildings.stream().filter(b -> !b.gone()).mapToDouble(metric.value)
+                    .filter(Double::isFinite).sorted().toArray();
             double p98 = finite.length == 0 ? 0 : finite[Math.min(finite.length - 1, (int) (0.98 * (finite.length - 1)))];
             double hi = Math.max(metric.linear ? 1e-6 : 1, p98);
             double lo = finite.length == 0 ? 0 : Math.min(finite[0], hi);
@@ -231,10 +258,14 @@ final class Look {
 
         /** Ramp colour of {@code b}: {@code log1p(v) / log1p(hi)} or {@code v / hi}, flipped for inverted metrics. */
         Color color(Building b) {
+            return color(b, metric.value.applyAsDouble(b));
+        }
+
+        /** Like {@link #color(Building)}, but for the value {@code v} instead of the building's present one. */
+        Color color(Building b, double v) {
             if (metric == ColorMetric.KIND) {
                 return kind(b.type().kind());
             }
-            double v = metric.value.applyAsDouble(b);
             double t;
             if (!Double.isFinite(v)) {
                 t = metric.invert ? 0 : 1;

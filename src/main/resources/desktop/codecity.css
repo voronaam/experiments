@@ -198,6 +198,13 @@
 .hint { -fx-padding: 6 12 6 12; -fx-text-fill: -cc-muted !important; -fx-font-size: 11.5px; -fx-background-radius: 999; -fx-border-radius: 999; }
 .toast { -fx-padding: 8 14 8 14; -fx-font-weight: bold; -fx-background-radius: 999; -fx-border-radius: 999; }
 
+/* ---------- history replay ---------- */
+.timeline { -fx-padding: 6 10 6 10; -fx-background-radius: 999; -fx-border-radius: 999; }
+.timeline-text { -fx-font-size: 12px; }
+.timeline .slider .track { -fx-background-color: -cc-input; -fx-background-radius: 3; -fx-pref-height: 5; }
+.timeline .slider .thumb { -fx-background-color: -cc-accent; -fx-background-radius: 999; -fx-padding: 6; }
+.replay-note { -fx-text-fill: -cc-accent !important; -fx-font-size: 12px; -fx-font-weight: bold; }
+
 /* ---------- source window ---------- */
 .source-window { -fx-background-color: #0d1117; }
 .source-title { -fx-text-fill: #c9d1d9; -fx-font-family: "JetBrains Mono", "Consolas", "Menlo", "DejaVu Sans Mono", monospace; -fx-font-size: 12px; }

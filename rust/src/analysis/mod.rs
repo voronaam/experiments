@@ -84,10 +84,21 @@ pub fn is_ignored_dir(name: &str) -> bool {
 
 /// Manifest file names whose content feeds into the parse of other files: a `.rs` file's crate name comes from the
 /// nearest `Cargo.toml`, a `.ts` file's project from the nearest `package.json`.
-const MANIFESTS: [&str; 2] = ["Cargo.toml", "package.json"];
+pub const MANIFESTS: [&str; 2] = ["Cargo.toml", "package.json"];
 
-/// Path, modification time and size of every manifest, sorted by path: when this changes, cached parses may be stale.
-type ManifestStamps = Vec<(PathBuf, Option<SystemTime>, u64)>;
+/// What every manifest contributes to the parse of other files (see [`manifest_stamp`]), sorted by path: when this
+/// changes, cached parses may be stale.
+type ManifestStamps = Vec<(PathBuf, Option<String>)>;
+
+/// A manifest's path plus what the analysers read from it, so the stamp changes exactly when a parse could: for a
+/// `Cargo.toml` the crate name it declares (the Rust analyser uses nothing else from it); a `package.json` matters
+/// only by existing (the TypeScript analyser only looks for one). An edit that only bumps a version or a dependency
+/// therefore keeps the parse cache, which matters for the history replay ([`crate::history`]), where such edits come
+/// with most snapshots.
+fn manifest_stamp(manifest: PathBuf) -> (PathBuf, Option<String>) {
+    let name = if manifest.file_name().is_some_and(|n| n == "Cargo.toml") { manifest.parent().and_then(rust_lang::read_crate_name) } else { None };
+    (manifest, name)
+}
 
 /// A cached parse result. The file counts as unchanged while both its modification time and its size match; the size
 /// catches rewrites within the timestamp resolution of the file system.
@@ -104,7 +115,8 @@ pub struct SourceAnalyzer {
     /// Absolute file path → last parse. Locked briefly by the rayon workers in `parse_cached`; never held while
     /// parsing, so workers do not serialise on it.
     cache: Mutex<HashMap<PathBuf, CacheEntry>>,
-    /// The manifests seen by the previous analysis. Any difference (edited, added, removed) empties `cache`.
+    /// The manifest stamps of the previous analysis. Any difference (a crate renamed, a manifest added or removed)
+    /// empties `cache`.
     manifests: Mutex<ManifestStamps>,
     /// Set once the first analyser panic has been reported, so a buggy analyser does not flood stderr.
     reported_failure: AtomicBool,
@@ -126,16 +138,10 @@ impl SourceAnalyzer {
         let (files, manifests) = find_sources(root);
         {
             let mut cache = self.cache.lock().unwrap();
-            // A changed manifest can change the parse of files that did not change themselves (their crate or
-            // project), so start over. Manifests rarely change, so dropping every language's parses is good enough.
-            let stamps: ManifestStamps = manifests
-                .into_iter()
-                .map(|m| {
-                    let meta = std::fs::metadata(&m).ok();
-                    let modified = meta.as_ref().and_then(|x| x.modified().ok());
-                    (m, modified, meta.map(|x| x.len()).unwrap_or(0))
-                })
-                .collect();
+            // A manifest change that matters (a crate renamed, a manifest added or removed) can change the parse of
+            // files that did not change themselves (their crate or project), so start over. Such changes are rare, so
+            // dropping every language's parses is good enough.
+            let stamps: ManifestStamps = manifests.into_iter().map(manifest_stamp).collect();
             let mut last = self.manifests.lock().unwrap();
             if *last != stamps {
                 cache.clear();

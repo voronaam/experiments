@@ -61,6 +61,7 @@
       <button id="btn-theme" title="Toggle day / night (N)">Night</button>
       <button id="btn-frame" title="Frame whole city (F)">Frame</button>
       <button id="btn-walk" title="Walk through the city (G)" aria-pressed="false">Walk</button>
+      <button id="btn-replay" title="Replay the city's growth commit by commit (R)" aria-pressed="false" hidden>Replay</button>
       <button id="btn-snapshot" title="Save a PNG">Snapshot</button>
     </section>
   </aside>
@@ -87,6 +88,13 @@
   <div class="hint">drag to orbit · right-drag to pan · scroll to zoom · click a building · <kbd>F</kbd> frame · <kbd>N</kbd> night · <kbd>Esc</kbd> clear</div>
   <div id="crosshair" class="crosshair" hidden></div>
   <div id="walk-hint" class="hint walk-hint" hidden><kbd>WASD</kbd> move · Mouse look · <kbd>Shift</kbd> run · <kbd>Space</kbd> jump · Click select · <kbd>G</kbd>/<kbd>Esc</kbd> exit</div>
+  <div id="timeline" class="timeline panel" hidden>
+    <button id="tl-play" class="tl-icon" title="Play / pause (P)" aria-label="Pause">❚❚</button>
+    <input id="tl-slider" type="range" min="0" max="0" step="any" value="0" aria-label="Snapshot">
+    <div id="tl-info" class="tl-info"></div>
+    <button id="tl-speed" class="tl-speed" title="Playback speed">1×</button>
+    <button id="tl-now" class="tl-now" title="Back to the present-day city (R / Esc)">Now</button>
+  </div>
   <div id="loading" class="loading"><div class="spinner"></div><span>Building city…</span></div>
 
   <script type="module" src="app.js"></script>

@@ -10,6 +10,10 @@
 // colour the metric colour (dimmed or highlighted by search, selection and hover). Picking raycasts against those
 // meshes and reads back hit.instanceId. Night mode patches the standard material's shader (makeBuildingMaterial) for
 // glow and lit windows. The desktop viewer (desktop/CityView3D.java) draws the same scene with JavaFX.
+//
+// History: a city exported with --history also holds every type that existed in one of its sampled commits. Types
+// that are gone today ("gone": true) stay hidden in the present-day city; the Replay mode (see the "history replay"
+// section, arithmetic in replay.js) plays the city's growth back commit by commit.
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
@@ -20,6 +24,7 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import * as Walk from './walk.js';
+import * as Replay from './replay.js';
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -45,7 +50,8 @@ const HEIGHT_METRICS = {
 
 const COLOR_METRICS = {
   commits: { label: 'Churn (commits)', git: true, get: (b) => b.commits ?? 0, lo: 'stable', hi: 'hot spot' },
-  age: { label: 'Recency', git: true, get: (b) => (b.last ? Math.max(0, (nowSec() - b.last) / DAY) : Infinity), invert: true, lo: 'dormant', hi: 'just changed', unit: 'd' },
+  // `now` is the moment recency is measured from: the present, or the snapshot's commit time during replay.
+  age: { label: 'Recency', git: true, get: (b, now = nowSec()) => (b.last ? Math.max(0, (now - b.last) / DAY) : Infinity), invert: true, lo: 'dormant', hi: 'just changed', unit: 'd' },
   authors: { label: 'Authors', git: true, get: (b) => b.authors ?? 0, lo: 'one owner', hi: 'many hands' },
   prs: { label: 'Open pull requests', github: true, get: (b) => b.prs?.length ?? 0, lo: 'none', hi: 'contested' },
   cx: { label: 'Complexity (WMC)', get: (b) => b.cx, lo: 'simple', hi: 'complex' },
@@ -162,6 +168,7 @@ let buildingMesh = null;
 let districtMesh = null;
 let baseColors = [];
 let heights = { cur: new Float32Array(0), from: new Float32Array(0), to: new Float32Array(0), t0: 0, dur: 0 };
+let sides = new Float32Array(0); // drawn footprint side per building: the lot's side, or the interpolated one during replay
 let arcs = [];
 let labelObjects = [];
 let cityRadius = 50;
@@ -236,8 +243,17 @@ function quantile(values, q) {
   return v[Math.min(v.length - 1, Math.floor(q * (v.length - 1)))];
 }
 
+// A building is shown when the test filter allows it and it exists: in the present-day city that is every type that
+// is not gone, during replay every type of snapshot round(p). Search, arcs and the inspector's dependency lists follow
+// this rule.
 function visible(b) {
-  return state.showTests || !b.test;
+  if (!state.showTests && b.test) return false;
+  return replay ? Replay.exists(b, replay.r) : !b.gone;
+}
+
+// Visibility in the present-day city, whatever mode the viewer is in; the height and colour scales are based on it.
+function presentVisible(b) {
+  return (state.showTests || !b.test) && !b.gone;
 }
 
 // ---------------------------------------------------------------- building the city
@@ -261,20 +277,12 @@ function buildCity(city, { previousHeights = null } = {}) {
   for (const l of labelObjects) l.removeFromParent();
   labelObjects = [];
 
-  const P = city.platform;
-  const tmp = new THREE.Object3D();
-
   // Districts: stacked platforms, one level per package nesting depth.
   // An InstancedMesh needs at least one instance slot; `count` then hides the unused one for an empty city.
   districtMesh = new THREE.InstancedMesh(unitBox, districtMaterial, Math.max(1, city.districts.length));
   districtMesh.count = city.districts.length;
-  city.districts.forEach((d, i) => {
-    tmp.position.set(d.x, d.depth * P, d.z);
-    tmp.scale.set(d.w, P, d.d);
-    tmp.updateMatrix();
-    districtMesh.setMatrixAt(i, tmp.matrix);
-    districtMesh.setColorAt(i, new THREE.Color(0xffffff));
-  });
+  city.districts.forEach((d, i) => districtMesh.setColorAt(i, new THREE.Color(0xffffff)));
+  writeDistrictMatrices();
   districtMesh.receiveShadow = true;
   districtMesh.castShadow = true;
   cityGroup.add(districtMesh);
@@ -296,6 +304,8 @@ function buildCity(city, { previousHeights = null } = {}) {
 
   heights = { cur: new Float32Array(n), from: new Float32Array(n), to: new Float32Array(n), t0: 0, dur: 0 };
   city.buildings.forEach((b, i) => { heights.cur[i] = oldHeights.get(b.id) ?? 0; });
+  sides = Float32Array.from(city.buildings, (b) => b.side);
+  $('#btn-replay').hidden = !Replay.hasHistory(city);
 
   // Lights, shadows, fog and ground scale with the city.
   cityRadius = Math.max(20, Math.hypot(city.width, city.depth) / 2);
@@ -329,16 +339,42 @@ function buildCity(city, { previousHeights = null } = {}) {
   if ($('#search').value) runSearch($('#search').value);
 }
 
+// Writes every district platform's instance matrix. A hidden district gets a zero scale: in the present-day city one
+// that only holds gone types (types 0), during replay one without an existing building in snapshot round(p).
+function writeDistrictMatrices() {
+  const { districts, platform: P } = state.city;
+  const tmp = new THREE.Object3D();
+  districts.forEach((d, i) => {
+    const shown = districtShown(i);
+    tmp.position.set(d.x, d.depth * P, d.z);
+    tmp.scale.set(shown ? d.w : 0, shown ? P : 0.0001, shown ? d.d : 0);
+    tmp.updateMatrix();
+    districtMesh.setMatrixAt(i, tmp.matrix);
+  });
+  districtMesh.instanceMatrix.needsUpdate = true;
+  districtMesh.computeBoundingSphere();
+  districtMesh.computeBoundingBox();
+}
+
+function districtShown(i) {
+  const d = state.city.districts[i];
+  return replay ? d.hist?.[replay.r] !== 0 : d.types > 0;
+}
+
+// Labels the largest districts at depth 1–2 that hold types: in the present-day city those with present types, during
+// replay those visible in snapshot round(p) (rebuilt whenever that snapshot changes), with the same placement rules.
 function buildLabels() {
+  for (const l of labelObjects) l.removeFromParent();
+  labelObjects = [];
   const city = state.city;
   const P = city.platform;
   const candidates = city.districts
     .map((d, i) => ({ d, i }))
-    .filter(({ d }) => d.depth >= 1 && d.depth <= 2 && d.types > 0)
+    .filter(({ d, i }) => d.depth >= 1 && d.depth <= 2 && (replay ? districtShown(i) : d.types > 0))
     .sort((a, b) => b.d.w * b.d.d - a.d.w * a.d.d)
     .slice(0, 24);
   const anchors = [];
-  for (const { d } of candidates) {
+  for (const { d, i } of candidates) {
     // A district whose only content is one sub-district shares its front edge; label just one of them.
     if (anchors.some((a) => Math.abs(a.x - d.x) < 8 && Math.abs(a.z - (d.z + d.d / 2)) < 3) || anchors.length >= 16) continue;
     anchors.push({ x: d.x, z: d.z + d.d / 2 });
@@ -348,6 +384,7 @@ function buildLabels() {
     const obj = new CSS2DObject(el);
     obj.position.set(d.x, (d.depth + 1) * P + 0.2, d.z + d.d / 2);
     obj.center.set(0.5, 0);
+    obj.userData.district = i;
     cityGroup.add(obj);
     labelObjects.push(obj);
   }
@@ -355,21 +392,34 @@ function buildLabels() {
 }
 
 // District labels are HTML on top of the canvas, so at street level they would show through the buildings; walk
-// mode hides them regardless of the setting.
+// mode hides them regardless of the setting. During replay a hidden district's label is hidden with it.
 function setLabelsVisible(on) {
-  for (const l of labelObjects) l.visible = on && !walk;
+  for (const l of labelObjects) l.visible = on && !walk && districtShown(l.userData.district);
+}
+
+// Height per unit of the height metric: the 95th percentile of the present-day city's visible buildings maps to 8–16
+// units, depending on the city's size. Replay keeps using this present-day scale, so the city visibly grows.
+function presentHeightScale() {
+  const metric = HEIGHT_METRICS[state.heightKey];
+  const values = state.city.buildings.filter(presentVisible).map(metric.get);
+  const p95 = Math.max(1, quantile(values, 0.95));
+  return Math.min(16, Math.max(8, cityRadius * 0.2)) / p95;
+}
+
+function heightFor(value, scale) {
+  return Math.min(0.35 + value * scale, cityRadius * 0.75);
 }
 
 /** Recomputes target heights for the current metric and animates the skyline towards them. */
 function updateHeights(rise = false) {
   const { buildings } = state.city;
   const metric = HEIGHT_METRICS[state.heightKey];
-  const values = buildings.filter(visible).map(metric.get);
-  const p95 = Math.max(1, quantile(values, 0.95));
-  const scale = Math.min(16, Math.max(8, cityRadius * 0.2)) / p95;
+  const scale = presentHeightScale();
+  // During replay the heights come from the timeline; a new metric or test filter only changes the scale.
+  if (replay) { replay.scale = scale; applyReplay(); return; }
   heights.from = rise ? new Float32Array(buildings.length) : heights.cur.slice();
   buildings.forEach((b, i) => {
-    heights.to[i] = visible(b) ? Math.min(0.35 + metric.get(b) * scale, cityRadius * 0.75) : 0;
+    heights.to[i] = visible(b) ? heightFor(metric.get(b), scale) : 0;
   });
   heights.t0 = performance.now();
   heights.dur = rise ? 1400 : 650;
@@ -406,7 +456,7 @@ function writeBuildingMatrices() {
   for (let i = 0; i < buildings.length; i++) {
     const b = buildings[i];
     const h = heights.cur[i];
-    const s = h > 0.001 ? b.side : 0;
+    const s = h > 0.001 ? sides[i] : 0;
     mtx.compose(pos.set(b.x, b.y, b.z), quat, scl.set(s, Math.max(h, 0.0001), s));
     buildingMesh.setMatrixAt(i, mtx);
   }
@@ -419,17 +469,21 @@ function rampColor(t) {
   return new THREE.Color(RAMP[i]).lerp(new THREE.Color(RAMP[i + 1]), x - i);
 }
 
-/** Maps the colour metric onto every building, using a log scale clipped at the 98th percentile. */
+/**
+ * Maps the colour metric onto every building, using a log scale clipped at the 98th percentile of the present-day
+ * city. During replay the scale stays the present-day one, but the values are those of snapshot round(p) (recency
+ * measured from that snapshot's commit time), and the open-PR mode falls back to churn.
+ */
 function updateColors() {
   const { buildings } = state.city;
-  const key = state.colorKey;
+  const key = replay && state.colorKey === 'prs' ? 'commits' : state.colorKey;
   const metric = COLOR_METRICS[key];
   if (metric.categorical) {
     baseColors = buildings.map((b) => new THREE.Color(KINDS[b.kind] || KINDS.class));
     renderLegend({ categorical: true });
   } else {
-    const values = buildings.map(metric.get);
-    const finite = values.filter(Number.isFinite);
+    const present = buildings.map((b) => (b.gone ? NaN : metric.get(b)));
+    const finite = present.filter(Number.isFinite);
     const hi = Math.max(metric.linear ? 1e-6 : 1, quantile(finite, 0.98));
     const lo = finite.reduce((m, v) => Math.min(m, v), hi);
     const norm = (v) => {
@@ -437,6 +491,11 @@ function updateColors() {
       const t = metric.linear ? v / hi : Math.log1p(v) / Math.log1p(hi);
       return metric.invert ? 1 - t : t;
     };
+    let values = present;
+    if (replay) {
+      const time = replay.snapshots[replay.r].time;
+      values = buildings.map((b) => metric.get(Replay.valuesAt(b, replay.r), time));
+    }
     baseColors = values.map((v) => rampColor(norm(v)));
     renderLegend({ lo, hi, metric });
   }
@@ -641,6 +700,7 @@ function renderInspector() {
       ${metric(out.length + ' / ' + inc.length, 'uses / used by')}
       ${hasGit ? metric(b.commits ?? 0, 'commits') + metric(b.authors ?? 0, 'authors') + metric(relTime(b.last), 'last change') : ''}
     </div>
+    <div id="inspector-replay"></div>
     <div class="file-link"><span title="${esc(b.file)}:${b.line}">${esc(b.file)}:${b.line}</span>${live ? '<button id="view-source">Source</button>' : ''}</div>
     ${renderGitHubSection(b)}
     ${b.methods.length ? `<h3><span>Methods by complexity</span><span>${b.nom}</span></h3>
@@ -655,11 +715,31 @@ function renderInspector() {
     <div class="deps">${out.map((j) => depChip(j, 'out')).join('') || '<span class="muted">nothing in this project</span>'}</div>
     <h3><span>Used by</span><span>${inc.length}</span></h3>
     <div class="deps">${inc.map((j) => depChip(j, 'in')).join('') || '<span class="muted">no project types</span>'}</div>`;
+  renderReplayNote();
   el.hidden = false;
   el.scrollTop = 0;
   $('#inspector-close').onclick = () => select(-1);
   $('#view-source')?.addEventListener('click', () => openSource(i));
   el.querySelectorAll('.dep').forEach((d) => d.addEventListener('click', () => select(+d.dataset.idx)));
+}
+
+// The inspector's replay box: the selected type's metrics in snapshot round(p). It is redrawn on its own whenever the
+// snapshot changes, so the rest of the inspector (and its scroll position) stays put during playback.
+function renderReplayNote() {
+  const el = $('#inspector-replay');
+  if (!el) return;
+  if (!replay || state.selected < 0) { el.innerHTML = ''; return; }
+  const b = state.city.buildings[state.selected];
+  const date = Replay.formatDate(replay.snapshots[replay.r].time);
+  const metric = (v, l) => `<div class="metric"><b>${v}</b><span>${l}</span></div>`;
+  const v = Replay.valuesAt(b, replay.r);
+  el.innerHTML = `<div class="replay-note">
+      ${b.gone ? '<span class="gone">Removed before today</span>' : ''}
+      <span>Replaying — values at ${date}</span>
+      ${Replay.exists(b, replay.r)
+        ? `<div class="metrics">${metric(v.nom, 'methods')}${metric(v.noa, 'attributes')}${metric(fmt(v.loc), 'lines of code')}${metric(v.cx, 'complexity')}</div>`
+        : '<div class="muted">Not in this snapshot</div>'}
+    </div>`;
 }
 
 let toastTimer = 0;
@@ -711,12 +791,12 @@ scene.add(marker);
 
 function placeSelectionMarker() {
   const i = state.selected;
-  marker.visible = i >= 0;
-  if (i < 0) return;
+  marker.visible = i >= 0 && heights.cur[i] > 0.001;
+  if (!marker.visible) return;
   const b = state.city.buildings[i];
   const h = heights.cur[i];
   marker.position.set(b.x, b.y - 0.02, b.z);
-  marker.scale.set(b.side + 0.25, h + 0.25, b.side + 0.25);
+  marker.scale.set(sides[i] + 0.25, h + 0.25, sides[i] + 0.25);
   marker.material.color.set(state.theme === 'night' ? 0xffffff : 0x111827);
 }
 
@@ -739,8 +819,8 @@ function buildBeacons() {
 
 function stepBeacons(now) {
   if (!beaconMesh) return;
-  beaconMesh.visible = state.beacons;
-  if (!state.beacons) return;
+  beaconMesh.visible = state.beacons && !replay; // open PRs belong to today, not to the replayed past
+  if (!beaconMesh.visible) return;
   const t = now / 1000;
   beaconIndices.forEach((i, k) => {
     const b = state.city.buildings[i];
@@ -892,8 +972,11 @@ function showTooltip(target, x, y) {
   let html;
   if (target.type === 'building') {
     const b = state.city.buildings[target.index];
+    // During replay: the values of snapshot round(p), dated, and no open PRs.
+    const v = replay ? Replay.valuesAt(b, replay.r) : b;
+    const at = replay ? `<span class="t-at">· at ${Replay.formatDate(replay.snapshots[replay.r].time)}</span>` : '';
     html = `<b>${esc(b.name)}</b> <span class="t-pkg">${b.kind}</span><div class="t-pkg">${esc(b.pkg)}</div>
-      <div class="t-row"><span>${b.nom} methods</span><span>${b.noa} attrs</span><span>${fmt(b.loc)} loc</span><span>cx ${b.cx}</span>${b.commits != null ? `<span>${b.commits} commits</span>` : ''}${b.prs ? `<span class="t-pr">${b.prs.length} open PR${b.prs.length > 1 ? 's' : ''}</span>` : ''}</div>`;
+      <div class="t-row"><span>${v.nom} methods</span><span>${v.noa} attrs</span><span>${fmt(v.loc)} loc</span><span>cx ${v.cx}</span>${b.commits != null ? `<span>${v.commits} commits</span>` : ''}${b.prs && !replay ? `<span class="t-pr">${b.prs.length} open PR${b.prs.length > 1 ? 's' : ''}</span>` : ''}${at}</div>`;
   } else {
     const d = state.city.districts[target.index];
     if (d.depth === 0) { tooltip.hidden = true; return; }
@@ -964,7 +1047,8 @@ const resultsEl = $('#search-results');
 let results = [];
 let activeResult = 0;
 
-function runSearch(q) {
+// `show` opens the result list; replay re-runs the search on every snapshot change without opening it.
+function runSearch(q, { show = true } = {}) {
   q = q.trim().toLowerCase();
   if (q.length < 2) {
     state.matches = null;
@@ -989,7 +1073,7 @@ function runSearch(q) {
   state.matches = new Set(scored.map((s) => s.i));
   results = scored.slice(0, 12).map((s) => s.i);
   activeResult = 0;
-  renderResults();
+  if (show) renderResults();
   paintBuildings();
 }
 
@@ -1055,6 +1139,11 @@ function bindControls() {
   $('#btn-theme').addEventListener('click', toggleTheme);
   $('#btn-frame').addEventListener('click', () => frameAll());
   $('#btn-walk').addEventListener('click', toggleWalk);
+  $('#btn-replay').addEventListener('click', toggleReplay);
+  $('#tl-play').addEventListener('click', toggleReplayPlaying);
+  $('#tl-speed').addEventListener('click', cycleReplaySpeed);
+  $('#tl-now').addEventListener('click', exitReplay);
+  $('#tl-slider').addEventListener('input', (e) => seekReplay(+e.target.value));
   $('#btn-snapshot').addEventListener('click', snapshot);
   $('#source-close').addEventListener('click', closeSource);
   $('#source-modal').addEventListener('click', (e) => { if (e.target.id === 'source-modal') closeSource(); });
@@ -1076,13 +1165,15 @@ function snapshot() {
 }
 
 addEventListener('keydown', (e) => {
-  const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement;
+  // The timeline slider keeps focus after a drag; it is no text field, so the shortcuts still apply.
+  const typing = (e.target instanceof HTMLInputElement && e.target.type !== 'range') || e.target instanceof HTMLSelectElement;
   if (e.key === 'Escape') {
     // Esc leaves walk mode and does nothing else (the selection stays). The browser may also release the pointer
     // lock for this key press and so end walk mode first; the time check keeps that same press from clearing.
     if (walk) { exitWalk(); return; }
     if (performance.now() - walkExitedAt < 300) return;
     if (!$('#source-modal').hidden) closeSource();
+    else if (replay && !typing) exitReplay();
     else if (state.selected >= 0) select(-1);
     else if (searchInput.value) { searchInput.value = ''; runSearch(''); }
     return;
@@ -1094,6 +1185,8 @@ addEventListener('keydown', (e) => {
     walk.keys.add(e.code);
     return;
   }
+  if (e.code === 'KeyR') { toggleReplay(); return; }
+  if (replay && replayKey(e)) { e.preventDefault(); return; }
   if (e.key === '/') { exitWalk(); e.preventDefault(); searchInput.focus(); searchInput.select(); }
   else if (e.key === 'f' || e.key === 'F') { exitWalk(); frameAll(); }
   else if (e.key === 'n' || e.key === 'N') toggleTheme();
@@ -1136,6 +1229,7 @@ function enterWalk() {
   flight = null;
   const saved = { position: camera.position.clone(), target: controls.target.clone(), fov: camera.fov, near: camera.near };
   const world = Walk.makeWorld(state.city, heights.cur);
+  syncWalkSolids(world);
   let player;
   if (state.selected >= 0) {
     // On the street in front of the selected building, looking at it (yaw 0 looks towards −z).
@@ -1234,6 +1328,7 @@ function stepWalk(dt) {
   } else {
     Walk.updateHeights(walk.world, state.city, heights.cur);
   }
+  syncWalkSolids(walk.world);
   const k = walk.keys;
   const input = {
     forward: k.has('KeyW') || k.has('ArrowUp'),
@@ -1259,6 +1354,182 @@ function stepWalk(dt) {
   } else {
     showTooltip(null);
   }
+}
+
+// walk.js builds its boxes from the lots and the platforms. Footprints and districts change during replay, so this
+// copies the drawn sides into the building boxes and flattens the platforms of hidden districts (top 0 neither blocks
+// nor carries the player). Outside replay it writes back the lots and platforms as they are.
+function syncWalkSolids(world) {
+  const { buildings, districts, platform } = state.city;
+  world.buildingBoxes.forEach((box, i) => {
+    const b = buildings[i], half = sides[i] / 2;
+    box.minX = b.x - half; box.maxX = b.x + half;
+    box.minZ = b.z - half; box.maxZ = b.z + half;
+  });
+  world.boxes.forEach((box, i) => { box.top = districtShown(i) ? (districts[i].depth + 1) * platform : 0; });
+}
+
+// ---------------------------------------------------------------- history replay
+//
+// Replay (R or the Replay button, shown only when the city has a history) plays the city's growth over its sampled
+// commits. The playback position p runs continuously from 0 to S − 1, one snapshot per 0.8 s at 1×, and stops at the
+// end. Every frame in which p changes, applyReplay sets each building's height and footprint from the interpolated
+// metrics (replay.js) on the present-day height scale; when round(p) moves to another snapshot, the colours, district
+// visibility, labels, search matches, arcs and the inspector's replay box follow. The timeline bar at the bottom shows
+// the snapshot round(p) and offers play/pause, a slider, the speed and Now. Leaving (R, Esc, Now) restores the
+// present-day city: the heights animate back as after a metric change, everything else switches at once. The desktop
+// viewers implement the same rules (desktop/Replay.java, gui/replay.rs, gui/replay.d).
+
+let replay = null; // { snapshots, count, p, playing, speed (index into SPEEDS), r, scale, arcsAt } while replaying
+
+function toggleReplay() {
+  if (replay) exitReplay();
+  else enterReplay();
+}
+
+function enterReplay() {
+  if (!state.city || replay || !Replay.hasHistory(state.city)) return;
+  const snapshots = state.city.history.snapshots;
+  replay = { snapshots, count: snapshots.length, p: 0, playing: true, speed: 0, r: -1, scale: presentHeightScale(), arcsAt: 0 };
+  heights.dur = 0; // a running height animation would fight the timeline
+  $('#tl-slider').max = String(replay.count - 1);
+  $('#tl-speed').textContent = `${Replay.SPEEDS[0]}×`;
+  document.body.classList.add('replaying');
+  $('#btn-replay').classList.add('active');
+  $('#btn-replay').setAttribute('aria-pressed', 'true');
+  $('#timeline').hidden = false;
+  showTooltip(null);
+  applyReplay();
+}
+
+function exitReplay() {
+  if (!replay) return;
+  replay = null;
+  document.body.classList.remove('replaying');
+  $('#btn-replay').classList.remove('active');
+  $('#btn-replay').setAttribute('aria-pressed', 'false');
+  $('#timeline').hidden = true;
+  showTooltip(null);
+  state.city.buildings.forEach((b, i) => { sides[i] = b.side; });
+  writeDistrictMatrices();
+  buildLabels();
+  updateHeights();
+  updateColors();
+  // A type that is gone (or otherwise not in the present-day city) cannot stay selected.
+  if (state.selected >= 0 && !visible(state.city.buildings[state.selected])) select(-1);
+  else if (state.selected >= 0) { renderInspector(); buildArcs(); placeSelectionMarker(); }
+  if (searchInput.value) runSearch(searchInput.value, { show: document.activeElement === searchInput });
+}
+
+/** Shows the city at the current position p; see the section comment. */
+function applyReplay() {
+  const fr = Replay.frame(replay.p, replay.count);
+  const { buildings } = state.city;
+  const key = state.heightKey;
+  for (let i = 0; i < buildings.length; i++) {
+    const b = buildings[i];
+    const v = state.showTests || !b.test ? Replay.lerpMetric(b.hist[key], fr) : null;
+    heights.cur[i] = v === null ? 0 : heightFor(v, replay.scale);
+    sides[i] = v === null ? 0 : Replay.lerpSide(b.hist.noa, fr);
+  }
+  heights.to.set(heights.cur); // flyToBuilding aims at heights.to
+  writeBuildingMatrices();
+  buildingMesh.computeBoundingSphere(); // picking tests these first, see stepHeights
+  buildingMesh.computeBoundingBox();
+  placeSelectionMarker();
+  const now = performance.now();
+  if (fr.r !== replay.r) {
+    replay.r = fr.r;
+    replay.arcsAt = now;
+    snapshotChanged();
+  } else if (state.selected >= 0 && now - replay.arcsAt > 150) {
+    // The roofs move between snapshots; rebuilding up to 400 tubes every frame is too much, a few times a second is not.
+    replay.arcsAt = now;
+    buildArcs();
+  }
+  updateTimeline();
+}
+
+// Everything that depends on the snapshot round(p) rather than on the continuous position.
+function snapshotChanged() {
+  writeDistrictMatrices();
+  buildLabels();
+  updateColors();
+  buildArcs();
+  renderReplayNote();
+  if (searchInput.value) runSearch(searchInput.value, { show: false });
+  refreshTooltip();
+  const s = replay.snapshots[replay.r];
+  $('#tl-info').innerHTML = `<b>${Replay.formatDate(s.time)}</b> · <code>${esc(Replay.shortSha(s.commit))}</code> · `
+    + `${esc(Replay.truncateSubject(s.subject))} — ${esc(s.author)}`;
+  $('#tl-info').title = `${s.subject}\n${s.author} · ${s.commit} · ${s.types} types`;
+}
+
+// The hover tooltip shows the values of snapshot round(p); redraw it in place for the building under the pointer (or
+// the crosshair while walking) when the snapshot changes under a still mouse.
+function refreshTooltip() {
+  if (tooltip.hidden) return;
+  if (walk) {
+    if (state.hovered < 0) return;
+    const { left, top } = tooltip.style;
+    showTooltip({ type: 'building', index: state.hovered }, 0, 0);
+    tooltip.style.left = left;
+    tooltip.style.top = top;
+  } else if (pointer) {
+    showTooltip(pick(pointer.x, pointer.y), pointer.x, pointer.y);
+  }
+}
+
+function updateTimeline() {
+  const slider = $('#tl-slider');
+  if (+slider.value !== replay.p) slider.value = String(replay.p);
+  const play = $('#tl-play');
+  play.textContent = replay.playing ? '❚❚' : '▶'; // not ⏸, which some fonts lack
+  play.setAttribute('aria-label', replay.playing ? 'Pause' : 'Play');
+}
+
+// One frame of playback; it stops (pauses) at the last snapshot.
+function stepReplay(dt) {
+  if (!replay.playing) return;
+  replay.p = Replay.advance(replay.p, dt, Replay.SPEEDS[replay.speed], replay.count);
+  if (replay.p >= replay.count - 1) replay.playing = false;
+  applyReplay();
+}
+
+// Play / pause; playing from the end starts over at the first snapshot.
+function toggleReplayPlaying() {
+  if (!replay) return;
+  if (replay.playing) replay.playing = false;
+  else {
+    if (replay.p >= replay.count - 1) replay.p = 0;
+    replay.playing = replay.count > 1;
+  }
+  applyReplay();
+}
+
+// Moves to position p and pauses (slider, step keys, Home / End).
+function seekReplay(p) {
+  if (!replay) return;
+  replay.p = Replay.clampPosition(p, replay.count);
+  replay.playing = false;
+  applyReplay();
+}
+
+function cycleReplaySpeed() {
+  if (!replay) return;
+  replay.speed = (replay.speed + 1) % Replay.SPEEDS.length;
+  $('#tl-speed').textContent = `${Replay.SPEEDS[replay.speed]}×`;
+}
+
+// The replay keys (R and Esc are handled with the other global keys). Returns whether the key was used.
+function replayKey(e) {
+  if (e.code === 'KeyP') toggleReplayPlaying();
+  else if (e.key === ',') seekReplay(Replay.stepPosition(replay.p, -1, replay.count));
+  else if (e.key === '.') seekReplay(Replay.stepPosition(replay.p, 1, replay.count));
+  else if (e.key === 'Home') seekReplay(0);
+  else if (e.key === 'End') seekReplay(replay.count - 1);
+  else return false;
+  return true;
 }
 
 // ---------------------------------------------------------------- live updates
@@ -1295,6 +1566,7 @@ function loop() {
   stepHeights(now);
   stepArcs(dt);
   stepBeacons(now);
+  if (replay) stepReplay(frameTime); // replay.js caps the frame time itself (MAX_FRAME)
   // While walking the camera belongs to stepWalk; OrbitControls.update would turn it back towards its target.
   // walk.js caps the frame time itself (MAX_FRAME) and substeps it.
   if (walk) stepWalk(frameTime);

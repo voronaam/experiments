@@ -260,7 +260,8 @@ impl ColorMetric {
 
 /// Colour scale for a metric: log-scaled and clipped at the 98th percentile.
 ///
-/// The range is computed over the current model's buildings. `hi` is the 98th percentile rather than the maximum,
+/// The range is computed over the current model's present-day buildings (not the gone ones of a history replay, which
+/// keeps this scale during playback). `hi` is the 98th percentile rather than the maximum,
 /// so a few extreme outliers do not push every other building into the bottom of the ramp; everything above `hi`
 /// gets the top colour. Colours always start at 0, not at `lo`: `lo` (the smallest finite value) is only shown at
 /// the left end of the legend. The Java and D viewers compute the same scale.
@@ -276,6 +277,7 @@ impl Scale {
         let mut finite: Vec<f64> = model
             .buildings
             .iter()
+            .filter(|b| !b.gone)
             .map(|b| metric.value(&model.types()[b.index], b))
             .filter(|v| v.is_finite())
             .collect();
@@ -292,10 +294,15 @@ impl Scale {
     /// The colour of one building. Log metrics use `ln(1 + v) / ln(1 + hi)`, which handles 0 and keeps small
     /// counts apart; linear metrics use `v / hi`. Results above 1 are clamped by [`ramp`].
     pub fn color(&self, t: &TypeInfo, b: &Building) -> Srgba {
+        self.color_of(self.metric.value(t, b), t.kind)
+    }
+
+    /// The colour for a raw metric value `v` (see [`ColorMetric::value`]) of a type of kind `kind`; the history
+    /// replay passes a snapshot's value here.
+    pub fn color_of(&self, v: f64, kind: &str) -> Srgba {
         if self.metric == ColorMetric::Kind {
-            return kind_color(t.kind);
+            return kind_color(kind);
         }
-        let v = self.metric.value(t, b);
         // An infinite value (only the age of a type without history) goes to the cold end of the ramp after
         // inversion: 0 for recency, 1 for anything else.
         let mut x = if !v.is_finite() {

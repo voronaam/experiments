@@ -78,8 +78,9 @@ pub struct Layout {
 
 /// Side length of a building's square footprint. It grows with the square root of the attribute count, so the
 /// footprint area grows roughly linearly with it, and even a type without attributes gets a visible 1.2 × 1.2 lot.
-pub fn side(t: &TypeInfo) -> f64 {
-    1.2 + 0.8 * (t.noa as f64).sqrt()
+/// The history replay also sizes buildings with it, for each snapshot's attribute count.
+pub fn side_of_noa(noa: u32) -> f64 {
+    1.2 + 0.8 * (noa as f64).sqrt()
 }
 
 /// A district while the layout is being computed. It borrows the types (`'a` is the lifetime of the slice passed to
@@ -92,8 +93,8 @@ struct Node<'a> {
     /// Sub-districts by label. A sorted map keeps the layout independent of the order types were found in, and its
     /// iteration order is what the indices in [`Ref::Child`] count in.
     children: BTreeMap<String, Node<'a>>,
-    /// Types declared directly in this district (not in its sub-districts).
-    types: Vec<&'a TypeInfo>,
+    /// Types declared directly in this district (not in its sub-districts), each with its footprint side.
+    types: Vec<(&'a TypeInfo, f64)>,
     /// A build module (Maven/Gradle module, npm project, crate). Modules are never merged into their parent.
     module: bool,
     /// How this district's name joins with a collapsed child's: ".", "/" or "::".
@@ -137,7 +138,13 @@ struct Item {
 
 /// Lays out `types` as a city named `city_name` (the label of the root district).
 pub fn layout(city_name: &str, types: &[TypeInfo]) -> Layout {
-    let mut root = build_tree(city_name, types);
+    layout_with_noa(city_name, types, |t| t.noa)
+}
+
+/// [`layout`], with each footprint sized for the attribute count `noa(t)` instead of `t.noa`. The history replay
+/// passes a type's largest count over the present and every snapshot, so the lot fits the building at its widest.
+pub fn layout_with_noa(city_name: &str, types: &[TypeInfo], noa: impl Fn(&TypeInfo) -> u32) -> Layout {
+    let mut root = build_tree(city_name, types, &noa);
     measure(&mut root);
     let mut districts = vec![];
     let mut lots = HashMap::with_capacity(types.len());
@@ -150,7 +157,7 @@ pub fn layout(city_name: &str, types: &[TypeInfo]) -> Layout {
 /// Builds the district tree. With more than one build module, the first level is one district per module, so that
 /// packages with the same name in different modules stay apart. Below that, each package segment is one level:
 /// `com.acme.shop` becomes `com → acme → shop`, and the type is added to the last one.
-fn build_tree<'a>(city_name: &str, types: &'a [TypeInfo]) -> Node<'a> {
+fn build_tree<'a>(city_name: &str, types: &'a [TypeInfo], noa: &dyn Fn(&TypeInfo) -> u32) -> Node<'a> {
     let multi_module = {
         let mut modules: Vec<&str> = types.iter().map(|t| t.module.as_str()).collect();
         modules.sort_unstable();
@@ -184,7 +191,7 @@ fn build_tree<'a>(city_name: &str, types: &'a [TypeInfo]) -> Node<'a> {
             node = node.children.entry(segment.clone()).or_insert_with(|| Node::new(segment, id));
             node.separator = sep;
         }
-        node.types.push(t);
+        node.types.push((t, side_of_noa(noa(t))));
     }
     collapse(&mut root);
     root
@@ -235,8 +242,7 @@ fn measure(node: &mut Node) {
         measure(child);
         items.push(Item { w: child.w + GAP, d: child.d + GAP, x: 0.0, z: 0.0, what: Ref::Child(i) });
     }
-    for (i, t) in node.types.iter().enumerate() {
-        let s = side(t);
+    for (i, &(_, s)) in node.types.iter().enumerate() {
         items.push(Item { w: s + GAP, d: s + GAP, x: 0.0, z: 0.0, what: Ref::Type(i) });
     }
     let (w, d) = pack(&mut items);
@@ -275,8 +281,7 @@ fn place(node: &Node, left: f64, top: f64, depth: u32, districts: &mut Vec<Distr
             Ref::Type(i) => {
                 // The item is the footprint plus the street; the building sits in its top-left corner, and the lot
                 // stores the footprint's centre. It stands on this district's platform, one level above depth.
-                let t = node.types[i];
-                let s = side(t);
+                let (t, s) = node.types[i];
                 lots.insert(t.fqn.clone(), Lot { x: x + s / 2.0, z: z + s / 2.0, side: s, y: (depth + 1) as f64 * PLATFORM, district: index });
             }
         }

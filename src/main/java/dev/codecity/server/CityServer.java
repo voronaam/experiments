@@ -27,7 +27,7 @@ import java.util.concurrent.TimeUnit;
  *
  * <h2>Endpoints</h2>
  * <ul>
- *   <li>{@code /}, {@code /index.html}, {@code /app.js}, {@code /walk.js}, {@code /style.css}, {@code /favicon.svg}: the viewer, read
+ *   <li>{@code /}, {@code /index.html}, {@code /app.js}, {@code /walk.js}, {@code /replay.js}, {@code /style.css}, {@code /favicon.svg}: the viewer, read
  *       from the {@code web/} resources on the classpath. Any other path is a 404, so no file on disk is reachable
  *       by its path.</li>
  *   <li>{@code GET /api/city}: the whole city as JSON ({@link CityModel#json()}).</li>
@@ -53,6 +53,7 @@ public final class CityServer implements AutoCloseable {
             "/index.html", "index.html",
             "/app.js", "app.js",
             "/walk.js", "walk.js",
+            "/replay.js", "replay.js",
             "/style.css", "style.css",
             "/favicon.svg", "favicon.svg");
 

@@ -12,6 +12,10 @@
 ///   `Renderer`, render the 3D scene. ImGui's draw data is rendered on top by `runGui` afterwards.
 /// - Walk mode (G or the Walk button) swaps the orbit camera for a first-person one: `codecity.gui.walk` does the
 ///   movement and collisions, `App.enterWalk` / `exitWalk` / `handleWalk` the capture, keys and mouse look.
+/// - History replay (R or the Replay button, only for a city built with `--history`) plays the city's growth over
+///   the sampled commits: `App.enterReplay` / `exitReplay`, `App.applyReplay` for the displayed heights, footprints
+///   and districts at the playback position, `App.timeline` for the bar at the bottom. The browser viewer and the
+///   other desktop viewers play it back with the same rules.
 /// - `codecity.gui.look` decides colours and metrics, `codecity.gui.renderer` draws, `codecity.gui.source`
 ///   highlights the source window.
 ///
@@ -37,7 +41,7 @@ import codecity.gui.png : encode;
 import codecity.gui.renderer;
 import codecity.gui.source;
 import walk = codecity.gui.walk;
-import codecity.layout : platform;
+import codecity.layout : platform, side;
 import codecity.model;
 import core.stdc.stdlib : malloc;
 import core.stdc.string : memcpy;
@@ -45,10 +49,11 @@ import core.sync.mutex : Mutex;
 import std.algorithm : canFind, clamp, max, min, sort, SwapStrategy;
 import std.array : join, replace, split;
 import std.conv : to;
+import std.datetime.systime : SysTime;
 import std.file : exists, isDir, mkdirRecurse, readText, write;
 import std.format : format;
 import std.json;
-import std.math : abs, cos, exp, floor, PI, pow, sin, tan;
+import std.math : abs, ceil, cos, exp, floor, isNaN, PI, pow, sin, tan;
 import std.path : buildPath, dirName;
 import std.process : browse, environment;
 import std.stdio : stderr, writeln;
@@ -323,8 +328,12 @@ private final class App
     float flightDistance, flightPitch;
     double flightStart;
     /// Building heights by type index: the displayed ones, and the start and end of the running height animation.
-    /// Hidden buildings (test code switched off) have height 0, which also hides them from rendering and picking.
+    /// Hidden buildings (test code switched off, or gone today) have height 0, which also hides them from rendering
+    /// and picking.
     float[] heights, heightsFrom, heightsTo;
+    /// Displayed footprint side by type index: the lot's side, except during the history replay, where it follows
+    /// the attribute count at the playback position (0 where the type does not exist, which hides the building).
+    float[] sides;
     /// Start time of the height animation, -1 when none is running.
     double animationStart = -1, animationDuration;
     /// Current colour per building, including search dimming and hover highlight (see `recolor`).
@@ -346,8 +355,8 @@ private final class App
     Arc[] arcs;
     /// Type indices of the buildings with open pull requests (they get a beacon).
     size_t[] beaconBuildings;
-    /// A district name drawn as a floating pill at a world position.
-    struct Label { string text; Vec3 at; }
+    /// A district name drawn as a floating pill at a world position; `district` indexes `model.districts`.
+    struct Label { string text; Vec3 at; size_t district; }
     Label[] labels;
     SourceView source;
     bool sourceShown;
@@ -390,6 +399,22 @@ private final class App
     double walkMouseX, walkMouseY;
     bool walkMouseValid;
 
+    /// History replay: whether it is on and playing, and the playback position `replayPos`, continuous in
+    /// 0..S−1 over the S snapshots (`model.snapshots`); one snapshot per 0.8 s at 1×, times `replaySpeeds[replaySpeed]`.
+    bool replaying, replayPlaying;
+    double replayPos = 0;
+    size_t replaySpeed;
+    static immutable double[4] replaySpeeds = [1, 2, 4, 0.5];
+    static immutable string[4] replaySpeedLabels = ["1×", "2×", "4×", "0.5×"];
+    /// The present-day height scale (metric units → world units), fixed while replaying so that growth shows as
+    /// growth instead of being renormalised per snapshot; recomputed only when the height metric or test toggle
+    /// changes.
+    double replayHeightScale = 1;
+    /// The position the displayed heights and footprints were last computed for (NaN forces a recompute), and the
+    /// snapshot (`replayIndex`) whose colours, districts, search results and arcs are shown (-1 forces a refresh).
+    double replayApplied = double.nan;
+    long replayShown = -1;
+
     this(CityModel model, ImFont* ui, ImFont* mono)
     {
         renderer = new Renderer;
@@ -400,8 +425,21 @@ private final class App
         setModel(model, false);
     }
 
-    /// Whether type `i`'s building is shown (test code can be hidden).
-    bool visible(size_t i) const { return prefs.tests || !model.analysis.types[model.buildings[i].index].test; }
+    /// Whether type `i`'s building is shown: test code can be hidden; during the history replay only the types that
+    /// exist in the shown snapshot (`replayIndex`) count, otherwise only the types that exist today. Search, arcs,
+    /// the inspector's dependency lists and picking all go by this.
+    bool visible(size_t i) const
+    {
+        if (!prefs.tests && model.analysis.types[i].test) return false;
+        if (replaying) return model.buildings[i].hist.exists(replayIndex);
+        return !model.buildings[i].gone;
+    }
+
+    /// Whether type `i`'s building is shown in the present-day city (what `visible` says outside the replay).
+    bool visibleToday(size_t i) const
+    {
+        return (prefs.tests || !model.analysis.types[i].test) && !model.buildings[i].gone;
+    }
 
     /// Shows `next`. `live` is true for a rebuild after a file change: existing buildings start their height animation
     /// from their current height (matched by fully qualified name; new types from 0), the camera stays, and a toast
@@ -423,6 +461,8 @@ private final class App
             : model.hasGit ? ColorMetric.commits : ColorMetric.cx;
         const n = model.buildings.length;
         heights = new float[n];
+        sides = new float[n];
+        foreach (i, ref b; model.buildings) sides[i] = cast(float) b.lot.side;
         geometryDirty = true;
         foreach (i; 0 .. n) heights[i] = oldHeights.get(model.analysis.types[model.buildings[i].index].fqn, 0);
         radius = max(20.0f, cast(float)((model.width ^^ 2 + model.depth ^^ 2) ^^ 0.5 / 2));
@@ -451,18 +491,38 @@ private final class App
     void applyPalette()
     {
         auto p = palette(prefs.theme);
-        Instance[] ds;
-        foreach (d; model.districts)
-        {
-            const c = hex(p.districts[min(d.depth, 5)]);
-            ds ~= Instance([cast(float) d.x, cast(float)(d.depth * platform), cast(float) d.z],
-                [cast(float) d.w, cast(float) platform, cast(float) d.d], [c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, 1]);
-        }
-        renderer.setDistricts(ds);
+        uploadDistricts();
         renderer.setGround(Instance([0, -0.1f, 0], [radius * 14, 0.1f, radius * 14],
             [p.ground.r / 255.0f, p.ground.g / 255.0f, p.ground.b / 255.0f, 1]));
         buildingsDirty = true;
         select(selected, false);
+    }
+
+    /// Uploads the district platforms: one box per district from its depth's palette colour, `platform` thick,
+    /// stacked by depth. A district that is not present in the replay's shown snapshot keeps its instance with a zero
+    /// footprint, which makes it invisible.
+    void uploadDistricts()
+    {
+        auto p = palette(prefs.theme);
+        Instance[] ds;
+        foreach (i, d; model.districts)
+        {
+            const c = hex(p.districts[min(d.depth, 5)]);
+            const shown = districtShown(i);
+            ds ~= Instance([cast(float) d.x, cast(float)(d.depth * platform), cast(float) d.z],
+                [shown ? cast(float) d.w : 0, cast(float) platform, shown ? cast(float) d.d : 0],
+                [c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, 1]);
+        }
+        renderer.setDistricts(ds);
+    }
+
+    /// Whether district `i` is shown. During the replay: when it holds a building that exists in the shown snapshot.
+    /// In the present-day view of a city with history: when it holds a type that exists today (a district of only
+    /// gone types is hidden, with its label); without history always.
+    bool districtShown(size_t i) const
+    {
+        if (replaying) return model.districtHist[i][replayIndex];
+        return !model.hasHistory || model.districts[i].types > 0;
     }
 
     /// Chooses the district labels: the largest districts first (by platform area), only nesting depth 1 and 2 (the
@@ -472,13 +532,16 @@ private final class App
     /// of its platform.
     void buildLabels()
     {
-        auto candidates = model.districts.dup;
-        candidates.sort!((a, b) => a.w * a.d > b.w * b.d, SwapStrategy.stable);
         double[2][] anchors;
         labels = null;
         size_t taken;
-        foreach (d; candidates)
+        // sorted by index, so the label can remember its district (for hiding it during the replay)
+        size_t[] order;
+        foreach (i; 0 .. model.districts.length) order ~= i;
+        order.sort!((a, b) => model.districts[a].w * model.districts[a].d > model.districts[b].w * model.districts[b].d, SwapStrategy.stable);
+        foreach (index; order)
         {
+            const d = model.districts[index];
             if (d.depth < 1 || d.depth > 2 || d.types == 0) continue;
             if (taken++ >= 24) break;
             const front = d.z + d.d / 2;
@@ -486,31 +549,50 @@ private final class App
             foreach (a; anchors) if (abs(a[0] - d.x) < 8 && abs(a[1] - front) < 3) crowded = true;
             if (crowded) continue;
             anchors ~= [d.x, front];
-            labels ~= Label(d.label, Vec3(cast(float) d.x, cast(float)((d.depth + 1) * platform + 0.2), cast(float) front));
+            labels ~= Label(d.label, Vec3(cast(float) d.x, cast(float)((d.depth + 1) * platform + 0.2), cast(float) front), index);
         }
     }
 
     /// Recomputes the target heights for the current height metric and starts the animation towards them: from 0
     /// when `rise` (a slower 1.4 s "city grows" effect), otherwise from the current heights (0.65 s).
     ///
-    /// Heights are linear in the metric, scaled so that the 95th percentile of the visible types is
+    /// Heights are linear in the metric, scaled (`heightScale`) so that the 95th percentile of the visible types is
     /// `clamp(radius * 0.2, 8, 16)` units tall: big cities get taller buildings, but within limits. Every visible
-    /// building is at least 0.35 tall and outliers are capped at `radius * 0.75`.
+    /// building is at least 0.35 tall and outliers are capped at `radius * 0.75` (`toHeight`).
+    ///
+    /// During the replay there is no animation: the present-day scale is recomputed for the (new) metric and the
+    /// replay's heights are recomputed with it.
     void reheight(bool rise)
     {
-        double[] values;
-        foreach (i, ref t; model.analysis.types) if (visible(i)) values ~= heightValue(prefs.height, t);
-        values.sort();
-        const p95 = max(1.0, values.length ? values[min(cast(size_t)(0.95 * (values.length - 1)), values.length - 1)] : 1.0);
-        const s = clamp(radius * 0.2, 8.0, 16.0) / p95;
+        if (replaying)
+        {
+            replayHeightScale = heightScale();
+            replayApplied = double.nan;
+            return;
+        }
+        const s = heightScale();
         heightsTo = new float[model.buildings.length];
         foreach (i, ref t; model.analysis.types)
-            heightsTo[i] = visible(i) ? cast(float) min(0.35 + heightValue(prefs.height, t) * s, radius * 0.75) : 0;
+            heightsTo[i] = visibleToday(i) ? toHeight(heightValue(prefs.height, t), s) : 0;
         heightsFrom = rise ? new float[heightsTo.length] : heights.dup;
         if (rise) heightsFrom[] = 0;
         animationStart = time;
         animationDuration = rise ? 1.4 : 0.65;
     }
+
+    /// The present-day height scale for the current height metric: world units per metric unit, from the 95th
+    /// percentile of the types shown today (see `reheight`).
+    double heightScale()
+    {
+        double[] values;
+        foreach (i, ref t; model.analysis.types) if (visibleToday(i)) values ~= heightValue(prefs.height, t);
+        values.sort();
+        const p95 = max(1.0, values.length ? values[min(cast(size_t)(0.95 * (values.length - 1)), values.length - 1)] : 1.0);
+        return clamp(radius * 0.2, 8.0, 16.0) / p95;
+    }
+
+    /// The height of a building whose metric value is `value`, on scale `s`.
+    float toHeight(double value, double s) const { return cast(float) min(0.35 + value * s, radius * 0.75); }
 
     /// The heights buildings will have once the running animation ends (the current ones if none is running); arcs and
     /// the selection marker use these so they do not need to follow the animation.
@@ -520,9 +602,15 @@ private final class App
     /// outside the search matches or (with a selection) neither the selected building nor one of its direct
     /// dependencies / dependants, and lightened 30 % towards white while hovered. The scale is recomputed too, so it
     /// follows changes of metric and model.
+    ///
+    /// During the replay the colour comes from the shown snapshot's values (`Scale.colorAt`) on the present-day scale,
+    /// and the open-PR metric, which only exists for today, falls back to churn.
     void recolor()
     {
-        scale = Scale.of(colorMetric, model);
+        const replayColors = replaying && model.hasHistory;
+        scale = Scale.of(replayColors && colorMetric == ColorMetric.prs ? ColorMetric.commits : colorMetric, model);
+        const shown = replayColors ? replayIndex : 0;
+        const at = replayColors ? model.snapshots[shown].time : 0;
         const p = palette(prefs.theme);
         bool[size_t] related;
         if (selected >= 0)
@@ -534,7 +622,8 @@ private final class App
         colors.length = model.buildings.length;
         foreach (ref b; model.buildings)
         {
-            auto c = scale.color(model.analysis.types[b.index], b);
+            auto c = replayColors ? scale.colorAt(model.analysis.types[b.index], b, shown, at)
+                : scale.color(model.analysis.types[b.index], b);
             const outOfSearch = searching && b.index !in matches;
             const outOfFocus = selected >= 0 && b.index !in related;
             if (outOfSearch || outOfFocus) c = mix(c, p.dim, 0.8);
@@ -551,18 +640,27 @@ private final class App
     {
         selected = i;
         buildArcs();
-        auto h = targetHeights();
-        if (i >= 0)
-        {
-            auto b = &model.buildings[i];
-            const s = cast(float) b.lot.side + 0.35f;
-            float[4] tint = [0.07f, 0.09f, 0.15f, 0.2f];
-            if (night) tint = [1, 1, 1, 0.24f];
-            renderer.setMarker([Instance([cast(float) b.lot.x, cast(float) b.lot.y - 0.02f, cast(float) b.lot.z], [s, h[i] + 0.3f, s], tint)]);
-        }
-        else renderer.setMarker(null);
+        updateMarker();
         recolor();
         if (i >= 0 && fly) flyToBuilding(i);
+    }
+
+    /// Places the translucent marker box around the selected building (0.35 wider than its footprint and 0.3 taller
+    /// than the building), or removes it. Called by `select`, and every replay frame because the building's size
+    /// changes while playing.
+    void updateMarker()
+    {
+        if (selected < 0)
+        {
+            renderer.setMarker(null);
+            return;
+        }
+        auto b = &model.buildings[selected];
+        const s = sides[selected] + 0.35f;
+        float[4] tint = [0.07f, 0.09f, 0.15f, 0.2f];
+        if (night) tint = [1, 1, 1, 0.24f];
+        renderer.setMarker([Instance([cast(float) b.lot.x, cast(float) b.lot.y - 0.02f, cast(float) b.lot.z],
+            [s, targetHeights()[selected] + 0.3f, s], tint)]);
     }
 
     /// Builds the dependency arcs of the selected building: orange to each type it uses, blue from each type that uses
@@ -773,7 +871,17 @@ private final class App
         walkKeyPressed[] = false;
         walkClicked = false;
 
-        if (animationStart >= 0)
+        if (replaying)
+        {
+            if (replayPlaying)
+            {
+                const last = model.snapshots.length - 1.0;
+                replayPos = min(replayPos + dt * replaySpeeds[replaySpeed] / 0.8, last);
+                if (replayPos >= last) replayPlaying = false; // stops (paused) at the last snapshot
+            }
+            applyReplay();
+        }
+        else if (animationStart >= 0)
         {
             const k = cast(float) clamp((time - animationStart) / animationDuration, 0.0, 1.0);
             const e = 1 - pow(1 - k, 3); // ease-out cubic: fast start, gentle landing
@@ -795,7 +903,7 @@ private final class App
                 // Hidden (and not yet risen) buildings keep their instance but get a zero footprint, which makes the
                 // box degenerate and invisible; the height never goes to exactly 0. Instances stay in index order.
                 const h = heights[b.index];
-                const s = h > 0.001f ? cast(float) b.lot.side : 0;
+                const s = h > 0.001f ? sides[b.index] : 0;
                 const c = colors[b.index];
                 data ~= Instance([cast(float) b.lot.x, cast(float) b.lot.y, cast(float) b.lot.z], [s, max(h, 0.0001f), s],
                     [c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, 1]);
@@ -861,7 +969,8 @@ private final class App
             renderer.setParticles(data);
         }
         Instance[] gems;
-        if (prefs.beacons)
+        // open pull requests belong to the present, so the replay shows no beacons
+        if (prefs.beacons && !replaying)
             foreach (i; beaconBuildings)
             {
                 auto b = &model.buildings[i];
@@ -933,8 +1042,9 @@ private final class App
         foreach (ref b; model.buildings)
         {
             const h = heights[b.index];
-            if (h <= 0.001f) continue;
-            const s = cast(float) b.lot.side / 2;
+            // during the replay, buildings still fading in or out but absent from the shown snapshot are not picked
+            if (h <= 0.001f || sides[b.index] <= 0.001f || (replaying && !visible(b.index))) continue;
+            const s = sides[b.index] / 2;
             const t = rayBox(eye, dir, Vec3(cast(float) b.lot.x - s, cast(float) b.lot.y, cast(float) b.lot.z - s),
                 Vec3(cast(float) b.lot.x + s, cast(float) b.lot.y + h, cast(float) b.lot.z + s));
             if (t >= 0 && t < best)
@@ -946,6 +1056,7 @@ private final class App
         float bestDistrict = float.max;
         foreach (i, d; model.districts)
         {
+            if (!districtShown(i)) continue;
             const t = rayBox(eye, dir, Vec3(cast(float)(d.x - d.w / 2), cast(float)(d.depth * platform), cast(float)(d.z - d.d / 2)),
                 Vec3(cast(float)(d.x + d.w / 2), cast(float)((d.depth + 1) * platform), cast(float)(d.z + d.d / 2)));
             // the topmost (deepest) platform under the cursor is hit first; on (near) ties the earlier district in
@@ -1050,25 +1161,130 @@ private final class App
         }
     }
 
+    // -------------------------------------------------------------- history replay
+
+    /// The snapshot whose colours, districts, search results and arcs are shown: the playback position rounded,
+    /// halves up.
+    size_t replayIndex() const
+    {
+        return min(cast(size_t) floor(replayPos + 0.5), model.snapshots.length - 1);
+    }
+
+    void toggleReplay()
+    {
+        if (replaying) exitReplay();
+        else enterReplay();
+    }
+
+    /// Starts the replay at the first snapshot, playing. The present-day height scale is taken now and kept; a
+    /// running height animation is dropped (the replay sets the heights itself every frame).
+    void enterReplay()
+    {
+        if (replaying || !model.hasHistory) return;
+        replayHeightScale = heightScale();
+        replaying = true;
+        replayPlaying = true;
+        replayPos = 0;
+        replayApplied = double.nan;
+        replayShown = -1;
+        animationStart = -1;
+        applyReplay();
+    }
+
+    /// Leaves the replay and returns to the present-day city: footprints back to the lots, every district shown,
+    /// heights animated back to today's, colours, search and arcs of today. A selected type that is gone today is
+    /// deselected, since it is not part of the present city.
+    void exitReplay()
+    {
+        if (!replaying) return;
+        replaying = replayPlaying = false;
+        foreach (i, ref b; model.buildings) sides[i] = cast(float) b.lot.side;
+        uploadDistricts();
+        reheight(false);
+        if (selected >= 0 && !visible(selected)) selected = -1;
+        if (search.length) runSearch();
+        select(selected, false);
+        buildingsDirty = geometryDirty = true;
+    }
+
+    /// Play / pause; playing from the last snapshot starts over from the first.
+    void togglePlay()
+    {
+        if (!replayPlaying && replayPos >= model.snapshots.length - 1) replayPos = 0;
+        replayPlaying = !replayPlaying;
+    }
+
+    /// Jumps to position `p` and pauses.
+    void seek(double p)
+    {
+        replayPos = clamp(p, 0.0, model.snapshots.length - 1.0);
+        replayPlaying = false;
+    }
+
+    /// Updates the scene for the playback position, once per frame while replaying (and only when something
+    /// changed). With a = ⌊p⌋, b = min(a + 1, S − 1) and f = p − a, a building's height is the height metric
+    /// interpolated between snapshots a and b on the present-day scale, and its footprint side the layout's side
+    /// formula interpolated the same way, an absent type counting as 0 in both; a building absent from both is
+    /// hidden. When the rounded position (`replayIndex`) changes, the colours, district platforms, search results
+    /// and arcs, which all show that one snapshot, are refreshed too.
+    void applyReplay()
+    {
+        if (replayPos == replayApplied) return;
+        replayApplied = replayPos;
+        const last = model.snapshots.length - 1;
+        const a = min(cast(size_t) floor(replayPos), last), b = min(a + 1, last);
+        const f = replayPos - a;
+        foreach (i, ref bd; model.buildings)
+        {
+            const va = heightValueAt(prefs.height, bd, a), vb = heightValueAt(prefs.height, bd, b);
+            if ((va < 0 && vb < 0) || (!prefs.tests && model.analysis.types[i].test))
+            {
+                heights[i] = sides[i] = 0;
+                continue;
+            }
+            heights[i] = toHeight(max(va, 0.0) + (max(vb, 0.0) - max(va, 0.0)) * f, replayHeightScale);
+            const sa = bd.hist.exists(a) ? side(bd.hist.noa[a]) : 0, sb = bd.hist.exists(b) ? side(bd.hist.noa[b]) : 0;
+            sides[i] = cast(float)(sa + (sb - sa) * f);
+        }
+        buildingsDirty = geometryDirty = true;
+        if (replayShown != replayIndex)
+        {
+            replayShown = replayIndex;
+            uploadDistricts();
+            if (search.length) runSearch();
+            // rebuilds the arcs (only between buildings of this snapshot) and recolours
+            select(selected, false);
+        }
+        else updateMarker();
+    }
+
+    /// The local calendar date of a Unix time as YYYY-MM-DD.
+    static string localDate(long epoch)
+    {
+        const t = SysTime.fromUnixTime(epoch);
+        return format("%04d-%02d-%02d", t.year, cast(int) t.month, t.day);
+    }
+
     // -------------------------------------------------------------- walk mode
 
     /// Builds the solids for `walk.Walker` from the current scene: one box per district platform (from the ground up
     /// to its top at (depth + 1) × `platform`) and one per visible building at its current, possibly animating
-    /// height. Rebuilt every walking frame, so growing or hidden buildings take effect on the next step.
+    /// height and footprint (the replay changes both); districts hidden by the replay are left out. Rebuilt every walking frame, so growing or hidden buildings take effect on the next step.
     walk.World walkWorld()
     {
         walk.World w;
         w.halfWidth = cast(float) model.width / 2;
         w.halfDepth = cast(float) model.depth / 2;
         w.boxes.reserve(model.districts.length + model.buildings.length);
-        foreach (d; model.districts)
-            w.boxes ~= walk.Box(cast(float)(d.x - d.w / 2), cast(float)(d.z - d.d / 2), cast(float)(d.x + d.w / 2),
+        foreach (i, d; model.districts)
+            if (districtShown(i))
+                w.boxes ~= walk.Box(cast(float)(d.x - d.w / 2), cast(float)(d.z - d.d / 2), cast(float)(d.x + d.w / 2),
                 cast(float)(d.z + d.d / 2), 0, cast(float)((d.depth + 1) * platform));
         foreach (ref b; model.buildings)
         {
             const h = heights[b.index];
-            if (h <= 0.001f) continue;
-            const s = cast(float) b.lot.side / 2;
+            if (h <= 0.001f || sides[b.index] <= 0.001f) continue;
+            const s = sides[b.index] / 2;
             w.boxes ~= walk.Box(cast(float) b.lot.x - s, cast(float) b.lot.z - s, cast(float) b.lot.x + s,
                 cast(float) b.lot.z + s, cast(float) b.lot.y, cast(float) b.lot.y + h);
         }
@@ -1302,9 +1518,10 @@ private final class App
         igPopStyleVar(5);
     }
 
-    /// Keyboard shortcuts. Esc closes the topmost thing, one per press: source window, search drop-down, selection,
-    /// then the search text. It works even while typing; the letter shortcuts (F frame, N night, / search) do not, so
-    /// they can be typed into the search field.
+    /// Keyboard shortcuts. Esc closes the topmost thing, one per press: source window, search drop-down, the history
+    /// replay, selection, then the search text (the order all viewers use; walk mode handles its own Esc first). It works even while typing; the letter shortcuts (F frame, N night,
+    /// / search, G walk, R replay, and while replaying P play/pause, `,` / `.` step, Home / End) do not, so they can
+    /// be typed into the search field.
     void shortcuts()
     {
         // while walking, `handleWalk` reads the keys from GLFW
@@ -1314,6 +1531,7 @@ private final class App
         {
             if (sourceShown) sourceShown = false;
             else if (searchOpen) searchOpen = false;
+            else if (replaying) exitReplay();
             else if (selected >= 0) select(-1, false);
             else if (search.length)
             {
@@ -1327,6 +1545,17 @@ private final class App
         if (igIsKeyPressed_Bool(ImGuiKey.N, false)) toggleTheme();
         if (igIsKeyPressed_Bool(ImGuiKey.Slash, false)) focusSearch = true;
         if (igIsKeyPressed_Bool(ImGuiKey.G, false)) enterWalk();
+        if (model.hasHistory && igIsKeyPressed_Bool(ImGuiKey.R, false)) toggleReplay();
+        if (replaying)
+        {
+            const last = model.snapshots.length - 1;
+            if (igIsKeyPressed_Bool(ImGuiKey.P, false)) togglePlay();
+            // the previous / next whole snapshot, from wherever between two snapshots the position is
+            if (igIsKeyPressed_Bool(ImGuiKey.Comma, true)) seek(max(0.0, ceil(replayPos) - 1));
+            if (igIsKeyPressed_Bool(ImGuiKey.Period, true)) seek(min(cast(double) last, floor(replayPos) + 1));
+            if (igIsKeyPressed_Bool(ImGuiKey.Home, false)) seek(0);
+            if (igIsKeyPressed_Bool(ImGuiKey.End, false)) seek(last);
+        }
     }
 
     /// Switches day ↔ night, saves the preference and recolours everything.
@@ -1353,7 +1582,7 @@ private final class App
         foreach (l; labels)
         {
             float x, y;
-            if (!project(l.at, x, y)) continue;
+            if (!districtShown(l.district) || !project(l.at, x, y)) continue;
             const size = igCalcTextSize(l.text.ptr, l.text.ptr + l.text.length, false, -1);
             const p0 = ImVec2(x - size.x / 2 - 8, y - size.y - 10), p1 = ImVec2(x + size.x / 2 + 8, y - 4);
             ImDrawList_AddRectFilled(list, p0, p1, night ? rgba(13, 19, 33, 215) : rgba(255, 255, 255, 220), 99, 0);
@@ -1588,6 +1817,19 @@ private final class App
         if (igButton(walking ? "Walking  ·  G / Esc to exit" : "Walk  (G)", ImVec2(igGetContentRegionAvail().x, 28))) toggleWalk();
         if (walking) igPopStyleColor(2);
         igSetItemTooltip("Walk through the city in first person");
+        // the Replay button (only with history), highlighted like Walk while the replay runs
+        if (model.hasHistory)
+        {
+            if (replaying)
+            {
+                igPushStyleColor_Vec4(Col.Button, color(56, 139, 253));
+                igPushStyleColor_Vec4(Col.Text, color(255, 255, 255));
+            }
+            if (igButton(replaying ? "Replaying  ·  R / Esc to exit" : "Replay  (R)", ImVec2(igGetContentRegionAvail().x, 28)))
+                toggleReplay();
+            if (replaying) igPopStyleColor(2);
+            igSetItemTooltip("Watch the city grow commit by commit");
+        }
         igEnd();
     }
 
@@ -1668,6 +1910,21 @@ private final class App
         {
             igSameLine(0, 6);
             badge("test", RGB(0, 0, 0), false);
+        }
+        if (b.gone)
+        {
+            igSpacing();
+            mutedText("Removed before today");
+        }
+        if (replaying)
+        {
+            // the details below stay today's (or, for a gone type, its last seen ones); this line gives the
+            // snapshot's values
+            const k = replayIndex;
+            igSpacing();
+            text("Replaying — values at " ~ localDate(model.snapshots[k].time));
+            small(b.hist.exists(k) ? format("%d methods · %d attributes · %s LOC · complexity %d", b.hist.nom[k],
+                b.hist.noa[k], fmt(b.hist.loc[k]), b.hist.cx[k]) : "not in this snapshot");
         }
         igSpacing();
         size_t[] uses, usedBy;
@@ -1830,9 +2087,20 @@ private final class App
             auto b = &model.buildings[hovered];
             title = t.name ~ "  ·  " ~ t.kind;
             sub = t.pkg;
-            row = format("%d methods · %d attrs · %s loc · cx %d", t.nom, t.noa, fmt(t.loc), t.complexity);
-            if (b.hasHistory) row ~= format(" · %d commits", b.history.commits);
-            if (b.prs.length) row ~= format(" · %d open PR%s", b.prs.length, b.prs.length > 1 ? "s" : "");
+            if (replaying)
+            {
+                // the shown snapshot's values (picking only hovers buildings that exist in it)
+                const k = replayIndex;
+                const h = &b.hist;
+                row = format("%d methods · %d attrs · %s loc · cx %d · %d commits · at %s", h.nom[k], h.noa[k],
+                    fmt(h.loc[k]), h.cx[k], h.commits[k], localDate(model.snapshots[k].time));
+            }
+            else
+            {
+                row = format("%d methods · %d attrs · %s loc · cx %d", t.nom, t.noa, fmt(t.loc), t.complexity);
+                if (b.hasHistory) row ~= format(" · %d commits", b.history.commits);
+                if (b.prs.length) row ~= format(" · %d open PR%s", b.prs.length, b.prs.length > 1 ? "s" : "");
+            }
         }
         else if (hoveredDistrict >= 0 && model.districts[hoveredDistrict].depth > 0)
         {
@@ -1949,12 +2217,67 @@ private final class App
             if (alpha > 0)
             {
                 igPushStyleVar_Float(StyleVar.Alpha, alpha);
-                pill("##walkhint", 40, "WASD move · Mouse look · Shift run · Space jump · Click select · G/Esc exit", false);
+                pill("##walkhint", replaying ? 100 : 40, "WASD move · Mouse look · Shift run · Space jump · Click select · G/Esc exit", false);
                 igPopStyleVar(1);
             }
         }
-        else pill("##hint", 40, "drag to orbit · right-drag to pan · scroll to zoom · click a building · / search · F frame · N night · G walk · Esc clear", false);
-        if (time < toastUntil) pill("##toast", 86, toastText, true);
+        // the timeline takes the hint's place at the bottom while replaying; the toast moves above it
+        else if (!replaying)
+            pill("##hint", 40, "drag to orbit · right-drag to pan · scroll to zoom · click a building · / search · F frame · N night · G walk"
+                ~ (model.hasHistory ? " · R replay" : "") ~ " · Esc clear", false);
+        if (replaying) timeline();
+        if (time < toastUntil) pill("##toast", replaying ? 120 : 86, toastText, true);
+    }
+
+    /// The replay's timeline bar at the bottom centre:
+    /// `[play/pause] [slider over 0..S−1] date · short sha · subject — author [speed] [Now]`. The play button draws
+    /// its icon itself (a triangle, or two bars while playing). Dragging the slider moves the position and pauses;
+    /// the speed button cycles 1× → 2× → 4× → 0.5×; Now leaves the replay. The text describes the shown snapshot
+    /// (`replayIndex`), the subject cut to 60 characters. The bar has a fixed width (1200 px, or the window less its
+    /// margins), with the speed and Now buttons at its right end, so it does not jump about while the text changes.
+    void timeline()
+    {
+        const k = replayIndex;
+        const snap = &model.snapshots[k];
+        const width = min(winW - 32.0f, 1200.0f);
+        igSetNextWindowPos(ImVec2(winW / 2.0f, winH - 16.0f), Cond.Always, ImVec2(0.5f, 1));
+        igSetNextWindowSize(ImVec2(width, 0), Cond.Always);
+        igPushStyleVar_Float(StyleVar.WindowRounding, 12);
+        igBegin("##timeline", null, fixedFlags | WindowFlags.AlwaysAutoResize | WindowFlags.NoScrollbar);
+        if (igButton("##play", ImVec2(30, 26))) togglePlay();
+        igSetItemTooltip(replayPlaying ? "Pause (P)" : "Play (P)");
+        {
+            const lo = igGetItemRectMin(), hi = igGetItemRectMax();
+            const cx = (lo.x + hi.x) / 2, cy = (lo.y + hi.y) / 2;
+            auto dl = igGetWindowDrawList();
+            const c = igColor(textColor);
+            if (replayPlaying)
+            {
+                ImDrawList_AddRectFilled(dl, ImVec2(cx - 5, cy - 6), ImVec2(cx - 1.5f, cy + 6), c, 1, 0);
+                ImDrawList_AddRectFilled(dl, ImVec2(cx + 1.5f, cy - 6), ImVec2(cx + 5, cy + 6), c, 1, 0);
+            }
+            else ImDrawList_AddTriangleFilled(dl, ImVec2(cx - 4, cy - 7), ImVec2(cx - 4, cy + 7), ImVec2(cx + 7, cy), c);
+        }
+        igSameLine(0, 10);
+        igSetNextItemWidth(280);
+        float position = cast(float) replayPos;
+        if (igSliderFloat("##position", &position, 0, cast(float)(model.snapshots.length - 1), "", SliderFlags_NoInput))
+            seek(position);
+        igSameLine(0, 12);
+        // the subject cut to 60 characters (code points, not bytes, so a multi-byte character is never split)
+        auto subject = snap.subject.to!dstring;
+        const subjectText = subject.length > 60 ? (subject[0 .. 59] ~ "…"d).to!string : snap.subject;
+        text(format("%s · %s · %s — %s", localDate(snap.time), snap.commit[0 .. min(7, $)], subjectText, snap.author));
+        // right-aligned: the window's right padding (14), Now (46), the gap (6) and the speed button (46)
+        igSameLine(width - 14 - 46 - 6 - 46, -1);
+        if (igButton(replaySpeedLabels[replaySpeed].toStringz, ImVec2(46, 26)))
+            replaySpeed = (replaySpeed + 1) % replaySpeeds.length;
+        igSetItemTooltip("Playback speed");
+        igSameLine(0, 6);
+        if (igButton("Now", ImVec2(46, 26))) exitReplay();
+        igSetItemTooltip("Back to today's city (R / Esc)");
+        igEnd();
+        igPopStyleVar(1);
     }
 }
 

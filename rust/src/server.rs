@@ -1,7 +1,7 @@
 //! Serves the web viewer and the city model on localhost, and pushes rebuild notifications as server-sent events.
 //!
 //! Endpoints (all GET):
-//! - `/`, `/index.html`, `/app.js`, `/walk.js`, `/style.css`, `/favicon.svg`: the embedded viewer ([`crate::assets`]);
+//! - `/`, `/index.html`, `/app.js`, `/walk.js`, `/replay.js`, `/style.css`, `/favicon.svg`: the embedded viewer ([`crate::assets`]);
 //! - `/api/city`: the city model as JSON ([`CityModel::json`], computed once per model and cached);
 //! - `/api/source?id=N`: the source file of building `N` (see [`source`]);
 //! - `/api/events`: a server-sent event stream; an `update` event tells the viewer to reload `/api/city`.

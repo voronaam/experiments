@@ -82,9 +82,21 @@ final class Walker {
          * Buildings of (almost) zero height are hidden or filtered out and are left out, as they are when drawn.
          */
         static World of(CityModel model, double[] heights) {
+            return of(model, heights, null, null);
+        }
+
+        /**
+         * {@link #of(CityModel, double[])} for a history replay frame: footprints of {@code sides[i]} centred on the
+         * lots instead of the lots' own sides, and only the districts with {@code districtShown[d]}. Either may be
+         * null for the present-day city.
+         */
+        static World of(CityModel model, double[] heights, double[] sides, boolean[] districtShown) {
             List<Box> boxes = new ArrayList<>();
             List<CityLayout.District> districts = model.districts();
             for (int i = 0; i < districts.size(); i++) {
+                if (districtShown != null && !districtShown[i]) {
+                    continue;
+                }
                 CityLayout.District d = districts.get(i);
                 boxes.add(new Box(-1, i, d.x() - d.w() / 2, d.z() - d.d() / 2, d.x() + d.w() / 2, d.z() + d.d() / 2,
                         0, (d.depth() + 1) * CityLayout.PLATFORM));
@@ -95,7 +107,7 @@ final class Walker {
                     continue;
                 }
                 CityLayout.Lot lot = b.lot();
-                double s = lot.side() / 2;
+                double s = (sides != null ? sides[b.index()] : lot.side()) / 2;
                 boxes.add(new Box(b.index(), -1, lot.x() - s, lot.z() - s, lot.x() + s, lot.z() + s,
                         lot.y(), lot.y() + h));
             }

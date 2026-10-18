@@ -65,6 +65,8 @@ field by field: every building, metric, position, district and dependency edge.
 * soft shadows (PCF shadow map) and the night-time glow / lit-window shader;
 * an ImGui interface: search, the inspector, a source viewer with syntax highlighting, legend, toasts and snapshots;
 * dependency arcs with flowing particles, PR beacons, and live reload.
+* **History replay** (`--history`, then `R`): watch the city grow commit by commit, as described in the
+  [main README](../README.md#history-replay).
 * **Walk mode** (`G`): walk through the city in first person, as described in the
   [main README](../README.md#walk-mode).
 

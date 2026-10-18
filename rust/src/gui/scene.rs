@@ -115,6 +115,10 @@ pub struct Scene {
     /// Building indices that have at least one open pull request; these get a floating beacon.
     beacon_buildings: Vec<usize>,
     pub building_count: usize,
+    /// Which districts are drawn (indexed like the model's districts), or None for all of them. The history replay
+    /// hides districts that have no building yet; a hidden district keeps its instance, with no footprint, so instance
+    /// ids keep matching district indices for picking.
+    district_mask: Option<Vec<bool>>,
     /// Rough radius of the city in world units: half the diagonal of its footprint, at least 20. The app uses it to
     /// limit camera distance and to frame the city; here it sizes the ground plane.
     pub radius: f32,
@@ -202,6 +206,7 @@ impl Scene {
             arcs: vec![],
             beacon_buildings: vec![],
             building_count: 0,
+            district_mask: None,
             radius: 50.0,
             shadows: true,
             shadows_dirty: true,
@@ -213,6 +218,7 @@ impl Scene {
     /// the old model. Buildings are not touched here; the app follows up with [`Scene::set_buildings`].
     pub fn set_model(&mut self, model: &CityModel, palette: &Palette) {
         self.building_count = model.buildings.len();
+        self.district_mask = None;
         self.radius = ((model.width.hypot(model.depth) / 2.0) as f32).max(20.0);
         let r = self.radius;
         // A ground square 14 radii across (7 from the centre to an edge; the app clamps the orbit distance to 6
@@ -228,12 +234,23 @@ impl Scene {
     fn district_instances(&self, model: &CityModel, palette: &Palette) -> Instances {
         let mut t = Vec::with_capacity(model.districts.len());
         let mut c = Vec::with_capacity(model.districts.len());
-        for d in &model.districts {
-            t.push(box_transform(d.x as f32, d.depth as f32 * PLATFORM as f32, d.z as f32, d.w as f32, PLATFORM as f32, d.d as f32));
+        for (i, d) in model.districts.iter().enumerate() {
+            let shown = self.district_mask.as_ref().is_none_or(|m| m[i]);
+            let (w, depth) = if shown { (d.w as f32, d.d as f32) } else { (0.0, 0.0) };
+            t.push(box_transform(d.x as f32, d.depth as f32 * PLATFORM as f32, d.z as f32, w, PLATFORM as f32, depth));
             // The palette has six platform colours; anything nested deeper reuses the last one.
             c.push(look::rgb(palette.districts[(d.depth as usize).min(5)]));
         }
         if t.is_empty() { hidden() } else { instances(t, c) }
+    }
+
+    /// Shows only the districts whose `mask` entry is true, or all of them for None (see `district_mask`).
+    pub fn set_district_mask(&mut self, model: &CityModel, palette: &Palette, mask: Option<Vec<bool>>) {
+        if self.district_mask != mask {
+            self.district_mask = mask;
+            self.districts.geometry.set_instances(&self.district_instances(model, palette));
+            self.shadows_dirty = true;
+        }
     }
 
     /// Applies a theme: platform colours, ground colour, light colours and intensities, and the night-time building
@@ -253,11 +270,12 @@ impl Scene {
 
     /// Rewrites every building's box; a height of at most 0.001 hides building `i`.
     ///
-    /// `heights` and `colors` are indexed by building index and must have one entry per building. Hidden buildings
+    /// `heights`, `sides` (footprint side lengths) and `colors` are indexed by building index and must have one entry
+    /// per building. Sides are the lots' sides except during a history replay, where buildings grow into their lots. Hidden buildings
     /// keep their instance (with zero footprint) so that instance ids keep matching building indices for picking.
     /// `geometry_changed` says whether heights or visibility differ from the last call; only then is the shadow map
     /// marked stale, so recolouring alone does not re-render it.
-    pub fn set_buildings(&mut self, model: &CityModel, heights: &[f32], colors: &[Srgba], geometry_changed: bool) {
+    pub fn set_buildings(&mut self, model: &CityModel, heights: &[f32], sides: &[f32], colors: &[Srgba], geometry_changed: bool) {
         if model.buildings.is_empty() {
             self.buildings.geometry.set_instances(&hidden());
             return;
@@ -267,7 +285,7 @@ impl Scene {
             .iter()
             .map(|b| {
                 let h = heights[b.index];
-                let s = if h > 0.001 { b.lot.side as f32 } else { 0.0 };
+                let s = if h > 0.001 { sides[b.index] } else { 0.0 };
                 box_transform(b.lot.x as f32, b.lot.y as f32, b.lot.z as f32, s, h, s)
             })
             .collect();
@@ -275,14 +293,15 @@ impl Scene {
         self.shadows_dirty |= geometry_changed;
     }
 
-    /// Shows the translucent selection box around building `selected`, or hides it.
-    pub fn set_marker(&mut self, model: &CityModel, selected: Option<usize>, heights: &[f32], night: bool) {
+    /// Shows the translucent selection box around building `selected` (at its height and side, see
+    /// [`Scene::set_buildings`]), or hides it.
+    pub fn set_marker(&mut self, model: &CityModel, selected: Option<usize>, heights: &[f32], sides: &[f32], night: bool) {
         let inst = match selected {
             Some(i) => {
                 let b = &model.buildings[i];
                 // Slightly larger than the building on every side and above, and starting just below its base, so
                 // the faces never coincide with the building's own.
-                let s = b.lot.side as f32 + 0.35;
+                let s = sides[i] + 0.35;
                 let color = if night { Srgba::new(255, 255, 255, 60) } else { Srgba::new(17, 24, 39, 50) };
                 instances(vec![box_transform(b.lot.x as f32, b.lot.y as f32 - 0.02, b.lot.z as f32, s, heights[i] + 0.3, s)], vec![color])
             }

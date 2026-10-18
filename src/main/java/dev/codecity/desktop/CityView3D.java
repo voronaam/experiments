@@ -32,6 +32,7 @@ import javafx.scene.transform.Rotate;
 import javafx.scene.transform.Translate;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -73,6 +74,11 @@ import java.util.function.IntPredicate;
  * Mouse events are ignored while walking (including the synthetic move the recentring causes), except a primary press,
  * which selects what the crosshair points at. The crosshair target is found by casting the view ray against the
  * walker's boxes ({@link Walker#target}) rather than by JavaFX picking, which only works at the cursor.
+ *
+ * <h2>History replay</h2>
+ * During replay {@code DesktopApp} drives the geometry frame by frame: {@link #showFrame} sets every building's height
+ * and footprint at once, without animation, and {@link #setDistrictsShown} hides the districts that did not exist yet
+ * (their boxes, and labels, collapse to nothing). {@link #setHeights} returns to the present-day footprints.
  *
  * <p>The web viewer draws the same scene with three.js instancing instead.
  */
@@ -126,6 +132,13 @@ final class CityView3D {
 
     private CityModel model;
     private TriangleMesh buildingMesh;
+    private TriangleMesh districtMesh;
+    /** Corner points of every district box as laid out, so hidden districts can be restored. */
+    private float[] districtPoints = new float[0];
+    /** Which districts are drawn during replay; null shows all. */
+    private boolean[] districtShown;
+    /** Footprint side per building during replay; null uses the lots' sides. */
+    private double[] sides;
     private MeshView buildingsView;
     private MeshView districtsView;
     /** Point buffer of the building mesh, rewritten while heights animate and copied into the mesh in one go. */
@@ -153,8 +166,11 @@ final class CityView3D {
     /** Building index of each beacon; entry {@code k} belongs to child {@code k} of {@link #beaconGroup}. */
     private final List<Integer> beaconBuildings = new ArrayList<>();
     private boolean beaconsVisible = true;
-    /** A 2D district label and the world point it is pinned to (the front edge of the district, on top of it). */
-    private record LabelAnchor(Label label, Point3D at) {
+    /**
+     * A 2D district label, the world point it is pinned to (the front edge of the district, on top of it) and the
+     * district's index.
+     */
+    private record LabelAnchor(Label label, Point3D at, int district) {
     }
 
     private final List<LabelAnchor> labels = new ArrayList<>();
@@ -248,6 +264,8 @@ final class CityView3D {
         heights = new double[n];
         heightsFrom = new double[n];
         heightsTo = new double[n];
+        sides = null;
+        districtShown = null;
         for (int i = 0; i < n; i++) {
             heights[i] = previous.getOrDefault(next.buildings().get(i).type().fqn(), 0.0);
         }
@@ -259,7 +277,8 @@ final class CityView3D {
         ground.setWidth(radius * 14);
         ground.setDepth(radius * 14);
 
-        districtsView = new MeshView(districtMesh(next.districts()));
+        districtMesh = districtMesh(next.districts());
+        districtsView = new MeshView(districtMesh);
         districtsView.setMaterial(districtMaterial);
         districtsView.setCullFace(CullFace.BACK);
 
@@ -400,6 +419,7 @@ final class CityView3D {
         }
         mesh.getFaces().setAll(faces);
         mesh.getPoints().setAll(pts);
+        districtPoints = pts;
         return mesh;
     }
 
@@ -429,6 +449,7 @@ final class CityView3D {
      * running animation and continues from the current heights. Durations (1.4 s, 0.65 s) match the web viewer.
      */
     void setHeights(double[] targets, boolean rise) {
+        sides = null;
         heightsFrom = rise ? new double[targets.length] : heights.clone();
         heightsTo = targets.clone();
         heightStart = System.nanoTime();
@@ -445,6 +466,40 @@ final class CityView3D {
     }
 
     /**
+     * Shows one replay frame: every building's height and footprint side ({@code sides[i]}, centred on its lot) at
+     * once, stopping any height animation. A building of zero height is hidden as usual.
+     */
+    void showFrame(double[] frameHeights, double[] frameSides) {
+        heights = frameHeights.clone();
+        heightsFrom = frameHeights.clone();
+        heightsTo = frameHeights.clone();
+        heightDuration = 0;
+        sides = frameSides.clone();
+        writeBuildings();
+    }
+
+    /**
+     * Draws only the districts with {@code shown[d]} (null: all of them). A hidden district's box collapses to a point,
+     * so it can neither be seen nor picked, and its label is hidden.
+     */
+    void setDistrictsShown(boolean[] shown) {
+        districtShown = shown == null ? null : shown.clone();
+        float[] pts = districtPoints.clone();
+        if (shown != null) {
+            for (int d = 0; d < shown.length; d++) {
+                if (!shown[d]) {
+                    Arrays.fill(pts, d * 24, d * 24 + 24, 0f);
+                }
+            }
+        }
+        districtMesh.getPoints().setAll(pts);
+    }
+
+    private boolean districtShown(int d) {
+        return districtShown == null || districtShown[d];
+    }
+
+    /**
      * Rewrites every building box from the current heights and uploads all points at once. A building with (almost)
      * no height also gets a zero footprint, so hidden buildings vanish completely and cannot be picked.
      */
@@ -453,7 +508,7 @@ final class CityView3D {
         for (int i = 0; i < buildings.size(); i++) {
             CityLayout.Lot lot = buildings.get(i).lot();
             double h = heights[i];
-            double s = h > 0.001 ? lot.side() / 2 : 0;
+            double s = h > 0.001 ? (sides != null ? sides[i] : lot.side()) / 2 : 0;
             writeBox(points, i, lot.x() - s, lot.z() - s, lot.x() + s, lot.z() + s, lot.y(), lot.y() + Math.max(h, 0));
         }
         buildingMesh.getPoints().set(0, points, 0, points.length);
@@ -535,7 +590,8 @@ final class CityView3D {
             label.setManaged(false);
             label.setMouseTransparent(true);
             labelLayer.getChildren().add(label);
-            labels.add(new LabelAnchor(label, new Point3D(d.x(), -((d.depth() + 1) * CityLayout.PLATFORM + 0.2), front)));
+            labels.add(new LabelAnchor(label, new Point3D(d.x(), -((d.depth() + 1) * CityLayout.PLATFORM + 0.2), front),
+                    model.districts().indexOf(d)));
         }
     }
 
@@ -552,7 +608,8 @@ final class CityView3D {
         for (LabelAnchor a : labels) {
             Point3D inCamera = camera.sceneToLocal(world.localToScene(a.at()));
             // Hidden while walking: at street level they would show through the buildings in front of them.
-            boolean show = labelsVisible && walker == null && inCamera != null && inCamera.getZ() > 0;
+            boolean show = labelsVisible && walker == null && inCamera != null && inCamera.getZ() > 0
+                    && districtShown(a.district());
             a.label().setVisible(show);
             if (!show) {
                 continue;
@@ -910,7 +967,7 @@ final class CityView3D {
         flight = null;
         savedOrbit = new double[]{target.getX(), target.getY(), target.getZ(), yaw.getAngle(), pitch.getAngle(),
                 dolly.getZ()};
-        Walker.World world = Walker.World.of(model, heights);
+        Walker.World world = Walker.World.of(model, heights, sides, districtShown);
         walker = new Walker();
         if (selected >= 0 && selected < model.buildings().size()) {
             CityLayout.Lot lot = model.buildings().get(selected).lot();
@@ -974,7 +1031,7 @@ final class CityView3D {
                 recentred = true;
             }
         }
-        Walker.World world = Walker.World.of(model, heights);
+        Walker.World world = Walker.World.of(model, heights, sides, districtShown);
         walker.step(dt, walkInput, world);
         placeWalkCamera();
         Walker.Box aim = walker.target(world);

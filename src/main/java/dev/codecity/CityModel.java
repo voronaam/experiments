@@ -9,6 +9,9 @@ import dev.codecity.analysis.MethodInfo;
 import dev.codecity.analysis.TypeInfo;
 import dev.codecity.github.GitHubInfo;
 import dev.codecity.github.PullRequest;
+import dev.codecity.history.CityHistory;
+import dev.codecity.history.Snapshot;
+import dev.codecity.history.TypeHistory;
 import dev.codecity.json.JsonWriter;
 import dev.codecity.layout.CityLayout;
 
@@ -21,6 +24,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 
 /**
  * An analysed and laid-out city, consumed by both the web viewer (as JSON) and the desktop viewer (as objects).
@@ -33,6 +37,13 @@ import java.util.Set;
  *
  * <p>Buildings are indexed in the order of {@link Analysis#types()}, i.e. sorted by fqn; {@code deps},
  * {@code incoming} and the JSON {@code deps} arrays all use these indices, so the viewers never handle fqns for edges.
+ *
+ * <h2>History replay</h2>
+ * With {@code --history} the model also carries a {@link CityHistory}. The city is then the union of today's types and
+ * every type of any snapshot: a type that no longer exists ("gone") is shown with its last snapshot version, is hidden
+ * in the present-day view and only appears during replay. Buildings are still sorted by fqn, now over the union, and
+ * each lot is sized for the largest attribute count the type ever had. {@link #analysis()}, {@link #types()} and the
+ * statistics stay present-day only.
  */
 public final class CityModel {
 
@@ -51,9 +62,12 @@ public final class CityModel {
      * @param incoming indices of buildings that use this type
      * @param prs      indices into {@link GitHubInfo#pulls()} of open PRs touching its file
      * @param methods  methods sorted by complexity, then size (capped)
+     * @param hist     the type's metrics per replay snapshot, or null when the model has no history
+     * @param gone     the type exists only in history snapshots, not today
      */
     public record Building(int index, TypeInfo type, CityLayout.Lot lot, String file, FileHistory history,
-                           int[] deps, int[] incoming, int[] prs, List<MethodInfo> methods) {
+                           int[] deps, int[] incoming, int[] prs, List<MethodInfo> methods, TypeHistory hist,
+                           boolean gone) {
     }
 
     /**
@@ -73,18 +87,29 @@ public final class CityModel {
     private final List<Building> buildings;
     private final Stats stats;
     private final long buildMillis;
+    /** The history replay, or null without {@code --history}. */
+    private final CityHistory history;
+    /**
+     * Per district (in {@link #districts()} order), per snapshot: whether the district or one of its sub-districts
+     * holds a building that exists in that snapshot. Null without history.
+     */
+    private final boolean[][] districtHist;
     /**
      * Cached JSON. Several server threads may call {@link #json} at once; at worst each computes the same string,
      * and volatile makes the published string visible to all of them.
      */
     private volatile String json;
 
-    private CityModel(String name, Analysis analysis, CityLayout.Result layout, GitHubInfo github, long buildMillis) {
+    private CityModel(String name, Analysis analysis, List<TypeInfo> cityTypes, Map<String, Set<String>> cityDeps,
+                      CityHistory history, CityLayout.Result layout, GitHubInfo github, long buildMillis) {
         this.name = name;
         this.analysis = analysis;
         this.layout = layout;
         this.github = github;
-        this.buildings = resolve(analysis, layout, github);
+        this.history = history;
+        this.buildings = resolve(analysis, cityTypes, cityDeps, history, layout, github);
+        this.districtHist = history == null ? null : districtHist(layout.districts(), buildings,
+                history.snapshots().size());
         List<TypeInfo> types = analysis.types();
         this.stats = new Stats(analysis.files(), analysis.failedFiles(), types.size(),
                 types.stream().map(t -> t.language() + ":" + t.module() + ":" + t.packageName()).distinct().count(),
@@ -103,15 +128,61 @@ public final class CityModel {
      */
     public static CityModel build(SourceAnalyzer analyzer, Path root, boolean includeTests, boolean useGit,
                                   GitHubInfo github) throws IOException {
+        return build(analyzer, root, includeTests, useGit, github, 0);
+    }
+
+    /**
+     * {@link #build(SourceAnalyzer, Path, boolean, boolean, GitHubInfo)} plus, when {@code historySnapshots > 0}, the
+     * history replay over that many sampled commits ({@link CityHistory}). The replay needs git history; without it
+     * (no git, {@code --no-git}, not a work tree, no commits) a warning is printed and the model has no history.
+     */
+    public static CityModel build(SourceAnalyzer analyzer, Path root, boolean includeTests, boolean useGit,
+                                  GitHubInfo github, int historySnapshots) throws IOException {
         long start = System.nanoTime();
         Analysis parsed = analyzer.analyze(root, includeTests);
-        Map<Path, FileHistory> history = useGit ? GitHistory.load(root) : Map.of();
+        // The raw log is kept only for the replay, which counts each file's commits up to every snapshot.
+        Map<Path, List<GitHistory.Touch>> touches = useGit ? GitHistory.touches(root) : Map.of();
+        Map<Path, FileHistory> history = GitHistory.summarise(touches);
         // The analyser leaves history empty; add it here so the model has a single, complete Analysis.
         Analysis analysis = new Analysis(root, parsed.types(), parsed.dependencies(), history,
                 parsed.files(), parsed.failedFiles());
         String name = root.getFileName() == null ? root.toString() : root.getFileName().toString();
-        CityLayout.Result layout = CityLayout.layout(name, analysis.types());
-        return new CityModel(name, analysis, layout, github, (System.nanoTime() - start) / 1_000_000);
+        CityHistory replay = null;
+        if (historySnapshots > 0) {
+            replay = useGit ? CityHistory.compute(root, historySnapshots, includeTests, touches, System.out) : null;
+            if (replay == null) {
+                System.err.println("warning: --history needs git history; replay disabled");
+            }
+        }
+        if (replay == null) {
+            CityLayout.Result layout = CityLayout.layout(name, analysis.types());
+            return new CityModel(name, analysis, analysis.types(), analysis.dependencies(), null, layout, github,
+                    (System.nanoTime() - start) / 1_000_000);
+        }
+
+        // The union city: today's types as they are, plus every gone type in its last snapshot version with that
+        // version's dependencies (which all point at types of that snapshot, so into the union).
+        Map<String, TypeInfo> union = new TreeMap<>();
+        Map<String, Set<String>> deps = new HashMap<>(analysis.dependencies());
+        analysis.types().forEach(t -> union.put(t.fqn(), t));
+        Set<String> present = Set.copyOf(union.keySet());
+        replay.types().forEach((fqn, h) -> {
+            if (!union.containsKey(fqn)) {
+                union.put(fqn, h.latest());
+                Set<String> d = new java.util.HashSet<>(h.latestDeps());
+                d.remove(fqn);
+                deps.put(fqn, d);
+            }
+        });
+        CityHistory r = replay;
+        // Every lot is big enough for the building at its widest, today or in any snapshot.
+        CityLayout.Result layout = CityLayout.layout(name, List.copyOf(union.values()), t -> {
+            TypeHistory h = r.types().get(t.fqn());
+            int max = h == null ? -1 : h.maxNoa();
+            return present.contains(t.fqn()) ? Math.max(max, t.noa()) : max;
+        });
+        return new CityModel(name, analysis, List.copyOf(union.values()), deps, replay,
+                presentCounts(layout, present), github, (System.nanoTime() - start) / 1_000_000);
     }
 
     public String name() {
@@ -159,6 +230,103 @@ public final class CityModel {
         return buildMillis;
     }
 
+    /** The replay snapshots, oldest first, or null when the model has no history. */
+    public List<Snapshot> history() {
+        return history == null ? null : history.snapshots();
+    }
+
+    public boolean hasHistory() {
+        return history != null;
+    }
+
+    /**
+     * Whether district {@code d} (an index into {@link #districts()}) has an existing building, directly or in a
+     * sub-district, in snapshot {@code k}. Always true without history.
+     */
+    public boolean districtExists(int d, int k) {
+        return districtHist == null || districtHist[d][k];
+    }
+
+    /**
+     * {@code layout} with each district's {@code types} counting only the {@code present} types (in it and its
+     * sub-districts), like the statistics: the layout itself counted the gone types of the union too.
+     */
+    private static CityLayout.Result presentCounts(CityLayout.Result layout, Set<String> present) {
+        List<CityLayout.District> districts = layout.districts();
+        int[] parent = districtParents(districts);
+        int[] counts = new int[districts.size()];
+        layout.lots().forEach((fqn, lot) -> {
+            if (present.contains(fqn)) {
+                for (int d = lot.districtIndex(); d >= 0; d = parent[d]) {
+                    counts[d]++;
+                }
+            }
+        });
+        List<CityLayout.District> recounted = new ArrayList<>();
+        for (int i = 0; i < districts.size(); i++) {
+            CityLayout.District d = districts.get(i);
+            recounted.add(new CityLayout.District(d.id(), d.label(), d.depth(), d.x(), d.z(), d.w(), d.d(), counts[i]));
+        }
+        return new CityLayout.Result(List.copyOf(recounted), layout.lots(), layout.width(), layout.depth());
+    }
+
+    /**
+     * Per district, whether it or one of its sub-districts holds a building matching {@code which}. The desktop viewer
+     * uses it to leave out districts that hold nothing but types that exist only in history.
+     */
+    public boolean[] districtsHolding(java.util.function.Predicate<Building> which) {
+        int[] parent = districtParents(layout.districts());
+        boolean[] marked = new boolean[parent.length];
+        for (Building b : buildings) {
+            if (which.test(b)) {
+                mark(marked, parent, b.lot().districtIndex());
+            }
+        }
+        return marked;
+    }
+
+    /** Marks district {@code d} and its ancestors, stopping at the first one already marked (as are all above it). */
+    private static void mark(boolean[] marked, int[] parent, int d) {
+        for (; d >= 0 && !marked[d]; d = parent[d]) {
+            marked[d] = true;
+        }
+    }
+
+    /**
+     * Index of every district's parent district, -1 for the city. The districts are in pre-order, so a district's
+     * parent is the closest earlier district one level up, tracked with a stack.
+     */
+    private static int[] districtParents(List<CityLayout.District> districts) {
+        int[] parent = new int[districts.size()];
+        int[] stack = new int[districts.size() + 1];
+        for (int i = 0; i < districts.size(); i++) {
+            int depth = districts.get(i).depth();
+            parent[i] = depth == 0 ? -1 : stack[depth - 1];
+            stack[depth] = i;
+        }
+        return parent;
+    }
+
+    /** Marks, for every snapshot, the districts that hold a building existing then, and all their ancestors. */
+    private static boolean[][] districtHist(List<CityLayout.District> districts, List<Building> buildings, int count) {
+        int[] parent = districtParents(districts);
+        boolean[][] byTime = new boolean[count][districts.size()];
+        for (Building b : buildings) {
+            for (int k = 0; k < count; k++) {
+                if (b.hist().exists(k)) {
+                    mark(byTime[k], parent, b.lot().districtIndex());
+                }
+            }
+        }
+        boolean[][] hist = new boolean[districts.size()][count];
+        for (int d = 0; d < districts.size(); d++) {
+            for (int k = 0; k < count; k++) {
+                hist[d][k] = byTime[k][d];
+            }
+        }
+        return hist;
+    }
+
     /** Types per language, most first; ties keep the Language declaration order, as the sort is stable. */
     private static Map<Language, Integer> languageCounts(List<TypeInfo> types) {
         Map<Language, Integer> counts = new java.util.EnumMap<>(Language.class);
@@ -189,12 +357,14 @@ public final class CityModel {
      * <p>Pull requests list files relative to the repository root, while buildings know their path relative to the
      * analysed root; {@link GitHubInfo#prefix()} (the analysed root's path inside the repository) bridges the two.
      */
-    private static List<Building> resolve(Analysis analysis, CityLayout.Result layout, GitHubInfo github) {
-        List<TypeInfo> types = analysis.types();
+    private static List<Building> resolve(Analysis analysis, List<TypeInfo> types, Map<String, Set<String>> dependencies,
+                                          CityHistory history, CityLayout.Result layout, GitHubInfo github) {
         Map<String, Integer> index = new HashMap<>();
         for (int i = 0; i < types.size(); i++) {
             index.put(types.get(i).fqn(), i);
         }
+        Set<String> present = new java.util.HashSet<>();
+        analysis.types().forEach(t -> present.add(t.fqn()));
         Map<String, List<Integer>> pullsByPath = new HashMap<>();
         if (github != null && github.pulls() != null) {
             List<PullRequest> pulls = github.pulls();
@@ -211,7 +381,7 @@ public final class CityModel {
         }
         for (int i = 0; i < types.size(); i++) {
             // Unknown targets are skipped defensively; SourceAnalyzer already guarantees that every target exists.
-            int[] out = analysis.dependencies().getOrDefault(types.get(i).fqn(), Set.of()).stream()
+            int[] out = dependencies.getOrDefault(types.get(i).fqn(), Set.of()).stream()
                     .map(index::get).filter(j -> j != null).mapToInt(Integer::intValue).toArray();
             deps.add(out);
             for (int j : out) {
@@ -234,7 +404,11 @@ public final class CityModel {
                     deps.get(i),
                     incoming.get(i).stream().mapToInt(Integer::intValue).toArray(),
                     pullsByPath.getOrDefault(repoPath, List.of()).stream().mapToInt(Integer::intValue).toArray(),
-                    methods));
+                    methods,
+                    // A present type missing from every snapshot (e.g. not committed yet) never existed in history.
+                    history == null ? null : history.types().getOrDefault(t.fqn(),
+                            new TypeHistory(history.snapshots().size())),
+                    history != null && !present.contains(t.fqn())));
         }
         return List.copyOf(result);
     }
@@ -271,15 +445,23 @@ public final class CityModel {
         }
 
         w.name("districts").beginArray();
-        for (CityLayout.District d : layout.districts()) {
+        for (int i = 0; i < layout.districts().size(); i++) {
+            CityLayout.District d = layout.districts().get(i);
             w.beginObject()
                     .field("id", d.id())
                     .field("name", d.label())
                     .field("depth", d.depth())
                     .field("x", d.x()).field("z", d.z())
                     .field("w", d.w()).field("d", d.d())
-                    .field("types", d.types())
-                    .endObject();
+                    .field("types", d.types());
+            if (districtHist != null) {
+                w.name("hist").beginArray();
+                for (boolean e : districtHist[i]) {
+                    w.value(e ? 1 : 0);
+                }
+                w.endArray();
+            }
+            w.endObject();
         }
         w.endArray();
 
@@ -331,10 +513,53 @@ public final class CityModel {
                 w.value(d);
             }
             w.endArray();
+            if (b.hist() != null) {
+                writeHist(w, b.hist());
+            }
+            if (b.gone()) {
+                w.field("gone", true);
+            }
             w.endObject();
         }
         w.endArray();
+        if (history != null) {
+            w.name("history").beginObject().name("snapshots").beginArray();
+            for (Snapshot s : history.snapshots()) {
+                w.beginObject()
+                        .field("commit", s.commit())
+                        .field("time", s.time())
+                        .field("author", s.author())
+                        .field("subject", s.subject())
+                        .field("types", s.types())
+                        .endObject();
+            }
+            w.endArray().endObject();
+        }
         return w.endObject().toString();
+    }
+
+    /** A building's {@code hist} object: one array per metric, one entry per snapshot. */
+    private static void writeHist(JsonWriter w, TypeHistory h) {
+        w.name("hist").beginObject();
+        intArray(w, "nom", h.nom);
+        intArray(w, "noa", h.noa);
+        intArray(w, "loc", h.loc);
+        intArray(w, "cx", h.cx);
+        intArray(w, "commits", h.commits);
+        intArray(w, "authors", h.authors);
+        w.name("last").beginArray();
+        for (long v : h.last) {
+            w.value(v);
+        }
+        w.endArray().endObject();
+    }
+
+    private static void intArray(JsonWriter w, String name, int[] values) {
+        w.name(name).beginArray();
+        for (int v : values) {
+            w.value(v);
+        }
+        w.endArray();
     }
 
     /** Repository info for permalinks; the pull request list only when it was fetched ({@code pulls} non-null). */

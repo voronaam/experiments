@@ -13,8 +13,9 @@ import java.util.Base64;
  *
  * <p>The exporter takes the same {@code web/} resources the {@link CityServer} serves and splices them together by
  * replacing four exact markers in {@code index.html}: the stylesheet link, the favicon link, the module script tag and
- * the start of the import map. {@code app.js} imports {@code ./walk.js}; an inline module cannot load a sibling
- * file, so the import map gets an entry that maps {@code ./walk.js} to a base64 {@code data:} URL of that module. The
+ * the start of the import map. {@code app.js} imports {@code ./walk.js} and {@code ./replay.js}; an inline module
+ * cannot load a sibling file, so the import map gets an entry for each that maps it to a base64 {@code data:} URL of
+ * that module. The
  * city JSON goes into a {@code <script id="city-data" type="application/json">} element; the viewer looks for that
  * element first and only falls back to fetching {@code api/city} (and listening for live updates) when it is
  * missing. If {@code index.html} is ever edited so that a marker no longer matches character for character, the export
@@ -31,6 +32,7 @@ public final class HtmlExporter {
         String css = text("style.css");
         String js = text("app.js");
         String walkJs = text("walk.js");
+        String replayJs = text("replay.js");
         String favicon = text("favicon.svg");
 
         html = replaceOnce(html, "<link rel=\"stylesheet\" href=\"style.css\">", "<style>\n" + css + "\n</style>");
@@ -40,9 +42,12 @@ public final class HtmlExporter {
                 "<link rel=\"icon\" href=\"data:image/svg+xml," + favicon.replace("\"", "'")
                         .replace("#", "%23").replace("\n", " ") + "\">");
         // "./walk.js" in the import map resolves against the page URL, exactly like app.js's import from the inline
-        // module, so the import is served from the data: URL. Base64 needs no escaping inside the JSON string.
+        // module, so the import is served from the data: URL (likewise "./replay.js"). Base64 needs no escaping inside
+        // the JSON string.
         html = replaceOnce(html, "\"imports\": {", "\"imports\": {\n        \"./walk.js\": \"data:text/javascript;base64,"
-                + Base64.getEncoder().encodeToString(walkJs.getBytes(StandardCharsets.UTF_8)) + "\",");
+                + Base64.getEncoder().encodeToString(walkJs.getBytes(StandardCharsets.UTF_8)) + "\","
+                + "\n        \"./replay.js\": \"data:text/javascript;base64,"
+                + Base64.getEncoder().encodeToString(replayJs.getBytes(StandardCharsets.UTF_8)) + "\",");
         // JsonWriter escapes '<', so the data cannot terminate the script element early.
         html = replaceOnce(html, "<script type=\"module\" src=\"app.js\"></script>",
                 "<script id=\"city-data\" type=\"application/json\">" + model.json() + "</script>\n"

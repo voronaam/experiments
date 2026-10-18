@@ -60,8 +60,8 @@ public final class SourceAnalyzer {
     /** Absolute file path → last parse. Concurrent because the parallel parse stream fills it. */
     private final Map<Path, CacheEntry> cache = new ConcurrentHashMap<>();
     /**
-     * Path, modification time and size of every manifest seen by the previous analysis, sorted by path. Any difference
-     * (edited, added, removed) empties {@link #cache}.
+     * Path and parse-relevant content ({@link #manifestStamp}) of every manifest seen by the previous analysis, sorted
+     * by path. Any difference (a crate renamed, a manifest added or removed) empties {@link #cache}.
      */
     private List<String> manifestStamps = List.of();
     /** Set after the first analyser crash has been printed, so a systematic bug does not flood the console. */
@@ -88,14 +88,11 @@ public final class SourceAnalyzer {
         List<Path> manifests = new ArrayList<>();
         List<Path> files = findSources(root, manifests);
         // A changed manifest can change the parse of files that did not change themselves (their crate or project),
-        // so start over. Manifests rarely change, so dropping every language's parses is good enough.
+        // so start over. Manifests rarely change in a way that matters, so dropping every language's parses is good
+        // enough. The Rust and D editions use the same stamps.
         List<String> stamps = new ArrayList<>();
         for (Path m : manifests) {
-            try {
-                stamps.add(m + "\0" + Files.getLastModifiedTime(m).toMillis() + "\0" + Files.size(m));
-            } catch (IOException e) {
-                stamps.add(m.toString());
-            }
+            stamps.add(manifestStamp(m));
         }
         if (!stamps.equals(manifestStamps)) {
             cache.clear();
@@ -153,9 +150,31 @@ public final class SourceAnalyzer {
         return new Analysis(root, types, deps, Map.of(), files.size(), failed);
     }
 
+    /**
+     * What a manifest contributes to the parse of other files, as a string that changes exactly when that does: the
+     * path plus, for a {@code Cargo.toml}, the crate name it declares (the Rust analyser uses nothing else from it); a
+     * {@code package.json} matters only by existing (the TypeScript analyser only looks for one). So an edit that only
+     * bumps a version or a dependency keeps the parse cache, which matters for the history replay
+     * ({@link dev.codecity.history.CityHistory}), where such edits come with most snapshots.
+     */
+    private static String manifestStamp(Path manifest) {
+        if (manifest.getFileName().toString().equals("Cargo.toml")) {
+            return manifest + "\0" + RustAnalyzer.crateName(manifest.getParent());
+        }
+        return manifest.toString();
+    }
+
     /** True for files some language analyser understands; used by the watcher. */
     public boolean isSource(Path file) {
         return supportFor(file) != null;
+    }
+
+    /**
+     * True for the manifests ({@code Cargo.toml}, {@code package.json}) whose content feeds into the parse of other
+     * files. The history replay writes exactly the files for which this or {@link #isSource} holds.
+     */
+    public static boolean isManifest(Path file) {
+        return file.getFileName() != null && MANIFESTS.contains(file.getFileName().toString());
     }
 
     /** The analyser for a file, or null if no language accepts it. */

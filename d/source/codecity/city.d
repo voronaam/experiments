@@ -7,16 +7,22 @@
 ///
 /// Indices: `Building.index`, `Building.deps`/`incoming` and the JSON `deps` all index `analysis.types` (which is
 /// sorted by fqn) and `buildings` alike, because `buildings[i]` is built for `analysis.types[i]`.
+///
+/// History replay (`--history`): `analysis.types` is then the union of the present types and the types that only
+/// existed in some sampled snapshot ("gone" types, `Building.gone`), still sorted by fqn. Every building carries one
+/// value per snapshot (`Building.hist`), every district one flag per snapshot (`CityModel.districtHist`). The
+/// stats count present types only.
 module codecity.city;
 
 import codecity.analysis : SourceAnalyzer;
-import codecity.git : load;
+import codecity.git : load, Touch;
 import codecity.github : GitHubInfo;
+import codecity.history;
 import codecity.json : JsonWriter;
 import codecity.layout;
 import codecity.model;
 import core.thread : Thread;
-import std.algorithm : sort, SwapStrategy;
+import std.algorithm : max, sort, SwapStrategy;
 import std.array : replace;
 import std.datetime.stopwatch : StopWatch, AutoStart;
 import std.datetime.systime : Clock;
@@ -43,6 +49,23 @@ struct Building
     size_t[] prs;
     /// Methods sorted by complexity, then size (capped).
     MethodInfo[] methods;
+    /// History replay only: the type no longer exists today; it is shown as it was when last seen.
+    bool gone;
+    /// History replay only (empty arrays otherwise): the type in each snapshot.
+    TypeHistory hist;
+}
+
+/// One building's values per snapshot (index k = `CityModel.snapshots[k]`). The four metrics are -1 where the type
+/// does not exist. `commits` / `authors` / `last` are the git statistics of the type's file in that snapshot, counted
+/// over the commits up to the snapshot's author time; 0, 0 and -1 when the type does not exist there or no such
+/// commit exists.
+struct TypeHistory
+{
+    int[] nom, noa, loc, cx, commits, authors;
+    long[] last;
+
+    /// Whether the type exists in snapshot `k`.
+    bool exists(size_t k) const { return nom[k] >= 0; }
 }
 
 struct LanguageCount
@@ -73,18 +96,29 @@ final class CityModel
     Building[] buildings;
     Stats stats;
     long buildMillis;
+    /// History replay: the sampled commits, oldest first (empty without `--history`), and per district (index into
+    /// `districts`) whether it holds a building that exists in each snapshot.
+    Snapshot[] snapshots;
+    bool[][] districtHist;
     /// Lazily built JSON form; see `json`.
     private string cachedJson;
 
     /// Runs the full pipeline for `root`. `useGit` enables history mining; `github` (valid when `hasGithub`) was
     /// fetched once by the caller and is copied into every model, so rebuilds do not query GitHub again.
-    static CityModel build(SourceAnalyzer analyzer, string root, bool includeTests, bool useGit, bool hasGithub, GitHubInfo github)
+    ///
+    /// `historySamples` > 0 adds the history replay over that many sampled commits (see `codecity.history`); it needs
+    /// `useGit`, and without git history it only prints a warning.
+    static CityModel build(SourceAnalyzer analyzer, string root, bool includeTests, bool useGit, bool hasGithub,
+        GitHubInfo github, uint historySamples = 0)
     {
         auto sw = StopWatch(AutoStart.yes);
         FileHistory[string] history;
+        // every commit per file, kept only for the replay
+        Touch[][string] touches;
+        const wantHistory = historySamples > 0 && useGit;
         // git log runs while the sources are parsed. The thread writes `history` (captured by the closure); join()
         // makes that write visible here before it is read.
-        auto gitThread = new Thread({ if (useGit) history = load(root); });
+        auto gitThread = new Thread({ if (useGit) history = load(root, wantHistory ? &touches : null); });
         gitThread.start();
         auto analysis = analyzer.analyze(root, includeTests);
         gitThread.join();
@@ -92,18 +126,135 @@ final class CityModel
 
         auto c = new CityModel;
         c.name = root.baseName;
+        // the stats describe today's code base, so they are taken before past types join the analysis
+        c.stats = computeStats(analysis);
+        // The replay runs after the present analysis, as it reuses the same analyser (which is not reentrant).
+        History past;
+        if (historySamples > 0 && !useGit) warnNoHistory();
+        const replay = wantHistory && collect(analyzer, root, includeTests, historySamples, past);
+        uint[] footprint;
+        if (replay) footprint = mergeHistory(analysis, past, c.presentTypes);
         c.analysis = analysis;
-        auto l = layout(c.name, c.analysis.types);
+        auto l = layout(c.name, c.analysis.types, footprint);
         c.districts = l.districts;
         c.width = l.width;
         c.depth = l.depth;
         c.hasGithub = hasGithub;
         c.github = github;
         c.buildings = resolve(c.analysis, l.lots, hasGithub ? &c.github : null);
-        c.stats = computeStats(c.analysis);
+        if (replay) c.addHistory(past, touches);
         c.buildMillis = sw.peek.total!"msecs";
         return c;
     }
+
+    bool hasHistory() const { return snapshots.length > 0; }
+
+    /// Fills `snapshots`, every building's `gone` flag and `hist`, and `districtHist` from the replay's `past`, sets
+    /// every building's footprint side to its actual size and recounts the districts' types without the gone ones;
+    /// `touches` are the per-file commits of the git history pass. Runs after `resolve`, so building indices, files
+    /// and lots are final.
+    private void addHistory(ref History past, Touch[][string] touches)
+    {
+        snapshots = past.snapshots;
+        const n = snapshots.length;
+        // Per file: its commits' author times in ascending order, and how many distinct authors the first i + 1 of
+        // them have. A snapshot then needs one binary search: the commits with time ≤ T are a prefix.
+        struct Timeline
+        {
+            long[] times;
+            uint[] distinct;
+        }
+        Timeline[string] timelines;
+        Timeline timeline(string file)
+        {
+            if (auto hit = file in timelines) return *hit;
+            auto list = touches.get(file, null).dup;
+            list.sort!((a, b) => a.time < b.time, SwapStrategy.stable);
+            Timeline tl;
+            bool[string] seen;
+            foreach (t; list)
+            {
+                seen[t.author] = true;
+                tl.times ~= t.time;
+                tl.distinct ~= cast(uint) seen.length;
+            }
+            timelines[file] = tl;
+            return tl;
+        }
+        foreach (ref b; buildings)
+        {
+            auto t = &analysis.types[b.index];
+            b.gone = t.fqn !in presentTypes;
+            // The lot was sized for the type's largest attribute count; the building itself has its actual size
+            // (today's, or when last seen for a gone type), centred in that lot (the lot's x/z is its centre).
+            b.lot.side = side(*t);
+            with (b.hist)
+            {
+                nom = new int[n];
+                noa = new int[n];
+                loc = new int[n];
+                cx = new int[n];
+                commits = new int[n];
+                authors = new int[n];
+                last = new long[n];
+            }
+            foreach (k; 0 .. n)
+            {
+                auto m = t.fqn in past.metrics[k];
+                if (m is null)
+                {
+                    b.hist.nom[k] = b.hist.noa[k] = b.hist.loc[k] = b.hist.cx[k] = -1;
+                    b.hist.last[k] = -1;
+                    continue;
+                }
+                b.hist.nom[k] = m.nom;
+                b.hist.noa[k] = m.noa;
+                b.hist.loc[k] = m.loc;
+                b.hist.cx[k] = m.cx;
+                // The git statistics of the file the type was in at that snapshot (it may have moved since),
+                // keyed like the building's own (see `resolve`).
+                const tl = timeline(m.file);
+                // number of commits with time ≤ the snapshot's (the times are ascending)
+                import std.range : assumeSorted;
+                const count = tl.times.assumeSorted.lowerBound(snapshots[k].time + 1).length;
+                b.hist.commits[k] = cast(int) count;
+                b.hist.authors[k] = count ? tl.distinct[count - 1] : 0;
+                b.hist.last[k] = count ? tl.times[count - 1] : -1;
+            }
+        }
+        // A district is present in a snapshot when one of its own buildings exists there or one of its
+        // sub-districts is present. `districts` is in pre-order, so walking it backwards visits every sub-district
+        // before its parent; a district's parent is the closest earlier district one level up.
+        districtHist = new bool[][](districts.length, n);
+        auto parent = new size_t[districts.length];
+        size_t[] stack;
+        foreach (i, d; districts)
+        {
+            stack = stack[0 .. d.depth];
+            if (d.depth > 0) parent[i] = stack[$ - 1];
+            stack ~= i;
+        }
+        foreach (ref b; buildings)
+            foreach (k; 0 .. n)
+                if (b.hist.exists(k)) districtHist[b.lot.district][k] = true;
+        // District type counts, like the stats, cover today's types only: recount without the gone ones, each
+        // building counting for its district and every enclosing one.
+        foreach (ref d; districts) d.types = 0;
+        foreach (ref b; buildings)
+            if (!b.gone)
+                for (size_t d = b.lot.district;; d = parent[d])
+                {
+                    districts[d].types++;
+                    if (d == 0) break;
+                }
+        foreach_reverse (i; 1 .. districts.length)
+            foreach (k; 0 .. n)
+                if (districtHist[i][k]) districtHist[parent[i]][k] = true;
+    }
+
+    /// History replay: fqns of the types that exist today (the others in `analysis.types` are gone); filled by
+    /// `mergeHistory`.
+    private bool[string] presentTypes;
 
     ref const(TypeDecl) type(size_t i) const { return analysis.types[i]; }
 
@@ -180,7 +331,7 @@ final class CityModel
         }
 
         w.name("districts").beginArray();
-        foreach (d; districts)
+        foreach (i, d; districts)
         {
             w.beginObject()
                 .field("id", d.id)
@@ -188,8 +339,15 @@ final class CityModel
                 .field("depth", d.depth)
                 .fieldNum("x", d.x).fieldNum("z", d.z)
                 .fieldNum("w", d.w).fieldNum("d", d.d)
-                .field("types", d.types)
-                .endObject();
+                .field("types", d.types);
+            if (hasHistory)
+            {
+                // 1 when the district is present in that snapshot, 0 when not
+                w.name("hist").beginArray();
+                foreach (present; districtHist[i]) w.value(present ? 1 : 0);
+                w.endArray();
+            }
+            w.endObject();
         }
         w.endArray();
 
@@ -237,12 +395,77 @@ final class CityModel
             w.name("deps").beginArray();
             foreach (d; b.deps) w.value(d);
             w.endArray();
+            if (hasHistory)
+            {
+                // one value per snapshot, in the order of "history"."snapshots"
+                void list(T)(string key, const T[] values)
+                {
+                    w.name(key).beginArray();
+                    foreach (v; values) w.value(v);
+                    w.endArray();
+                }
+                w.name("hist").beginObject();
+                list("nom", b.hist.nom);
+                list("noa", b.hist.noa);
+                list("loc", b.hist.loc);
+                list("cx", b.hist.cx);
+                list("commits", b.hist.commits);
+                list("authors", b.hist.authors);
+                list("last", b.hist.last);
+                w.endObject();
+                if (b.gone) w.fieldBool("gone", true);
+            }
             w.endObject();
         }
         w.endArray();
+        if (hasHistory)
+        {
+            w.name("history").beginObject().name("snapshots").beginArray();
+            foreach (s; snapshots)
+            {
+                w.beginObject()
+                    .field("commit", s.commit)
+                    .field("time", s.time)
+                    .field("author", s.author)
+                    .field("subject", s.subject)
+                    .field("types", s.types)
+                    .endObject();
+            }
+            w.endArray().endObject();
+        }
         w.endObject();
         return w.finish();
     }
+}
+
+/// Turns the present analysis `a` into the union city of the history replay: every type of `past` that does not
+/// exist today is added as it was last seen, with its dependencies of then restricted to the union, and the types
+/// are sorted by fqn again. `present` receives the fqns of today's types. Returns, per type of the union (same
+/// order), the attribute count that sizes its lot: the largest over the present and all snapshots.
+private uint[] mergeHistory(ref Analysis a, ref History past, out bool[string] present)
+{
+    foreach (ref t; a.types) present[t.fqn] = true;
+    TypeDecl[] gone;
+    foreach (fqn, ref t; past.lastSeen) if (fqn !in present) gone ~= t;
+    a.types ~= gone;
+    a.types.sort!((x, y) => x.fqn < y.fqn);
+    bool[string] union_;
+    foreach (ref t; a.types) union_[t.fqn] = true;
+    foreach (ref t; gone)
+    {
+        string[] deps;
+        foreach (d; past.lastDeps.get(t.fqn, null)) if (d in union_) deps ~= d;
+        a.dependencies[t.fqn] = deps;
+    }
+    auto footprint = new uint[a.types.length];
+    foreach (i, ref t; a.types)
+    {
+        uint noa = t.fqn in present ? t.noa : 0;
+        foreach (ref snapshot; past.metrics)
+            if (auto m = t.fqn in snapshot) noa = max(noa, cast(uint) m.noa);
+        footprint[i] = noa;
+    }
+    return footprint;
 }
 
 /// Joins the per-type data into `Building`s, one per `a.types` entry and in the same order: the type's lot,

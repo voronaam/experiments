@@ -68,9 +68,15 @@ enum ImGuiKey : int
     Escape = 526,
     UpArrow = 515,
     DownArrow = 516,
+    Home = 519,
+    End = 520,
     F = 551,
     G = 552,
     N = 559,
+    P = 561,
+    R = 563,
+    Comma = 597,
+    Period = 599,
     Slash = 600,
 }
 
@@ -138,6 +144,7 @@ enum ConfigFlags_NoKeyboard = 1 << 6;
 enum HoveredFlags_AnyWindow = 4;
 enum TableFlags_SizingStretchSame = 32768;
 enum InputTextFlags_EnterReturnsTrue = 64;
+enum SliderFlags_NoInput = 1 << 7;
 
 ImGuiContext* igCreateContext(ImFontAtlas* shared_font_atlas);
 void igDestroyContext(ImGuiContext*);
@@ -169,6 +176,7 @@ bool igCheckbox(const(char)* label, bool* v);
 bool igBeginCombo(const(char)* label, const(char)* preview_value, int flags);
 void igEndCombo();
 bool igSelectable_Bool(const(char)* label, bool selected, int flags, ImVec2 size);
+bool igSliderFloat(const(char)* label, float* v, float v_min, float v_max, const(char)* format, int flags);
 bool igInputTextWithHint(const(char)* label, const(char)* hint, char* buf, size_t buf_size, int flags, void* callback, void* user_data);
 void igBeginDisabled(bool disabled);
 void igEndDisabled();
@@ -223,6 +231,7 @@ ImDrawList* igGetBackgroundDrawList_Nil();
 ImDrawList* igGetForegroundDrawList_Nil();
 void ImDrawList_AddRectFilled(ImDrawList* self, ImVec2 p_min, ImVec2 p_max, ImU32 col, float rounding, int flags);
 void ImDrawList_AddRect(ImDrawList* self, ImVec2 p_min, ImVec2 p_max, ImU32 col, float rounding, int flags, float thickness);
+void ImDrawList_AddTriangleFilled(ImDrawList* self, ImVec2 p1, ImVec2 p2, ImVec2 p3, ImU32 col);
 void ImDrawList_AddText_Vec2(ImDrawList* self, ImVec2 pos, ImU32 col, const(char)* text_begin, const(char)* text_end);
 
 ImFont* ImFontAtlas_AddFontFromMemoryTTF(ImFontAtlas* self, void* data, int size, float size_pixels, const(ImFontConfig)* cfg, const(ushort)* ranges);

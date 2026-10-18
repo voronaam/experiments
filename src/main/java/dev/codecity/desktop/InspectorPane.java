@@ -61,12 +61,22 @@ final class InspectorPane extends ScrollPane {
         setMaxWidth(360);
     }
 
+    /** Which replay snapshot to describe: its index and its date as shown ({@code YYYY-MM-DD}). */
+    record ReplayAt(int snapshot, String date) {
+    }
+
+    /** {@link #show(CityModel, Building, IntPredicate, ReplayAt)} outside replay. */
+    void show(CityModel model, Building b, IntPredicate visible) {
+        show(model, b, visible, null);
+    }
+
     /**
      * Fills the panel for {@code b} and makes it visible. Dependency lists and counts only include buildings that pass
      * {@code visible}, so they agree with the arcs drawn in the city when test code is hidden. Git metrics are shown
-     * only when the model has git history.
+     * only when the model has git history. During a history replay ({@code replay} non-null) the present-day details
+     * stay, followed by the replayed snapshot's four metrics; a type that no longer exists says so.
      */
-    void show(CityModel model, Building b, IntPredicate visible) {
+    void show(CityModel model, Building b, IntPredicate visible, ReplayAt replay) {
         content.getChildren().clear();
         TypeInfo t = b.type();
 
@@ -133,7 +143,15 @@ final class InspectorPane extends ScrollPane {
         fileRow.setAlignment(Pos.CENTER_LEFT);
         fileRow.getStyleClass().add("file-row");
 
-        content.getChildren().addAll(head, badges, metrics, fileRow);
+        content.getChildren().addAll(head, badges, metrics);
+        if (b.gone()) {
+            content.getChildren().add(styled(new Label("Removed before today"), "replay-note"));
+        }
+        if (replay != null && b.hist() != null) {
+            content.getChildren().addAll(styled(new Label("Replaying — values at " + replay.date()), "replay-note"),
+                    replayMetrics(b, replay.snapshot()));
+        }
+        content.getChildren().add(fileRow);
         gitHub(model.github(), b);
 
         if (!b.methods().isEmpty()) {
@@ -246,6 +264,32 @@ final class InspectorPane extends ScrollPane {
     }
 
     /** Adds one value/label tile to the three-column grid at position {@code cell}; returns the next position. */
+    /** The type's methods, attributes, lines and complexity in snapshot {@code k}; "—" where it did not exist. */
+    private static GridPane replayMetrics(Building b, int k) {
+        GridPane grid = new GridPane();
+        grid.getStyleClass().add("metrics");
+        for (int c = 0; c < 4; c++) {
+            javafx.scene.layout.ColumnConstraints col = new javafx.scene.layout.ColumnConstraints();
+            col.setPercentWidth(25);
+            grid.getColumnConstraints().add(col);
+        }
+        int[][] values = {b.hist().nom, b.hist().noa, b.hist().loc, b.hist().cx};
+        String[] labels = {"methods", "attributes", "lines", "cx"};
+        for (int i = 0; i < 4; i++) {
+            int v = values[i][k];
+            metric(grid, 0, v < 0 ? "—" : Look.fmt(v), labels[i]);
+            // metric() places by a 3-column grid; move the box into column i of the single row.
+            Node box = grid.getChildren().getLast();
+            GridPane.setConstraints(box, i, 0);
+        }
+        return grid;
+    }
+
+    private static <T extends Node> T styled(T node, String style) {
+        node.getStyleClass().add(style);
+        return node;
+    }
+
     private static int metric(GridPane grid, int cell, String value, String label) {
         Label v = new Label(value);
         v.getStyleClass().add("metric-value");

@@ -192,7 +192,7 @@ fn crate_cache() -> &'static Mutex<HashMap<PathBuf, Option<String>>> {
 /// A regex instead of a TOML parser: from a line starting with `[package]`, match lazily up to the first line that
 /// sets `name`, skipping only lines that do not start with `[` (after indentation), so the match stays inside the
 /// table. A `[` elsewhere on a line (e.g. `authors = ["…"]` listed first) does not stop it.
-fn read_crate_name(dir: &Path) -> Option<String> {
+pub fn read_crate_name(dir: &Path) -> Option<String> {
     static PACKAGE_NAME: OnceLock<Regex> = OnceLock::new();
     let re = PACKAGE_NAME.get_or_init(|| {
         Regex::new(r#"(?m)^\[package\][^\n]*\n(?:[ \t\r]*(?:[^\[\s][^\n]*)?\n)*?[ \t]*name\s*=\s*"([^"]+)""#).unwrap()

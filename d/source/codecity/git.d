@@ -1,7 +1,9 @@
 /// Mines `git log` once for per-file churn, author count and recency.
 ///
 /// Runs on its own thread while the sources are parsed (see `CityModel.build`). The result is keyed by absolute
-/// path so it can be matched against `TypeDecl.file`. Also hosts the small git helpers used by `codecity.github`.
+/// path so it can be matched against `TypeDecl.file`. Also hosts the small git helpers used by `codecity.github` and
+/// by the history replay (`codecity.history`): `bytes` for the output of long-running commands and `BlobReader` for
+/// reading file contents out of the object database.
 module codecity.git;
 
 import codecity.model : FileHistory;
@@ -11,6 +13,14 @@ import std.path : buildNormalizedPath;
 import std.process : kill, pipe, Pid, spawnProcess, tryWait, wait;
 import std.stdio : File;
 import std.string : strip;
+
+/// One commit touching a file, as the history pass in `load` saw it: its author time (Unix seconds) and author
+/// e-mail. The history replay counts these up to each snapshot's time (see `codecity.city`).
+struct Touch
+{
+    long time;
+    string author;
+}
 
 /// How long a short command (`run`, `gh auth token`) may take before `output` kills it.
 private enum timeout = 30.seconds;
@@ -141,7 +151,10 @@ string lossyUtf8(const(char)[] s)
 /// Merges are skipped (`--no-merges`). With `--no-renames` a rename is listed as the old and the new path, and the
 /// file's history under its new name starts at the rename. Any failure, including a malformed timestamp, yields an
 /// empty result rather than an error.
-FileHistory[string] load(string root)
+///
+/// With `touches` non-null, every commit of every file is also kept there (same keys, newest commit first, the order
+/// of `git log`), for the history replay; it stays empty whenever the result is empty.
+FileHistory[string] load(string root, Touch[][string]* touches = null)
 {
     FileHistory[string] result;
     auto top = run(root, "rev-parse", "--show-toplevel");
@@ -155,6 +168,8 @@ FileHistory[string] load(string root)
         uint commits;
         bool[string] authors;
         long last = long.min, first = long.max;
+        /// Only filled when the caller asked for `touches`.
+        Touch[] touches;
     }
     Acc[string] files;
     try
@@ -193,6 +208,7 @@ FileHistory[string] load(string root)
                 acc.authors[author] = true;
                 if (time > acc.last) acc.last = time;
                 if (time < acc.first) acc.first = time;
+                if (touches !is null) acc.touches ~= Touch(time, author);
             }
         }
         wait(pid);
@@ -200,8 +216,101 @@ FileHistory[string] load(string root)
     catch (Exception)
         return result;
     foreach (rel, a; files)
-        result[buildNormalizedPath(top, rel)] = FileHistory(a.commits, cast(uint) a.authors.length, a.last, a.first);
+    {
+        const path = buildNormalizedPath(top, rel);
+        result[path] = FileHistory(a.commits, cast(uint) a.authors.length, a.last, a.first);
+        if (touches !is null) (*touches)[path] = a.touches;
+    }
     return result;
+}
+
+/// The raw standard output of `git -C dir args…`, or null when git cannot be started or exits with an error.
+///
+/// Unlike `run` there is no time limit and nothing is stripped or decoded, so it suits long-running commands and
+/// NUL-separated (`-z`) output, e.g. the history replay's `rev-list`, `ls-tree` and `diff-tree`. stderr is
+/// discarded and stdin is the null device. An empty but successful output is returned as an empty, non-null array.
+ubyte[] bytes(string dir, string[] args...)
+{
+    try
+    {
+        auto p = pipe();
+        auto pid = spawn(["git", "-C", dir] ~ args, p.writeEnd);
+        ubyte[] data = [];
+        ubyte[65536] buf;
+        while (true)
+        {
+            const chunk = p.readEnd.rawRead(buf[]);
+            if (chunk.length == 0) break;
+            data ~= chunk;
+        }
+        return wait(pid) == 0 ? data : null;
+    }
+    catch (Exception)
+        return null;
+}
+
+/// Reads blobs out of a repository's object database through one long-running `git cat-file --batch` process, so
+/// that materialising thousands of files costs one process rather than one per file.
+///
+/// The protocol: for every object name written to its stdin (one per line), git answers with a header line
+/// `<sha> <type> <size>` followed by exactly `size` bytes of content and a newline, or with `<sha> missing`. Requests
+/// are sent in chunks of `chunk` names and all answers to a chunk are read before the next one is written: 512 names
+/// (about 21 KB) always fit into the pipe, so the writer never blocks while git waits for its answers to be read.
+final class BlobReader
+{
+    private enum chunk = 512;
+    private Pid pid;
+    /// Our ends of the pipes: requests go to git's stdin, answers come from its stdout.
+    private File requests, answers;
+
+    /// Starts `git cat-file --batch` in `dir`. Throws when git cannot be started.
+    this(string dir)
+    {
+        auto input = pipe(), output = pipe();
+        pid = spawnProcess(["git", "-C", dir, "cat-file", "--batch"], input.readEnd, output.writeEnd,
+            File("/dev/null", "w"));
+        requests = input.writeEnd;
+        answers = output.readEnd;
+    }
+
+    /// The contents of the blobs named by `shas` (40-hex object names), in the same order. Throws when an object is
+    /// missing or the process ended early.
+    ubyte[][] read(const string[] shas)
+    {
+        import std.array : split;
+        ubyte[][] result;
+        result.reserve(shas.length);
+        for (size_t start = 0; start < shas.length; start += chunk)
+        {
+            const part = shas[start .. start + (shas.length - start < chunk ? shas.length - start : chunk)];
+            foreach (sha; part) requests.write(sha, "\n");
+            requests.flush();
+            foreach (sha; part)
+            {
+                const header = answers.readln().strip.split(' ');
+                if (header.length != 3) throw new Exception("git cat-file: cannot read object " ~ sha);
+                auto data = new ubyte[header[2].to!size_t];
+                // rawRead loops until the buffer is full (or end of file, which means git died)
+                if (data.length && answers.rawRead(data).length != data.length)
+                    throw new Exception("git cat-file: object " ~ sha ~ " cut short");
+                ubyte[1] newline;
+                answers.rawRead(newline[]);
+                result ~= data;
+            }
+        }
+        return result;
+    }
+
+    /// Closes git's stdin, which ends the process, and waits for it.
+    void close()
+    {
+        try
+        {
+            requests.close();
+            wait(pid);
+        }
+        catch (Exception) {}
+    }
 }
 
 /// Canonical absolute path (symlinks resolved), like Java's toRealPath / Rust's canonicalize.

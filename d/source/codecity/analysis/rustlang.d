@@ -190,7 +190,7 @@ private Crate crateOf(string root, string dir)
 /// A regex rather than a TOML parser: `(?m)` lets `^` match at every line start; the lines lazily skipped before
 /// `name` must not start with `[` (after indentation), so the match cannot run into the next `[table]`. A `[`
 /// elsewhere on a line (`authors = ["a"]`) does not stop it.
-private string readCrateName(string dir)
+package string readCrateName(string dir)
 {
     const manifest = buildPath(dir, "Cargo.toml");
     if (!manifest.exists || !manifest.isFile) return "";

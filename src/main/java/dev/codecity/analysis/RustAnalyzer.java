@@ -570,6 +570,14 @@ public final class RustAnalyzer implements LanguageSupport {
         return new Crate(name.replace('-', '_'), root);
     }
 
+    /**
+     * The crate name (underscores) declared by {@code dir/Cargo.toml}, or "" when there is none. This is all the
+     * analyser takes from a manifest, so {@link SourceAnalyzer} keys its cache invalidation on it.
+     */
+    static String crateName(Path dir) {
+        return readCrate(dir).map(Crate::name).orElse("");
+    }
+
     /** Reads {@code dir/Cargo.toml}; empty when it is missing, unreadable or has no {@code [package]} name. */
     private static Optional<Crate> readCrate(Path dir) {
         Path manifest = dir.resolve("Cargo.toml");

@@ -6,6 +6,7 @@ import dev.codecity.github.GitHubInfo;
 import dev.codecity.github.GitHubRepo;
 import dev.codecity.github.PullRequests;
 import dev.codecity.github.RepoCloner;
+import dev.codecity.history.CityHistory;
 import dev.codecity.server.CityServer;
 
 import java.awt.Desktop;
@@ -33,7 +34,8 @@ import java.util.Optional;
  * gets the result. With {@code --watch}, a {@link SourceWatcher} calls {@code CityModel.build} again on its own
  * background thread whenever a source file changes and hands the new model to the running viewer, which swaps it in.
  * The GitHub context (remote, permalink ref, open pull requests) is fetched only once at start-up and reused for every
- * rebuild.
+ * rebuild. With {@code --history}, {@code CityModel.build} also computes the history replay between the git history
+ * and the layout; it is computed once, which is why it cannot be combined with {@code --watch}.
  */
 public final class CodeCity {
 
@@ -55,6 +57,7 @@ public final class CodeCity {
               --no-github       no GitHub links or pull-request overlay
               --no-open         don't open a browser
               --export FILE     write a self-contained HTML file and exit
+              --history[=N]     replay the city's growth over N sampled commits (default 60)
               -h, --help        show this help
 
             Metaphor: packages / directories / modules are districts; classes, interfaces, structs,
@@ -69,14 +72,15 @@ public final class CodeCity {
             """;
 
     /**
-     * The parsed command line. Exactly one of {@code root} (a local directory, already resolved to its real path) and
+     * The parsed command line; {@code history} is the number of replay snapshots, 0 without {@code --history}.
+     * Exactly one of {@code root} (a local directory, already resolved to its real path) and
      * {@code remote} (a GitHub repository still to be cloned) is set; {@link #withRoot} turns the latter into the
      * former once the clone exists.
      */
     record Options(Path root, GitHubRepo remote, int port, boolean watch, boolean includeTests, boolean git,
-                   boolean github, boolean open, Path export, boolean gui) {
+                   boolean github, boolean open, Path export, boolean gui, int history) {
         Options withRoot(Path dir) {
-            return new Options(dir, null, port, watch, includeTests, git, github, open, export, gui);
+            return new Options(dir, null, port, watch, includeTests, git, github, open, export, gui, history);
         }
     }
 
@@ -117,7 +121,7 @@ public final class CodeCity {
         System.out.println("Analysing " + opts.root() + " …");
         // An effectively final copy, so the watcher lambdas below can capture it.
         Options o = opts;
-        CityModel model = CityModel.build(analyzer, o.root(), o.includeTests(), o.git(), github);
+        CityModel model = CityModel.build(analyzer, o.root(), o.includeTests(), o.git(), github, o.history());
         printSummary(model);
         if (model.types().isEmpty()) {
             System.err.println("No Java, TypeScript or Rust types found under " + opts.root());
@@ -180,6 +184,7 @@ public final class CodeCity {
         boolean git = true;
         boolean open = true;
         Path export = null;
+        int history = 0;
         List<String> rest = new ArrayList<>(List.of(args));
         while (!rest.isEmpty()) {
             String a = rest.removeFirst();
@@ -200,7 +205,13 @@ public final class CodeCity {
                 case "--no-github" -> github = false;
                 case "--no-open" -> open = false;
                 case "--export" -> export = Path.of(require(rest, a));
+                // Only the attached form takes a count, so "--history path" never mistakes the path for one.
+                case "--history" -> history = CityHistory.DEFAULT_SNAPSHOTS;
                 default -> {
+                    if (a.startsWith("--history=")) {
+                        history = snapshotCount(a.substring("--history=".length()));
+                        continue;
+                    }
                     if (a.startsWith("-")) {
                         throw new IllegalArgumentException("unknown option " + a);
                     }
@@ -216,8 +227,12 @@ public final class CodeCity {
                 }
             }
         }
+        // A replay is computed once; a live rebuild would have to redo it on every change.
+        if (history > 0 && watch) {
+            throw new IllegalArgumentException("--history cannot be combined with --watch");
+        }
         if (remote != null) {
-            return new Options(null, remote, port, watch, tests, git, github, open, export, gui);
+            return new Options(null, remote, port, watch, tests, git, github, open, export, gui, history);
         }
         Path dir = root == null ? Path.of(".") : root;
         if (!Files.isDirectory(dir)) {
@@ -228,7 +243,21 @@ public final class CodeCity {
         } catch (IOException e) {
             throw new IllegalArgumentException("cannot resolve " + dir + ": " + e.getMessage());
         }
-        return new Options(dir, null, port, watch, tests, git, github, open, export, gui);
+        return new Options(dir, null, port, watch, tests, git, github, open, export, gui, history);
+    }
+
+    /** The N of {@code --history=N}: a whole number from 2 to 500. */
+    private static int snapshotCount(String value) {
+        try {
+            int n = Integer.parseInt(value);
+            if (n >= CityHistory.MIN_SNAPSHOTS && n <= CityHistory.MAX_SNAPSHOTS) {
+                return n;
+            }
+        } catch (NumberFormatException ignored) {
+            // reported below
+        }
+        throw new IllegalArgumentException("--history needs a number of snapshots from "
+                + CityHistory.MIN_SNAPSHOTS + " to " + CityHistory.MAX_SNAPSHOTS);
     }
 
     /**

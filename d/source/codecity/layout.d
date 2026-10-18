@@ -77,7 +77,14 @@ struct Layout
 /// footprint area grows roughly linearly with it, and even a type without attributes gets a visible 1.2 × 1.2 lot.
 double side(ref const TypeDecl t) pure nothrow @safe
 {
-    return 1.2 + 0.8 * sqrt(cast(double) t.noa);
+    return side(t.noa);
+}
+
+/// ditto, for an attribute count alone. The history replay uses this to size a building at each snapshot, and the
+/// layout to size lots by a type's largest attribute count over its history (see `layout`).
+double side(uint noa) pure nothrow @safe
+{
+    return 1.2 + 0.8 * sqrt(cast(double) noa);
 }
 
 /// A district while the layout is being computed.
@@ -93,6 +100,8 @@ private final class Node
     /// Types declared directly in this district (not in its sub-districts). These point into the `types` array
     /// passed to `layout`, which outlives the whole computation.
     const(TypeDecl)*[] types;
+    /// The footprint side of each of `types`, same order (see `layout` for when it is not just `side(*t)`).
+    double[] sides;
     /// A build module (Maven/Gradle module, npm project, crate). Modules are never merged into their parent.
     bool module_;
     /// How this district's name joins with a collapsed child's: ".", "/" or "::".
@@ -137,9 +146,14 @@ private struct Item
 }
 
 /// Lays out `types` as a city called `cityName`; see the module documentation for the passes and coordinates.
-Layout layout(string cityName, const TypeDecl[] types)
+///
+/// `footprintNoa`, when given, holds one attribute count per type (same order as `types`) that sizes its lot instead
+/// of the type's own `noa`. The history replay passes each type's largest attribute count over the present and all
+/// snapshots, so that every lot is big enough for the building at its largest; nothing else changes.
+Layout layout(string cityName, const TypeDecl[] types, const(uint)[] footprintNoa = null)
 {
-    auto root = buildTree(cityName, types);
+    assert(footprintNoa is null || footprintNoa.length == types.length);
+    auto root = buildTree(cityName, types, footprintNoa);
     measure(root);
     Layout result;
     // Start at the top-left corner that puts the whole city's centre on the origin.
@@ -152,13 +166,13 @@ Layout layout(string cityName, const TypeDecl[] types)
 /// Builds the district tree. With more than one build module, the first level is one district per module, so that
 /// packages with the same name in different modules stay apart. Below that, each package segment is one level:
 /// `com.acme.shop` becomes `com → acme → shop`, and the type is added to the last one.
-private Node buildTree(string cityName, const TypeDecl[] types)
+private Node buildTree(string cityName, const TypeDecl[] types, const(uint)[] footprintNoa)
 {
     bool[string] modules;
     foreach (ref t; types) modules[t.module_] = true;
     const multiModule = modules.length > 1;
     auto root = new Node(cityName, "");
-    foreach (ref t; types)
+    foreach (i, ref t; types)
     {
         auto node = root;
         if (multiModule)
@@ -187,6 +201,7 @@ private Node buildTree(string cityName, const TypeDecl[] types)
         }
         // `t` is a ref into the caller's array, so this is a pointer to the original declaration, not a copy.
         node.types ~= &t;
+        node.sides ~= footprintNoa is null ? side(t) : side(footprintNoa[i]);
     }
     collapse(root);
     return root;
@@ -217,6 +232,7 @@ private void collapse(Node node)
             joined.separator = only.separator;
             joined.children = only.children;
             joined.types = only.types;
+            joined.sides = only.sides;
             c = joined;
         }
         // The chain's last district may still have chains of its own further down.
@@ -237,11 +253,7 @@ private void measure(Node node)
         measure(child);
         items ~= Item(child.w + gap, child.d + gap, 0, 0, true, i);
     }
-    foreach (i, t; node.types)
-    {
-        const s = side(*t);
-        items ~= Item(s + gap, s + gap, 0, 0, false, i);
-    }
+    foreach (i, s; node.sides) items ~= Item(s + gap, s + gap, 0, 0, false, i);
     double w, d;
     pack(items, w, d);
     node.items = items;
@@ -272,7 +284,7 @@ private void place(Node node, double left, double top, uint depth, ref Layout re
             // The item is the footprint plus the street; the building sits in its top-left corner, and the lot
             // stores the footprint's centre. It stands on this district's platform, one level above depth.
             auto t = node.types[item.index];
-            const s = side(*t);
+            const s = node.sides[item.index];
             result.lots[t.fqn] = Lot(x + s / 2, z + s / 2, s, (depth + 1) * platform, index);
         }
     }
@@ -480,4 +492,7 @@ unittest
     }
     auto single = layout("city", [ty("com.acme.shop", "Cart", 2)]);
     assert(single.districts.length == 2 && single.districts[1].label == "com.acme.shop");
+    // a footprint override sizes the lot by the given attribute count instead of the type's own
+    auto wide = layout("city", [ty("com.acme.shop", "Cart", 2)], [9]);
+    assert(wide.lots["com.acme.shop.Cart"].side == side(9) && abs(side(9) - 3.6) < 1e-12);
 }

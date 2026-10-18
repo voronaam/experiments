@@ -129,6 +129,18 @@ double heightValue(HeightMetric m, ref const TypeDecl t)
     }
 }
 
+/// History replay: the building's metric value in snapshot `k`, or -1 when the type does not exist there.
+double heightValueAt(HeightMetric m, ref const Building b, size_t k)
+{
+    final switch (m)
+    {
+    case HeightMetric.nom: return b.hist.nom[k];
+    case HeightMetric.loc: return b.hist.loc[k];
+    case HeightMetric.cx: return b.hist.cx[k];
+    case HeightMetric.noa: return b.hist.noa[k];
+    }
+}
+
 /// What a building's colour shows. The order matches `colorLabels` / `colorWords` and the preference names in
 /// `codecity.gui.app`. `kind` is categorical; all the others are numeric and coloured through `Scale`.
 enum ColorMetric { commits, age, authors, prs, cx, density, loc, kind }
@@ -176,6 +188,27 @@ double colorValue(ColorMetric m, ref const TypeDecl t, ref const Building b)
     }
 }
 
+/// History replay: the raw value of a colour metric for one building in snapshot `k`, whose author time is `at`.
+/// The git metrics use the commits up to that snapshot (`Building.hist`) and recency is measured from `at` instead
+/// of now; the code metrics use the snapshot's values. Open pull requests belong to the present, so `prs` is never
+/// asked for here (the viewer falls back to churn during replay).
+double colorValueAt(ColorMetric m, ref const Building b, size_t k, long at)
+{
+    final switch (m)
+    {
+    case ColorMetric.commits, ColorMetric.prs: return b.hist.commits[k];
+    case ColorMetric.age:
+        if (b.hist.last[k] < 0) return double.infinity;
+        const days = (at - b.hist.last[k]) / 86400.0;
+        return days > 0 ? days : 0;
+    case ColorMetric.authors: return b.hist.authors[k];
+    case ColorMetric.cx: return b.hist.cx[k];
+    case ColorMetric.density: return b.hist.nom[k] <= 0 ? 0 : cast(double) b.hist.cx[k] / b.hist.nom[k];
+    case ColorMetric.loc: return b.hist.loc[k];
+    case ColorMetric.kind: return 0;
+    }
+}
+
 /// Colour scale for a metric: log-scaled and clipped at the 98th percentile.
 ///
 /// A position `x` in 0..1 along the ramp is `log1p(v) / log1p(hi)` (or `v / hi` for `density`, whose values are small
@@ -188,12 +221,14 @@ struct Scale
     /// `hi` the 98th percentile.
     double lo = 0, hi = 1;
 
-    /// Builds the scale for `metric` from the finite values of all buildings (including hidden test types).
+    /// Builds the scale for `metric` from the finite values of all buildings (including hidden test types, but not
+    /// the types that are gone today, which only the history replay shows).
     static Scale of(ColorMetric metric, CityModel model)
     {
         double[] finite;
         foreach (ref b; model.buildings)
         {
+            if (b.gone) continue;
             const v = colorValue(metric, model.analysis.types[b.index], b);
             if (isFinite(v)) finite ~= v;
         }
@@ -214,7 +249,20 @@ struct Scale
     RGB color(ref const TypeDecl t, ref const Building b) const
     {
         if (metric == ColorMetric.kind) return kindColor(t.kind);
-        const v = colorValue(metric, t, b);
+        return valueColor(colorValue(metric, t, b));
+    }
+
+    /// History replay: the building's colour in snapshot `k` (author time `at`) on this scale, i.e. on the
+    /// present-day scale, so colours stay comparable over time.
+    RGB colorAt(ref const TypeDecl t, ref const Building b, size_t k, long at) const
+    {
+        if (metric == ColorMetric.kind) return kindColor(t.kind);
+        return valueColor(colorValueAt(metric, b, k, at));
+    }
+
+    /// The ramp colour of a raw value of this scale's (numeric) metric.
+    private RGB valueColor(double v) const
+    {
         const invert = metric == ColorMetric.age;
         double x;
         if (!isFinite(v)) x = invert ? 0 : 1;
