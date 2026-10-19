@@ -1,4 +1,4 @@
-//! TypeScript support (tree-sitter). Directories are districts; classes, interfaces, enums and type aliases are
+//! TypeScript support (parsed with the in-house [`super::typescript_parse`]). Directories are districts; classes, interfaces, enums and type aliases are
 //! buildings; each file's top-level functions and constants form one "module" building named after the file.
 //!
 //! # Identifiers
@@ -15,24 +15,17 @@
 //! per file, the top-level names it declares ([`Context::names`]) and its imports, and [`link`] resolves each
 //! reference by looking in that order, following an import to the file it names (see [`resolve_source`]).
 
-use super::syntax::{children, first_line, last_line, named_children, operator, walk, Src};
 use super::text::{count_loc, in_test_directory, lines};
-use super::{with_parser, Context as AnyContext, Linked, ParsedFile};
+use super::typescript_parse::{self, Field, NodeKind, Tree, DECISION, REF};
+use super::{Context as AnyContext, Linked, ParsedFile};
 use crate::model::{slashes, Language, MethodInfo, TypeInfo};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
-use tree_sitter::Node;
 
 /// Node kinds of function values: a `const f = () => …` declarator or a class field holding one is treated as a
 /// function / method rather than an attribute.
-const FUNCTION_VALUES: [&str; 4] = ["arrow_function", "function_expression", "function", "generator_function"];
-/// Node kinds that add one to cyclomatic complexity. `for_in_statement` covers both `for…in` and `for…of`;
-/// `switch_case` is a `case` clause (the `default` clause is a separate `switch_default` node and does not count).
-const DECISIONS: [&str; 8] = [
-    "if_statement", "for_statement", "for_in_statement", "while_statement", "do_statement", "switch_case",
-    "catch_clause", "ternary_expression",
-];
+const FUNCTION_VALUES: [NodeKind; 3] = [NodeKind::Arrow, NodeKind::FunctionExpr, NodeKind::GeneratorExpr];
 
 /// TypeScript sources by file name. Declaration files (`.d.ts`, …) are skipped: they only describe code that lives
 /// elsewhere (often generated or third-party).
@@ -72,17 +65,9 @@ pub struct Context {
 /// Parses one TypeScript file into its types, its module building (if it has any top-level code) and the linker
 /// context.
 pub fn parse(root: &Path, file: &Path, code: &str) -> ParsedFile {
-    // `.tsx` needs the TSX grammar: in plain TypeScript `<T>x` is a type assertion, in TSX it is JSX.
+    // `.tsx` enables JSX: in plain TypeScript `<T>x` is a type assertion, in TSX it is JSX.
     let tsx = file.extension().is_some_and(|e| e == "tsx");
-    let tree = if tsx {
-        with_parser("tsx", || tree_sitter_typescript::LANGUAGE_TSX.into(), |p| p.parse(code, None))
-    } else {
-        with_parser("typescript", || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), |p| p.parse(code, None))
-    };
-    let Some(tree) = tree else {
-        return ParsedFile { types: vec![], context: AnyContext::None, failed: true };
-    };
-    let src = Src { code };
+    let tree = typescript_parse::parse(code, tsx);
     let lines = lines(code);
     let relative = file.strip_prefix(root).unwrap_or(file);
     let path = slashes(relative);
@@ -90,7 +75,7 @@ pub fn parse(root: &Path, file: &Path, code: &str) -> ParsedFile {
     let package = package_of(&project, relative);
     let file_name = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let mut st = FileState {
-        src,
+        tree: &tree,
         lines,
         file,
         test: in_test_directory(relative) || is_test_file(&file_name),
@@ -108,16 +93,15 @@ pub fn parse(root: &Path, file: &Path, code: &str) -> ParsedFile {
         module_attributes: 0,
         module_loc: 0,
     };
-    let root_node = tree.root_node();
-    st.visit_statements(root_node, "");
+    st.visit_statements(tree.root, "");
     st.finish_module(&file_name);
     let ctx = Context { path: st.path.clone(), imports: st.imports, names: st.names, default_export: st.default_export };
-    ParsedFile { types: st.types, context: AnyContext::TypeScript(ctx), failed: root_node.has_error() }
+    ParsedFile { types: st.types, context: AnyContext::TypeScript(ctx), failed: tree.has_error }
 }
 
 /// Everything collected while walking one file.
 struct FileState<'a> {
-    src: Src<'a>,
+    tree: &'a Tree<'a>,
     lines: Vec<&'a str>,
     file: &'a Path,
     path: String,
@@ -139,46 +123,51 @@ struct FileState<'a> {
 }
 
 impl<'a> FileState<'a> {
-    fn loc(&self, n: Node) -> u32 {
-        count_loc(&self.lines, first_line(n), last_line(n))
+    fn loc(&self, n: u32) -> u32 {
+        count_loc(&self.lines, self.tree.first_line(n), self.tree.last_line(n))
+    }
+
+    /// Text of the child with the given field, or "".
+    fn field_text(&self, n: u32, f: Field) -> &'a str {
+        self.tree.field(n, f).map(|c| self.tree.text(c)).unwrap_or("")
     }
 
     /// Visits the statements of a program or namespace body. `prefix` is the namespace path (`"Ns."`), "" at the top.
     ///
-    /// Unwraps the statement forms that wrap a declaration: `export …` (a `declaration` field, or for
-    /// `export default <expr>` a `value` field), `declare …` (ambient_declaration) and the expression_statement the
-    /// grammar produces for `namespace X { … }`. Other expression statements are top-level code for the module
-    /// building. Re-exports (`export { a } from "./b"`) have neither field and are ignored.
-    fn visit_statements(&mut self, container: Node<'a>, prefix: &str) {
-        for child in named_children(container) {
+    /// Unwraps the statement forms that wrap a declaration: `export …` (a `Decl` child, or for `export default <expr>`
+    /// a `Value` child) and `declare …` (Ambient). Expression statements are top-level code for the module building.
+    /// Re-exports (`export { a } from "./b"`) have neither child and are ignored, as is `export declare …` (an
+    /// ambient declaration inside an export, which is not unwrapped).
+    fn visit_statements(&mut self, container: u32, prefix: &str) {
+        let tree = self.tree;
+        for &child in tree.children(container) {
             let mut decl = child;
             let mut is_default = false;
-            match child.kind() {
-                "import_statement" => {
+            match tree.kind(child) {
+                NodeKind::Import => {
                     self.add_import(child);
                     continue;
                 }
-                "export_statement" => {
-                    is_default = children(child).any(|c| c.kind() == "default");
-                    match child.child_by_field_name("declaration") {
+                NodeKind::Export | NodeKind::ExportDefault => {
+                    is_default = tree.kind(child) == NodeKind::ExportDefault;
+                    match tree.field(child, Field::Decl) {
                         Some(d) => decl = d,
                         None => {
-                            if let (Some(value), true) = (child.child_by_field_name("value"), is_default) {
+                            if let (Some(value), true) = (tree.field(child, Field::Value), is_default) {
                                 self.export_default_expression(value);
                             }
                             continue;
                         }
                     }
                 }
-                // tree-sitter-typescript parses `namespace X { }` as an expression (internal_module) wrapped in an
-                // expression_statement, so such statements have to be checked for a namespace first.
-                "ambient_declaration" | "expression_statement" => {
-                    let Some(first) = child.named_child(0) else { continue };
+                NodeKind::Ambient => {
+                    let Some(&first) = tree.children(child).first() else { continue };
                     decl = first;
-                    if child.kind() == "expression_statement" && decl.kind() != "internal_module" {
-                        self.add_statement(child, decl);
-                        continue;
-                    }
+                }
+                NodeKind::ExprStmt => {
+                    let Some(&first) = tree.children(child).first() else { continue };
+                    self.add_statement(child, first);
+                    continue;
                 }
                 _ => {}
             }
@@ -193,62 +182,62 @@ impl<'a> FileState<'a> {
     ///
     /// Classes, interfaces, enums and type aliases become buildings; functions and variables go into the module
     /// building; namespaces are walked recursively with a longer prefix and do not become buildings themselves.
-    fn declaration(&mut self, decl: Node<'a>, prefix: &str) -> Option<String> {
-        match decl.kind() {
-            "class_declaration" | "abstract_class_declaration" | "class" => self.add_class(decl, prefix, None),
-            "interface_declaration" => {
-                let name = format!("{prefix}{}", self.src.field_text(decl, "name"));
+    fn declaration(&mut self, decl: u32, prefix: &str) -> Option<String> {
+        let tree = self.tree;
+        match tree.kind(decl) {
+            NodeKind::ClassDecl | NodeKind::AbstractClassDecl | NodeKind::ClassExpr => self.add_class(decl, prefix, None),
+            NodeKind::Interface => {
+                let name = format!("{prefix}{}", self.field_text(decl, Field::Name));
                 let mut methods = vec![];
-                let attributes = self.count_members(decl.child_by_field_name("body"), &mut methods);
+                let attributes = self.count_members(tree.field(decl, Field::Body), &mut methods);
                 self.add_type(&name, "interface", decl, attributes, methods);
                 Some(name)
             }
-            "enum_declaration" => {
-                let name = format!("{prefix}{}", self.src.field_text(decl, "name"));
-                // Every named child of the enum body except comments is a member.
-                let variants = decl.child_by_field_name("body").map(count_named).unwrap_or(0);
+            NodeKind::Enum => {
+                let name = format!("{prefix}{}", self.field_text(decl, Field::Name));
+                let variants = tree.field(decl, Field::Body).map(|b| tree.children(b).len() as u32).unwrap_or(0);
                 self.add_type(&name, "enum", decl, variants, vec![]);
                 Some(name)
             }
-            "type_alias_declaration" => {
-                let name = format!("{prefix}{}", self.src.field_text(decl, "name"));
+            NodeKind::TypeAlias => {
+                let name = format!("{prefix}{}", self.field_text(decl, Field::Name));
                 let mut methods = vec![];
                 // Only an object-literal type (`type P = { x: number }`) has members to count; unions etc. have none.
-                let attributes = match decl.child_by_field_name("value") {
-                    Some(v) if v.kind() == "object_type" => self.count_members(Some(v), &mut methods),
+                let attributes = match tree.field(decl, Field::Value) {
+                    Some(v) if tree.kind(v) == NodeKind::ObjectType => self.count_members(Some(v), &mut methods),
                     _ => 0,
                 };
                 self.add_type(&name, "type", decl, attributes, methods);
                 Some(name)
             }
-            "function_declaration" | "generator_function_declaration" => {
-                let name = format!("{prefix}{}", self.src.field_text(decl, "name"));
+            NodeKind::FunctionDecl | NodeKind::GeneratorDecl => {
+                let name = format!("{prefix}{}", self.field_text(decl, Field::Name));
                 self.add_function(&name, decl, decl);
                 self.module_loc += self.loc(decl);
                 Some(name)
             }
-            // `const`/`let` (lexical_declaration) and `var` (variable_declaration), possibly several declarators. The
-            // statement's lines count once for the module building, however many declarators it has.
-            "lexical_declaration" | "variable_declaration" => {
+            // `const`/`let`/`var`, possibly several declarators. The statement's lines count once for the module
+            // building, however many declarators it has.
+            NodeKind::VarDecl => {
                 let mut last = None;
                 let mut free = false;
-                for d in named_children(decl).filter(|d| d.kind() == "variable_declarator") {
-                    let simple = self.src.field_text(d, "name").to_string();
+                for &d in tree.children(decl).iter().filter(|&&d| tree.kind(d) == NodeKind::Declarator) {
+                    let simple = self.field_text(d, Field::Name).to_string();
                     let name = format!("{prefix}{simple}");
-                    match d.child_by_field_name("value") {
-                        Some(v) if FUNCTION_VALUES.contains(&v.kind()) => {
+                    match tree.field(d, Field::Value) {
+                        Some(v) if FUNCTION_VALUES.contains(&tree.kind(v)) => {
                             self.add_function(&name, v, decl);
                             free = true;
                         }
                         // `const Foo = class { … }`: a class building named after the variable.
-                        Some(v) if v.kind() == "class" => {
+                        Some(v) if tree.kind(v) == NodeKind::ClassExpr => {
                             self.add_class(v, prefix, Some(&simple));
                         }
                         // Any other value is a module-level attribute.
                         _ => {
                             self.module_attributes += 1;
                             self.module_names.push(name.clone());
-                            collect_refs(&self.src, decl, &mut self.module_refs);
+                            collect_refs(tree, decl, &mut self.module_refs);
                             free = true;
                         }
                     }
@@ -259,11 +248,10 @@ impl<'a> FileState<'a> {
                 }
                 last
             }
-            // `namespace X {}` (internal_module) and `module X {}` / `declare module "x" {}` (module). Quotes are
-            // stripped from string module names.
-            "internal_module" | "module" => {
-                let name = self.src.field_text(decl, "name").replace(['\'', '"'], "");
-                if let Some(body) = decl.child_by_field_name("body") {
+            // `namespace X {}`, `module X {}` and `declare module "x" {}`. Quotes are stripped from string names.
+            NodeKind::Module => {
+                let name = self.field_text(decl, Field::Name).replace(['\'', '"'], "");
+                if let Some(body) = tree.field(decl, Field::Body) {
                     self.visit_statements(body, &format!("{prefix}{name}."));
                 }
                 None
@@ -275,52 +263,49 @@ impl<'a> FileState<'a> {
     /// `export default <expression>`: an identifier refers to a name declared elsewhere in the file; an anonymous
     /// function becomes a module-building function named "default"; a class expression becomes a building named
     /// after its own name or "default". Other expressions are not tracked.
-    fn export_default_expression(&mut self, value: Node<'a>) {
-        match value.kind() {
-            "identifier" => self.default_export = Some(self.src.text(value).to_string()),
-            "arrow_function" | "function_expression" | "function" => {
+    fn export_default_expression(&mut self, value: u32) {
+        match self.tree.kind(value) {
+            NodeKind::Ident => self.default_export = Some(self.tree.text(value).to_string()),
+            NodeKind::Arrow | NodeKind::FunctionExpr => {
                 self.add_function("default", value, value);
                 self.module_loc += self.loc(value);
                 self.default_export = Some("default".into());
             }
-            "class" => self.default_export = self.add_class(value, "", Some("default")),
+            NodeKind::ClassExpr => self.default_export = self.add_class(value, "", Some("default")),
             _ => {}
         }
     }
 
-    /// Records the bindings of an `import` statement. Side-effect imports (`import "./x"`) have no import_clause
-    /// and add nothing.
+    /// Records the bindings of an `import` statement. Side-effect imports (`import "./x"`) and
+    /// `import x = require("x")` add nothing.
     ///
     /// ```text
     /// import D from "m"            → D = default of m
     /// import * as N from "m"       → N = * (the whole module)
     /// import { a, b as c } from "m" → a = a, c = b
     /// ```
-    fn add_import(&mut self, stmt: Node) {
-        let Some(source) = stmt.child_by_field_name("source") else { return };
-        let from = self.src.text(source).trim_matches(|c| c == '\'' || c == '"' || c == '`').to_string();
-        for clause in named_children(stmt).filter(|c| c.kind() == "import_clause") {
-            for part in named_children(clause) {
-                match part.kind() {
-                    "identifier" => self.imports.push(Import {
-                        local: self.src.text(part).into(),
-                        source: from.clone(),
-                        imported: "default".into(),
-                    }),
-                    "namespace_import" => {
-                        for id in named_children(part) {
-                            self.imports.push(Import { local: self.src.text(id).into(), source: from.clone(), imported: "*".into() });
-                        }
+    fn add_import(&mut self, stmt: u32) {
+        let tree = self.tree;
+        let Some(source) = tree.field(stmt, Field::Source) else { return };
+        let from = tree.text(source).trim_matches(|c| c == '\'' || c == '"' || c == '`').to_string();
+        for &part in tree.children(stmt) {
+            match tree.kind(part) {
+                NodeKind::ImportDefault => self.imports.push(Import {
+                    local: tree.text(part).into(),
+                    source: from.clone(),
+                    imported: "default".into(),
+                }),
+                NodeKind::ImportNamespace => {
+                    for &id in tree.children(part) {
+                        self.imports.push(Import { local: tree.text(id).into(), source: from.clone(), imported: "*".into() });
                     }
-                    "named_imports" => {
-                        for spec in named_children(part).filter(|s| s.kind() == "import_specifier") {
-                            let name = self.src.field_text(spec, "name").to_string();
-                            let local = spec.child_by_field_name("alias").map(|a| self.src.text(a).to_string()).unwrap_or(name.clone());
-                            self.imports.push(Import { local, source: from.clone(), imported: name });
-                        }
-                    }
-                    _ => {}
                 }
+                NodeKind::ImportSpecifier => {
+                    let name = self.field_text(part, Field::Name).to_string();
+                    let local = tree.field(part, Field::Alias).map(|a| tree.text(a).to_string()).unwrap_or(name.clone());
+                    self.imports.push(Import { local, source: from.clone(), imported: name });
+                }
+                _ => {}
             }
         }
     }
@@ -340,11 +325,11 @@ impl<'a> FileState<'a> {
         id
     }
 
-    fn add_type(&mut self, name: &str, kind: &'static str, decl: Node, noa: u32, methods: Vec<MethodInfo>) {
+    fn add_type(&mut self, name: &str, kind: &'static str, decl: u32, noa: u32, methods: Vec<MethodInfo>) {
         let mut refs = HashSet::new();
-        collect_refs(&self.src, decl, &mut refs);
-        let begin = first_line(decl);
-        let end = last_line(decl);
+        collect_refs(self.tree, decl, &mut refs);
+        let begin = self.tree.first_line(decl);
+        let end = self.tree.last_line(decl);
         let fqn = self.id(name, kind);
         self.types.push(TypeInfo {
             language: Language::TypeScript,
@@ -371,29 +356,28 @@ impl<'a> FileState<'a> {
     ///
     /// Methods: method definitions, abstract and overload signatures, and fields holding a function value (arrow
     /// function properties). Attributes: other fields, plus constructor parameter properties.
-    fn add_class(&mut self, decl: Node<'a>, prefix: &str, fallback: Option<&str>) -> Option<String> {
-        let simple = match decl.child_by_field_name("name") {
-            Some(n) => self.src.text(n),
+    fn add_class(&mut self, decl: u32, prefix: &str, fallback: Option<&str>) -> Option<String> {
+        let tree = self.tree;
+        let simple = match tree.field(decl, Field::Name) {
+            Some(n) => tree.text(n),
             None => fallback?,
         };
         let name = format!("{prefix}{simple}");
         let mut methods = vec![];
         let mut attributes = 0;
-        if let Some(body) = decl.child_by_field_name("body") {
-            for member in named_children(body) {
-                match member.kind() {
-                    "method_definition" => {
-                        methods.push(self.method(member, member.child_by_field_name("name"), Some(member)));
-                        if self.src.field_text(member, "name") == "constructor" {
-                            attributes += parameter_properties(member);
+        if let Some(body) = tree.field(decl, Field::Body) {
+            for &member in tree.children(body) {
+                match tree.kind(member) {
+                    NodeKind::MethodDef => {
+                        methods.push(self.method(member, tree.field(member, Field::Name), Some(member)));
+                        if self.field_text(member, Field::Name) == "constructor" {
+                            attributes += parameter_properties(tree, member);
                         }
                     }
-                    "abstract_method_signature" | "method_signature" => {
-                        methods.push(self.method(member, member.child_by_field_name("name"), None))
-                    }
-                    "public_field_definition" => match member.child_by_field_name("value") {
-                        Some(v) if FUNCTION_VALUES.contains(&v.kind()) => {
-                            methods.push(self.method(v, member.child_by_field_name("name"), Some(member)))
+                    NodeKind::MethodSig => methods.push(self.method(member, tree.field(member, Field::Name), None)),
+                    NodeKind::FieldDef => match tree.field(member, Field::Value) {
+                        Some(v) if FUNCTION_VALUES.contains(&tree.kind(v)) => {
+                            methods.push(self.method(v, tree.field(member, Field::Name), Some(member)))
                         }
                         _ => attributes += 1,
                     },
@@ -401,21 +385,22 @@ impl<'a> FileState<'a> {
                 }
             }
         }
-        let kind = if decl.kind() == "abstract_class_declaration" { "abstract" } else { "class" };
+        let kind = if tree.kind(decl) == NodeKind::AbstractClassDecl { "abstract" } else { "class" };
         self.add_type(&name, kind, decl, attributes, methods);
         Some(name)
     }
 
     /// Members of an interface body or object type: properties are attributes; method, call (`(x): T`) and
     /// construct (`new (x): T`) signatures are methods. Returns the attribute count.
-    fn count_members(&self, body: Option<Node>, methods: &mut Vec<MethodInfo>) -> u32 {
+    fn count_members(&self, body: Option<u32>, methods: &mut Vec<MethodInfo>) -> u32 {
         let Some(body) = body else { return 0 };
+        let tree = self.tree;
         let mut attributes = 0;
-        for m in named_children(body) {
-            match m.kind() {
-                "property_signature" => attributes += 1,
-                "method_signature" | "call_signature" | "construct_signature" => {
-                    methods.push(self.method(m, m.child_by_field_name("name"), None))
+        for &m in tree.children(body) {
+            match tree.kind(m) {
+                NodeKind::PropertySig => attributes += 1,
+                NodeKind::MethodSig | NodeKind::CallSig | NodeKind::ConstructSig => {
+                    methods.push(self.method(m, tree.field(m, Field::Name), None))
                 }
                 _ => {}
             }
@@ -423,21 +408,17 @@ impl<'a> FileState<'a> {
         attributes
     }
 
-    /// `body`: node whose complexity is measured (None for signatures without a body).
-    ///
-    /// Parameters are the named children of the `parameters` list, comments excepted; an arrow function with a single
-    /// unparenthesised parameter (`x => …`) has a `parameter` field instead, which counts as one.
-    fn method(&self, node: Node, name: Option<Node>, body: Option<Node>) -> MethodInfo {
-        let name = name.map(|n| self.src.text(n).to_string()).unwrap_or_else(|| "(anonymous)".into());
-        let parameters = match node.child_by_field_name("parameters") {
-            Some(p) => count_named(p),
-            None => node.child_by_field_name("parameter").is_some() as u32,
-        };
+    /// `body`: node whose complexity is measured (None for signatures without a body). Parameters are the entries
+    /// of the node's parameter list (an arrow function's single unparenthesised parameter counts as one).
+    fn method(&self, node: u32, name: Option<u32>, body: Option<u32>) -> MethodInfo {
+        let tree = self.tree;
+        let name = name.map(|n| tree.text(n).to_string()).unwrap_or_else(|| "(anonymous)".into());
+        let parameters = tree.field(node, Field::Params).map(|p| tree.children(p).len() as u32).unwrap_or(0);
         MethodInfo {
             name,
-            line: first_line(node),
+            line: tree.first_line(node),
             loc: self.loc(node),
-            complexity: body.map(complexity).unwrap_or(1),
+            complexity: body.map(|b| complexity(tree, b)).unwrap_or(1),
             parameters,
         }
     }
@@ -445,36 +426,40 @@ impl<'a> FileState<'a> {
     /// Adds a top-level function to the module building. `function` gives the method's own metrics; `statement`
     /// (the whole declaration) is what the module building's references are taken from. The caller adds the
     /// statement's lines to the module building's LOC, once per statement.
-    fn add_function(&mut self, name: &str, function: Node, statement: Node) {
+    fn add_function(&mut self, name: &str, function: u32, statement: u32) {
         let mut m = self.method(function, None, Some(function));
         m.name = name.to_string();
         self.functions.push(m);
         self.module_names.push(name.to_string());
-        collect_refs(&self.src, statement, &mut self.module_refs);
+        collect_refs(self.tree, statement, &mut self.module_refs);
     }
 
     /// Top-level code: `describe("cart", () => …)` or `app.get("/", handler)` becomes a method named after the
     /// call, so test suites and route tables show up; anything else just adds lines and references.
-    fn add_statement(&mut self, statement: Node, expression: Node) {
+    fn add_statement(&mut self, statement: u32, expression: u32) {
+        let tree = self.tree;
         self.module_loc += self.loc(statement);
-        collect_refs(&self.src, statement, &mut self.module_refs);
-        if expression.kind() != "call_expression" {
+        collect_refs(tree, statement, &mut self.module_refs);
+        if tree.kind(expression) != NodeKind::Call {
             return;
         }
-        let Some(args) = expression.child_by_field_name("arguments") else { return };
+        let Some(args) = tree.field(expression, Field::Args) else { return };
+        if tree.kind(args) != NodeKind::Args {
+            return; // a tagged template
+        }
         let mut has_callback = false;
         let mut label: Option<&str> = None;
-        for arg in named_children(args) {
-            has_callback |= FUNCTION_VALUES.contains(&arg.kind());
-            if label.is_none() && matches!(arg.kind(), "string" | "template_string") {
-                label = Some(self.src.text(arg));
+        for &arg in tree.children(args) {
+            has_callback |= FUNCTION_VALUES.contains(&tree.kind(arg));
+            if label.is_none() && matches!(tree.kind(arg), NodeKind::Str | NodeKind::Template) {
+                label = Some(tree.text(arg));
             }
         }
         if !has_callback {
             return;
         }
         // The label is the first string argument, quotes included, shortened to 48 characters.
-        let callee = self.src.field_text(expression, "function");
+        let callee = tree.children(expression).first().map(|&c| tree.text(c)).unwrap_or("");
         let label = match label {
             None => String::new(),
             Some(l) if l.chars().count() > 48 => format!("{}…", l.chars().take(47).collect::<String>()),
@@ -482,9 +467,9 @@ impl<'a> FileState<'a> {
         };
         self.functions.push(MethodInfo {
             name: format!("{callee}({label})"),
-            line: first_line(statement),
+            line: tree.first_line(statement),
             loc: self.loc(statement),
-            complexity: complexity(args),
+            complexity: complexity(tree, args),
             parameters: 0,
         });
     }
@@ -521,44 +506,31 @@ impl<'a> FileState<'a> {
     }
 }
 
-/// Constructor parameters with an accessibility modifier (`private x: T`) or `readonly` declare fields.
-fn parameter_properties(constructor: Node) -> u32 {
-    let Some(params) = constructor.child_by_field_name("parameters") else { return 0 };
-    named_children(params)
-        .filter(|p| named_children(*p).any(|c| matches!(c.kind(), "accessibility_modifier" | "readonly")))
-        .count() as u32
+/// Constructor parameters with an accessibility modifier (`private x: T`) declare fields. (`readonly` alone does
+/// too in TypeScript, but is not counted, to keep the metric stable across CodeCity versions.)
+fn parameter_properties(tree: &Tree, constructor: u32) -> u32 {
+    let Some(params) = tree.field(constructor, Field::Params) else { return 0 };
+    tree.children(params).iter().filter(|&&p| tree.kind(p) == NodeKind::ParamProperty).count() as u32
 }
 
-/// Named children except comments, which tree-sitter allows between the members of a list.
-fn count_named(n: Node) -> u32 {
-    named_children(n).filter(|c| c.kind() != "comment").count() as u32
-}
-
-/// Every identifier and type identifier under `node`. Most are locals or members; [`link`] keeps only those that
-/// match a declared or imported name of the file. Property names (`obj.x`) are `property_identifier` nodes and are
-/// not collected.
-fn collect_refs(src: &Src, node: Node, refs: &mut HashSet<String>) {
-    walk(node, |n| {
-        if matches!(n.kind(), "type_identifier" | "identifier") {
-            refs.insert(src.text(n).to_string());
+/// Every identifier the parser flagged as a possible reference ([`REF`]) under `node`. Most are locals or members;
+/// [`link`] keeps only those that match a declared or imported name of the file. Property names (`obj.x`) are not
+/// flagged.
+fn collect_refs(tree: &Tree, node: u32, refs: &mut HashSet<String>) {
+    for t in tree.token_range(node) {
+        if tree.tokens[t].flags & REF != 0 {
+            let text = tree.token_text(t);
+            if !refs.contains(text) {
+                refs.insert(text.to_string());
+            }
         }
-        true
-    });
+    }
 }
 
-/// McCabe cyclomatic complexity: 1 + decision points ([`DECISIONS`] plus each `&&`, `||` and `??`). Nested
-/// functions inside `body` count towards it.
-pub fn complexity(body: Node) -> u32 {
-    let mut cx = 1;
-    walk(body, |n| {
-        if DECISIONS.contains(&n.kind()) {
-            cx += 1;
-        } else if n.kind() == "binary_expression" && matches!(operator(n), "&&" | "||" | "??") {
-            cx += 1;
-        }
-        true
-    });
-    cx
+/// McCabe cyclomatic complexity: 1 + decision points (`if`, loops, `case`, `catch`, `?:`, `&&`, `||`, `??`, as
+/// flagged [`DECISION`] by the parser). Nested functions inside `node` count towards it.
+pub fn complexity(tree: &Tree, node: u32) -> u32 {
+    1 + tree.token_range(node).filter(|&t| tree.tokens[t].flags & DECISION != 0).count() as u32
 }
 
 /// Directory of the nearest package.json at or above `dir` (relative to root, "" for the root itself).

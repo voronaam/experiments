@@ -14,39 +14,9 @@
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <javafx.version>21.0.10</javafx.version>
-    <tree-sitter.version>0.26.6</tree-sitter.version>
   </properties>
 
   <dependencies>
-    <!-- Parsing: tree-sitter with bundled natives for Linux, macOS and Windows. The core library is replaced at run
-         time by CodeCity's optimised build (native/build-tree-sitter.sh, see NativeLibraries); its JNI glue is the
-         binding's, so the build must be redone when tree-sitter.version changes. -->
-    <dependency>
-      <groupId>io.github.bonede</groupId>
-      <artifactId>tree-sitter</artifactId>
-      <version>${tree-sitter.version}</version>
-    </dependency>
-    <!-- Grammars: the same versions as the Rust and D editions where the binding publishes them -->
-    <dependency>
-      <groupId>io.github.bonede</groupId>
-      <artifactId>tree-sitter-java</artifactId>
-      <version>0.23.5</version>
-    </dependency>
-    <dependency>
-      <groupId>io.github.bonede</groupId>
-      <artifactId>tree-sitter-typescript</artifactId>
-      <version>0.23.2</version>
-    </dependency>
-    <dependency>
-      <groupId>io.github.bonede</groupId>
-      <artifactId>tree-sitter-tsx</artifactId>
-      <version>0.23.2</version>
-    </dependency>
-    <dependency>
-      <groupId>io.github.bonede</groupId>
-      <artifactId>tree-sitter-rust</artifactId>
-      <version>0.24.0</version>
-    </dependency>
     <!-- Desktop viewer (gui mode). Natives for the build machine's OS are selected automatically. -->
     <dependency>
       <groupId>org.openjfx</groupId>

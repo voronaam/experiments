@@ -11,8 +11,8 @@ const TEST_DIRS: [&str; 6] = ["test", "tests", "it", "androidTest", "testFixture
 
 /// Splits on `\n` only, keeping trailing empty lines.
 ///
-/// The result is indexed by line number - 1, so it has to agree with tree-sitter's row numbering, and tree-sitter
-/// starts a new row only at `\n`: a lone `\r` (classic Mac line ending) does not break the line, and the `\r` of a
+/// The result is indexed by line number - 1, so it has to agree with the parsers' line numbering, and they start a
+/// new line only at `\n`: a lone `\r` (classic Mac line ending) does not break the line, and the `\r` of a
 /// `\r\n` stays at the end of its line, where [`count_loc`]'s trimming drops it. A file ending in a newline yields a
 /// final empty string.
 pub fn lines(code: &str) -> Vec<&str> {
@@ -128,8 +128,8 @@ mod tests {
     }
 
     #[test]
-    fn splits_like_tree_sitter() {
-        // Only \n starts a new row, as in tree-sitter (and in JavaParser, which the Java edition feeds lone \r as spaces).
+    fn splits_on_newlines_only() {
+        // Only \n starts a new line, as in the parsers.
         assert_eq!(lines("a\r\nb\rc\n"), vec!["a\r", "b\rc", ""]);
     }
 }

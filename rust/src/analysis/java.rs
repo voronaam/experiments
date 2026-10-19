@@ -1,4 +1,4 @@
-//! Java support (tree-sitter-java), mirroring the metrics the JavaParser-based Java version computes.
+//! Java support. The source is parsed by the in-house parser in [`super::java_parse`].
 //!
 //! Packages are districts and every class, interface, enum, record and annotation type (including member types) is a
 //! building. The fqn is `package.Outer.Inner`, so it matches what Java itself calls the type.
@@ -7,32 +7,17 @@
 //! file's imports. [`link`] then resolves those names with Java's own lookup rules (see [`resolve`]); anything that
 //! does not resolve to a project type (JDK and library types) is dropped.
 
-use super::syntax::{first_line, last_line, named_children, walk, Src};
+use super::java_parse::{self as jp, NodeKind, Tree};
 use super::text::{count_loc, in_test_directory, lines};
-use super::{with_parser, Context, Linked, ParsedFile};
+use super::{Context, Linked, ParsedFile};
 use crate::model::{Language, MethodInfo, TypeInfo};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use tree_sitter::Node;
-
-/// Node kinds that declare a type, at the top level or as members of another type's body.
-const TYPE_DECLARATIONS: [&str; 5] = [
-    "class_declaration",
-    "interface_declaration",
-    "enum_declaration",
-    "record_declaration",
-    "annotation_type_declaration",
-];
 
 /// Parses one `.java` file into its types (top-level and member types, depth-first in source order).
 pub fn parse(root: &Path, file: &Path, code: &str) -> ParsedFile {
-    let tree = with_parser("java", || tree_sitter_java::LANGUAGE.into(), |p| p.parse(code, None));
-    let Some(tree) = tree else {
-        return ParsedFile { types: vec![], context: Context::None, failed: true };
-    };
-    let src = Src { code };
-    let program = tree.root_node();
+    let tree = jp::parse(code);
     let lines = lines(code);
     let relative = file.strip_prefix(root).unwrap_or(file);
     let module = module_of(relative);
@@ -42,24 +27,22 @@ pub fn parse(root: &Path, file: &Path, code: &str) -> ParsedFile {
     let mut package = String::new();
     let mut explicit = Vec::new();
     let mut wildcard = Vec::new();
-    for n in named_children(program) {
-        match n.kind() {
-            "package_declaration" => {
-                // Skip package annotations (allowed in package-info.java); the remaining child is the name.
-                if let Some(name) = named_children(n).find(|c| c.kind() != "annotation" && c.kind() != "marker_annotation") {
-                    package = strip_ws(src.text(name));
+    let top = tree.children(0);
+    for &n in &top {
+        let node = tree.nodes[n];
+        match node.kind {
+            NodeKind::Package => {
+                // Package annotations (allowed in package-info.java) are separate nodes; the Name child is the name.
+                if let Some(name) = name_child(&tree, n) {
+                    package = strip_ws(name_text(&tree, code, name));
                 }
             }
-            "import_declaration" => {
-                // `static` and `*` are tokens of the import_declaration; `*` is a named `asterisk` node.
-                let is_static = super::syntax::children(n).any(|c| c.kind() == "static");
-                let asterisk = named_children(n).any(|c| c.kind() == "asterisk");
-                let Some(name) = named_children(n).find(|c| c.kind() == "scoped_identifier" || c.kind() == "identifier")
-                else {
-                    continue;
-                };
+            NodeKind::Import => {
+                let Some(name) = name_child(&tree, n) else { continue };
+                let is_static = node.flags & jp::IMPORT_STATIC != 0;
+                let asterisk = node.flags & jp::IMPORT_ASTERISK != 0;
                 // Names may be written with whitespace or line breaks around the dots; normalise to `a.b.C`.
-                let name = strip_ws(src.text(name));
+                let name = strip_ws(name_text(&tree, code, name));
                 // Static imports name members, not types. What matters for dependencies is the class they come from:
                 // `import static a.b.C.m;` and `import static a.b.C.*;` both record `a.b.C` as a single-type import.
                 if is_static && !asterisk {
@@ -78,18 +61,34 @@ pub fn parse(root: &Path, file: &Path, code: &str) -> ParsedFile {
     }
 
     let mut types = Vec::new();
-    let ctx = FileCtx { src: &src, lines: &lines, file, package: &package, module: &module, test, explicit: &explicit, wildcard: &wildcard };
-    for n in named_children(program) {
-        if TYPE_DECLARATIONS.contains(&n.kind()) {
+    let ctx = FileCtx { tree: &tree, code, lines: &lines, file, package: &package, module: &module, test, explicit: &explicit, wildcard: &wildcard };
+    for &n in &top {
+        if tree.nodes[n].kind == NodeKind::TypeDecl {
             collect_type(&ctx, n, "", &mut types);
         }
     }
-    ParsedFile { types, context: Context::None, failed: program.has_error() }
+    ParsedFile { types, context: Context::None, failed: tree.error }
+}
+
+/// The [`NodeKind::Name`] child of a package or import node.
+fn name_child(tree: &Tree, n: usize) -> Option<usize> {
+    tree.children(n).into_iter().find(|&c| tree.nodes[c].kind == NodeKind::Name)
+}
+
+/// Source text of a node's whole token span.
+fn name_text<'a>(tree: &Tree, code: &'a str, n: usize) -> &'a str {
+    tree.text(code, tree.nodes[n].first, tree.nodes[n].last)
+}
+
+/// Source text of a single token, "" for [`jp::NONE`].
+fn token_text<'a>(tree: &Tree, code: &'a str, t: u32) -> &'a str {
+    if t == jp::NONE { "" } else { tree.text(code, t, t) }
 }
 
 /// Per-file data shared by every type declared in the file.
 struct FileCtx<'a> {
-    src: &'a Src<'a>,
+    tree: &'a Tree,
+    code: &'a str,
     lines: &'a [&'a str],
     file: &'a Path,
     package: &'a str,
@@ -104,56 +103,42 @@ struct FileCtx<'a> {
 /// `outer` is the enclosing type's name relative to the package ("" at the top level), so a member type is named
 /// `Outer.Inner`. Metrics:
 /// - `noa` (attributes): one per declared variable in fields and interface constants (`int a, b;` is two), one per
-///   enum constant and one per record component;
-/// - methods: methods and constructors (initialiser blocks are not counted);
+///   enum constant and one per record component (a varargs component `int... xs` is not counted);
+/// - methods: methods and constructors (initialiser blocks and compact record constructors are not counted);
 /// - `loc`: the whole declaration, including member types, so an outer type's LOC contains its inner types';
 /// - references: collected from the whole declaration, member types included.
 ///
 /// The type is pushed before its member types, so `out` is in pre-order.
-fn collect_type(ctx: &FileCtx, decl: Node, outer: &str, out: &mut Vec<TypeInfo>) {
-    let simple = ctx.src.field_text(decl, "name");
+fn collect_type(ctx: &FileCtx, decl: usize, outer: &str, out: &mut Vec<TypeInfo>) {
+    let tree = ctx.tree;
+    let node = tree.nodes[decl];
+    let simple = token_text(tree, ctx.code, node.name);
     let name = if outer.is_empty() { simple.to_string() } else { format!("{outer}.{simple}") };
     let fqn = if ctx.package.is_empty() { name.clone() } else { format!("{}.{}", ctx.package, name) };
-    let body = decl.child_by_field_name("body");
 
     let mut methods = Vec::new();
-    let mut noa = 0;
+    // Record components (`record P(int x, int y)`) are the record's fields; `count` is 0 for other kinds.
+    let mut noa = node.count;
     let mut nested = Vec::new();
-    // Record components (`record P(int x, int y)`) are the record's fields.
-    if decl.kind() == "record_declaration" {
-        if let Some(params) = decl.child_by_field_name("parameters") {
-            noa += named_children(params).filter(|p| p.kind() == "formal_parameter").count() as u32;
+    for m in tree.children(decl) {
+        let member = tree.nodes[m];
+        match member.kind {
+            NodeKind::Field => noa += member.count,
+            NodeKind::EnumConstant => noa += 1,
+            NodeKind::Method => methods.push(method(ctx, m)),
+            NodeKind::TypeDecl => nested.push(m),
+            _ => {}
         }
     }
-    if let Some(body) = body {
-        let mut members: Vec<Node> = named_children(body).collect();
-        // enum bodies keep their non-constant members in a nested enum_body_declarations node
-        if let Some(extra) = members.iter().position(|m| m.kind() == "enum_body_declarations") {
-            let e = members.remove(extra);
-            members.extend(named_children(e));
-        }
-        for m in members {
-            match m.kind() {
-                // constant_declaration is a field in an interface body.
-                "field_declaration" | "constant_declaration" => {
-                    noa += named_children(m).filter(|d| d.kind() == "variable_declarator").count() as u32;
-                }
-                "enum_constant" => noa += 1,
-                "method_declaration" | "constructor_declaration" => methods.push(method(ctx, m)),
-                k if TYPE_DECLARATIONS.contains(&k) => nested.push(m),
-                _ => {}
-            }
-        }
-    }
-    let begin = first_line(decl);
-    let end = last_line(decl);
+    let begin = tree.first_line(decl);
+    let end = tree.last_line(ctx.code, decl);
     out.push(TypeInfo {
         language: Language::Java,
         fqn,
         name: name.clone(),
         package: ctx.package.to_string(),
         module: ctx.module.to_string(),
-        kind: kind_of(ctx.src, decl),
+        kind: kind_of(node.sub, node.flags),
         file: ctx.file.to_path_buf(),
         line: begin,
         end_line: end,
@@ -161,7 +146,7 @@ fn collect_type(ctx: &FileCtx, decl: Node, outer: &str, out: &mut Vec<TypeInfo>)
         noa,
         test: ctx.test,
         methods,
-        references: references(ctx.src, decl),
+        references: references(tree, ctx.code, decl),
         explicit_imports: ctx.explicit.to_vec(),
         wildcard_imports: ctx.wildcard.to_vec(),
     });
@@ -171,115 +156,83 @@ fn collect_type(ctx: &FileCtx, decl: Node, outer: &str, out: &mut Vec<TypeInfo>)
 }
 
 /// The building kind shown in the viewers. Classes are split into "abstract" and "class" by their `abstract`
-/// modifier, which is an anonymous token inside the `modifiers` node.
-fn kind_of(src: &Src, decl: Node) -> &'static str {
-    match decl.kind() {
-        "interface_declaration" => "interface",
-        "enum_declaration" => "enum",
-        "record_declaration" => "record",
-        "annotation_type_declaration" => "annotation",
+/// modifier.
+fn kind_of(sub: u8, flags: u8) -> &'static str {
+    match sub {
+        jp::TYPE_INTERFACE => "interface",
+        jp::TYPE_ENUM => "enum",
+        jp::TYPE_RECORD => "record",
+        jp::TYPE_ANNOTATION => "annotation",
         _ => {
-            let is_abstract = named_children(decl)
-                .find(|c| c.kind() == "modifiers")
-                .map(|m| super::syntax::children(m).any(|c| src.text(c) == "abstract"))
-                .unwrap_or(false);
-            if is_abstract { "abstract" } else { "class" }
+            if flags & jp::TYPE_ABSTRACT != 0 { "abstract" } else { "class" }
         }
     }
 }
 
-/// Metrics of a method or constructor. Parameters include a trailing varargs parameter (`spread_parameter`);
-/// the receiver parameter (`Foo this`) is not counted.
-fn method(ctx: &FileCtx, m: Node) -> MethodInfo {
-    let begin = first_line(m);
-    let end = last_line(m);
-    let parameters = m
-        .child_by_field_name("parameters")
-        .map(|p| named_children(p).filter(|c| matches!(c.kind(), "formal_parameter" | "spread_parameter")).count())
-        .unwrap_or(0) as u32;
+/// Metrics of a method or constructor. Parameters include a trailing varargs parameter; the receiver parameter
+/// (`Foo this`) is not counted (the parser does both).
+fn method(ctx: &FileCtx, m: usize) -> MethodInfo {
+    let tree = ctx.tree;
+    let begin = tree.first_line(m);
+    let end = tree.last_line(ctx.code, m);
     MethodInfo {
-        name: ctx.src.field_text(m, "name").to_string(),
+        name: token_text(tree, ctx.code, tree.nodes[m].name).to_string(),
         line: begin,
         loc: count_loc(ctx.lines, begin, end),
-        complexity: complexity(m),
-        parameters,
+        complexity: complexity(tree, m),
+        parameters: tree.nodes[m].count,
     }
 }
 
 /// McCabe cyclomatic complexity: 1 + number of decision points.
 ///
 /// Decision points are branches and loops, each `catch`, each `?:`, each non-default `case` label, and each `&&` /
-/// `||` (short-circuit operators add a path each). The walk covers everything inside the node, so lambdas and
-/// anonymous or local classes in a method add to that method's complexity.
-pub fn complexity(node: Node) -> u32 {
-    let mut cx = 1;
-    walk(node, |n| {
-        match n.kind() {
-            "if_statement" | "for_statement" | "enhanced_for_statement" | "while_statement" | "do_statement"
-            | "catch_clause" | "ternary_expression" => cx += 1,
-            "switch_label" => {
-                if n.named_child_count() > 0 {
-                    cx += 1; // `default` labels have no expression
-                }
-            }
-            "binary_expression" => {
-                if matches!(super::syntax::operator(n), "&&" | "||") {
-                    cx += 1;
-                }
-            }
-            _ => {}
-        }
-        true
-    });
-    cx
+/// `||` (short-circuit operators add a path each); the parser marks them as [`NodeKind::Decision`] nodes. Everything
+/// inside the node counts, so lambdas and anonymous or local classes in a method add to that method's complexity.
+pub fn complexity(tree: &Tree, node: usize) -> u32 {
+    let end = tree.nodes[node].end as usize;
+    1 + tree.nodes[node + 1..end].iter().filter(|n| n.kind == NodeKind::Decision).count() as u32
 }
 
 /// Type names used in a declaration: types, annotations, and upper-case call/field scopes (`Util.run()`).
 ///
 /// Names are recorded as written; [`resolve`] decides later which ones are project types. The upper-case test is the
 /// usual Java naming convention: `Util.run()` is a static call on a type, `list.add()` a call on a variable.
-fn references(src: &Src, decl: Node) -> HashSet<String> {
+fn references(tree: &Tree, code: &str, decl: usize) -> HashSet<String> {
     let mut refs = HashSet::new();
-    walk(decl, |n| match n.kind() {
-        "type_identifier" => {
-            refs.insert(src.text(n).to_string());
-            true
-        }
-        "scoped_type_identifier" => {
-            // like JavaParser: `Map.Entry` contributes "Map.Entry" and its scope "Map", but not "Entry" alone
-            let text = strip_ws(src.text(n));
-            let mut prefix = text.as_str();
-            while let Some(dot) = prefix.rfind('.') {
-                prefix = &prefix[..dot];
-                refs.insert(prefix.to_string());
+    let end = tree.nodes[decl].end as usize;
+    for n in &tree.nodes[decl + 1..end] {
+        let text = tree.text(code, n.first, n.last);
+        match n.kind {
+            NodeKind::TypeName => {
+                refs.insert(text.to_string());
             }
-            refs.insert(text);
-            // Do not descend: the inner type_identifiers would add "Entry" on its own.
-            false
-        }
-        "marker_annotation" | "annotation" => {
-            refs.insert(strip_ws(src.field_text(n, "name")));
-            true
-        }
-        "method_invocation" | "field_access" => {
-            // `Outer.this` is a qualified this, not a static member access (JavaParser models it as ThisExpr)
-            let qualified_this = n.kind() == "field_access" && n.child_by_field_name("field").is_some_and(|f| f.kind() == "this");
-            if let Some(object) = n.child_by_field_name("object").filter(|_| !qualified_this) {
-                if object.kind() == "identifier" {
-                    let s = src.text(object);
-                    if s.chars().next().is_some_and(char::is_uppercase) {
-                        refs.insert(s.to_string());
-                    }
+            NodeKind::ScopedTypeName => {
+                // a qualified name: `Map.Entry` contributes "Map.Entry" and its scope "Map", but not "Entry" alone
+                // (the parser does not report the parts of a qualified name separately)
+                let text = strip_ws(text);
+                let mut prefix = text.as_str();
+                while let Some(dot) = prefix.rfind('.') {
+                    prefix = &prefix[..dot];
+                    refs.insert(prefix.to_string());
+                }
+                refs.insert(text);
+            }
+            NodeKind::AnnotationName => {
+                refs.insert(strip_ws(text));
+            }
+            NodeKind::MemberObject => {
+                if text.chars().next().is_some_and(char::is_uppercase) {
+                    refs.insert(text.to_string());
                 }
             }
-            true
+            _ => {}
         }
-        _ => true,
-    });
+    }
     refs
 }
 
-/// Removes all whitespace: tree-sitter keeps the source text, and `java.util . List` is a legal way to write a name.
+/// Removes all whitespace: names are taken from the source text, and `java.util . List` is a legal way to write one.
 fn strip_ws(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }

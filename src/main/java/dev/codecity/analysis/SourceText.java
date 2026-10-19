@@ -33,7 +33,7 @@ public final class SourceText {
     }
 
     /**
-     * Splits on {@code \n} only, so index {@code i} is line {@code i + 1} as tree-sitter numbers rows: a lone
+     * Splits on {@code \n} only, so index {@code i} is line {@code i + 1} as the parsers number lines: a lone
      * {@code \r} (classic Mac line ending) does not break the line, and the {@code \r} of a {@code \r\n} stays at the
      * end of its line, where {@link #countLoc}'s {@code strip()} drops it. The limit of -1 keeps trailing empty
      * lines, so a file that ends with a newline yields one final empty element.

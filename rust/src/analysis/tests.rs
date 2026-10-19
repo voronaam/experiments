@@ -285,7 +285,7 @@ fn java_resolution_never_sees_the_default_package() {
 }
 
 #[test]
-fn java_lines_follow_tree_sitter_rows_and_trailing_block_comments() {
+fn java_lines_break_at_newlines_only_and_trailing_block_comments_count() {
     let dir = tempfile::tempdir().unwrap();
     // A lone \r is not a line break; the comment opened after `int x;` hides the next line.
     write(dir.path(), "src/main/java/a/A.java", "package a;\rclass A {\n  int x; /* start\n  comment\n  end */\n  int y;\n}\n");

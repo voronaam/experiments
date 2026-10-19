@@ -1,9 +1,5 @@
 package dev.codecity.analysis;
 
-import org.treesitter.TSNode;
-import org.treesitter.TSParser;
-import org.treesitter.TreeSitterJava;
-
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -14,37 +10,27 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 
+import dev.codecity.analysis.JavaParse.NodeKind;
+import dev.codecity.analysis.JavaParse.Tree;
+
 /**
- * Java support (tree-sitter-java): extracts the classic CodeCity metrics per type.
+ * Java support: extracts the classic CodeCity metrics per type. The source is parsed by the in-house parser in
+ * {@link JavaParse} (no third-party parser).
  *
  * <p>Every class, interface, enum, record and annotation type is a building, nested and member types included (each
  * gets its own building, e.g. {@code Order.Line}); local and anonymous classes are not. Packages are the districts,
  * and the path up to the first {@code src} directory is the build module.
  *
- * <p>Parsing is purely syntactic: no classpath and no symbol solver. References are collected as the names written in
- * the source and resolved in {@link #link} against the set of project types, following Java's scoping rules closely
+ * <p>Parsing is purely syntactic: no classpath and no symbol solver. Parsing records, per type, the <em>raw</em> names
+ * it mentions ({@code List}, {@code Map.Entry}, {@code Util} from {@code Util.run()}) and the file's imports;
+ * {@link #link} then resolves those names against the set of project types, following Java's scoping rules closely
  * enough for project-internal edges. Java needs no extra linker context: everything is stored on {@link TypeInfo}
  * (references and imports), so {@link ParsedFile#context()} is null.
  *
- * <p>The Rust and D editions mirror this analyser node kind for node kind, with the same grammar version, so all
- * three produce the same city.
+ * <p>The Rust and D editions mirror this analyser (and {@link JavaParse}) node kind for node kind, so all three
+ * produce the same city.
  */
 public final class JavaAnalyzer implements LanguageSupport {
-
-    /** Node kinds that declare a type, at the top level or as members of another type's body. */
-    private static final Set<String> TYPE_DECLARATIONS = Set.of(
-            "class_declaration", "interface_declaration", "enum_declaration", "record_declaration",
-            "annotation_type_declaration");
-    /**
-     * Decision points for {@link #complexity}. {@code enhanced_for_statement} is the for-each loop;
-     * {@code switch_label} and {@code &&}/{@code ||} are counted separately.
-     */
-    private static final Set<String> DECISIONS = Set.of(
-            "if_statement", "for_statement", "enhanced_for_statement", "while_statement", "do_statement",
-            "catch_clause", "ternary_expression");
-
-    /** One parser per thread: a TSParser must not be shared between the threads parsing in parallel. */
-    private final ThreadLocal<TSParser> parser = ThreadLocal.withInitial(() -> Syntax.parser(TreeSitterJava::new));
 
     @Override
     public Language language() {
@@ -70,12 +56,12 @@ public final class JavaAnalyzer implements LanguageSupport {
     }
 
     /**
-     * Extracts every type of one file: top-level and member types, depth-first in source order. Tree-sitter always
+     * Extracts every type of one file: top-level and member types, depth-first in source order. The parser always
      * yields a tree; a file with syntax errors is analysed as far as it goes and only flagged as failed.
      */
     @Override
     public ParsedFile parse(Path root, Path file, String code) {
-        Syntax syntax = Syntax.parse(parser.get(), code);
+        Tree tree = JavaParse.parse(code);
         Path relative = root.relativize(file);
 
         // Imports are recorded by what they make visible under a simple name:
@@ -88,32 +74,25 @@ public final class JavaAnalyzer implements LanguageSupport {
         String pkg = "";
         List<String> explicitImports = new ArrayList<>();
         List<String> wildcardImports = new ArrayList<>();
-        List<TSNode> top = Syntax.namedChildren(syntax.root);
-        for (TSNode n : top) {
-            switch (n.getType()) {
-                case "package_declaration" -> {
-                    // Skip package annotations (allowed in package-info.java); the next named child is the name.
-                    for (TSNode c : Syntax.namedChildren(n)) {
-                        String kind = c.getType();
-                        if (!kind.equals("annotation") && !kind.equals("marker_annotation")) {
-                            pkg = stripWhitespace(syntax.text(c));
-                            break;
-                        }
+        List<Integer> top = tree.children(0);
+        for (int n : top) {
+            switch (tree.kind(n)) {
+                case PACKAGE -> {
+                    // Package annotations (allowed in package-info.java) are separate nodes; the NAME child is the name.
+                    int name = nameChild(tree, n);
+                    if (name != JavaParse.NONE) {
+                        pkg = stripWhitespace(tree.text(name));
                     }
                 }
-                case "import_declaration" -> {
-                    // `static` is an anonymous token of the import_declaration, `*` a named `asterisk` node.
-                    boolean isStatic = Syntax.children(n).stream().anyMatch(c -> c.getType().equals("static"));
-                    List<TSNode> named = Syntax.namedChildren(n);
-                    boolean asterisk = named.stream().anyMatch(c -> c.getType().equals("asterisk"));
-                    TSNode nameNode = named.stream()
-                            .filter(c -> c.getType().equals("scoped_identifier") || c.getType().equals("identifier"))
-                            .findFirst().orElse(null);
-                    if (nameNode == null) {
+                case IMPORT -> {
+                    int nameNode = nameChild(tree, n);
+                    if (nameNode == JavaParse.NONE) {
                         continue;
                     }
+                    boolean isStatic = (tree.flags(n) & JavaParse.IMPORT_STATIC) != 0;
+                    boolean asterisk = (tree.flags(n) & JavaParse.IMPORT_ASTERISK) != 0;
                     // Names may be written with whitespace or line breaks around the dots; normalise to `a.b.C`.
-                    String name = stripWhitespace(syntax.text(nameNode));
+                    String name = stripWhitespace(tree.text(nameNode));
                     if (isStatic && !asterisk) {
                         int dot = name.lastIndexOf('.');
                         explicitImports.add(dot >= 0 ? name.substring(0, dot) : name);
@@ -128,19 +107,29 @@ public final class JavaAnalyzer implements LanguageSupport {
             }
         }
 
-        FileState st = new FileState(syntax, SourceText.lines(code), file, pkg, moduleOf(relative),
+        FileState st = new FileState(tree, SourceText.lines(code), file, pkg, moduleOf(relative),
                 isTest(relative), List.copyOf(explicitImports), List.copyOf(wildcardImports));
-        for (TSNode n : top) {
-            if (TYPE_DECLARATIONS.contains(n.getType())) {
+        for (int n : top) {
+            if (tree.kind(n) == NodeKind.TYPE_DECL) {
                 st.collectType(n, "");
             }
         }
-        return new ParsedFile(file, st.types, null, syntax.root.hasError());
+        return new ParsedFile(file, st.types, null, tree.error());
+    }
+
+    /** The {@link NodeKind#NAME} child of a package or import node, or {@link JavaParse#NONE}. */
+    private static int nameChild(Tree tree, int n) {
+        for (int c = n + 1; c < tree.end(n); c = tree.end(c)) {
+            if (tree.kind(c) == NodeKind.NAME) {
+                return c;
+            }
+        }
+        return JavaParse.NONE;
     }
 
     /** Per-file data shared by every type declared in the file, and the types found so far (in pre-order). */
     private static final class FileState {
-        final Syntax syntax;
+        final Tree tree;
         final String[] lines;
         final Path file;
         final String pkg;
@@ -150,9 +139,9 @@ public final class JavaAnalyzer implements LanguageSupport {
         final List<String> wildcardImports;
         final List<TypeInfo> types = new ArrayList<>();
 
-        FileState(Syntax syntax, String[] lines, Path file, String pkg, String module, boolean test,
+        FileState(Tree tree, String[] lines, Path file, String pkg, String module, boolean test,
                   List<String> explicitImports, List<String> wildcardImports) {
-            this.syntax = syntax;
+            this.tree = tree;
             this.lines = lines;
             this.file = file;
             this.pkg = pkg;
@@ -169,107 +158,55 @@ public final class JavaAnalyzer implements LanguageSupport {
          * type is named {@code Outer.Inner}. Metrics:
          * <ul>
          *   <li>NOA (attributes): one per declared variable in fields and interface constants ({@code int a, b;} is
-         *       two), one per enum constant and one per record component;</li>
+         *       two), one per enum constant and one per record component (a varargs component {@code int... xs} is
+         *       not counted);</li>
          *   <li>methods: methods and constructors (initialiser blocks and compact record constructors are not
          *       counted);</li>
          *   <li>LOC: the whole declaration, including member types, so an outer type's LOC contains its inner
          *       types';</li>
          *   <li>references: collected from the whole declaration, member types included.</li>
          * </ul>
+         * The type is added before its member types, so {@link #types} is in pre-order.
          */
-        void collectType(TSNode decl, String outer) {
-            String kind = decl.getType();
-            String simple = syntax.text(Syntax.field(decl, "name"));
+        void collectType(int decl, String outer) {
+            String simple = tree.tokenText(tree.name(decl));
             String name = outer.isEmpty() ? simple : outer + "." + simple;
             String fqn = pkg.isEmpty() ? name : pkg + "." + name;
 
             List<MethodInfo> methods = new ArrayList<>();
-            List<TSNode> nested = new ArrayList<>();
-            int noa = 0;
-            // Record components (`record P(int x, int y)`) are the record's fields.
-            if (kind.equals("record_declaration")) {
-                TSNode params = Syntax.field(decl, "parameters");
-                if (params != null) {
-                    noa += countOfKind(Syntax.namedChildren(params), "formal_parameter");
-                }
-            }
-            TSNode body = Syntax.field(decl, "body");
-            if (body != null) {
-                List<TSNode> members = Syntax.namedChildren(body);
-                // Enum bodies keep their non-constant members in a nested enum_body_declarations node.
-                for (int i = 0; i < members.size(); i++) {
-                    if (members.get(i).getType().equals("enum_body_declarations")) {
-                        TSNode extra = members.remove(i);
-                        members.addAll(Syntax.namedChildren(extra));
-                        break;
-                    }
-                }
-                for (TSNode m : members) {
-                    String k = m.getType();
-                    switch (k) {
-                        // constant_declaration is a field in an interface body.
-                        case "field_declaration", "constant_declaration" ->
-                                noa += countOfKind(Syntax.namedChildren(m), "variable_declarator");
-                        case "enum_constant" -> noa++;
-                        case "method_declaration", "constructor_declaration" -> methods.add(method(m));
-                        default -> {
-                            if (TYPE_DECLARATIONS.contains(k)) {
-                                nested.add(m);
-                            }
-                        }
+            List<Integer> nested = new ArrayList<>();
+            // Record components (`record P(int x, int y)`) are the record's fields; `count` is 0 for other kinds.
+            int noa = tree.count(decl);
+            for (int m = decl + 1; m < tree.end(decl); m = tree.end(m)) {
+                switch (tree.kind(m)) {
+                    case FIELD -> noa += tree.count(m);
+                    case ENUM_CONSTANT -> noa++;
+                    case METHOD -> methods.add(method(m));
+                    case TYPE_DECL -> nested.add(m);
+                    default -> {
                     }
                 }
             }
-            int begin = Syntax.firstLine(decl);
-            int end = Syntax.lastLine(decl);
+            int begin = tree.firstLine(decl);
+            int end = tree.lastLine(decl);
             types.add(new TypeInfo(
-                    Language.JAVA, fqn, name, pkg, module, kindOf(decl, kind), file, begin, end,
+                    Language.JAVA, fqn, name, pkg, module, kindOf(tree.sub(decl), tree.flags(decl)), file, begin, end,
                     SourceText.countLoc(lines, begin, end), noa, test, methods, references(decl),
                     explicitImports, wildcardImports));
-            for (TSNode n : nested) {
+            for (int n : nested) {
                 collectType(n, name);
             }
         }
 
         /**
-         * The building kind shown in the viewers. Classes are split into "abstract" and "class" by their
-         * {@code abstract} modifier, which is an anonymous token inside the {@code modifiers} node.
+         * Metrics of a method or constructor. Parameters include a trailing varargs parameter; the receiver parameter
+         * ({@code Foo this}) is not counted (the parser does both).
          */
-        private String kindOf(TSNode decl, String kind) {
-            return switch (kind) {
-                case "interface_declaration" -> "interface";
-                case "enum_declaration" -> "enum";
-                case "record_declaration" -> "record";
-                case "annotation_type_declaration" -> "annotation";
-                default -> {
-                    TSNode modifiers = Syntax.namedChildren(decl).stream()
-                            .filter(c -> c.getType().equals("modifiers")).findFirst().orElse(null);
-                    boolean isAbstract = modifiers != null && Syntax.children(modifiers).stream()
-                            .anyMatch(c -> syntax.text(c).equals("abstract"));
-                    yield isAbstract ? "abstract" : "class";
-                }
-            };
-        }
-
-        /**
-         * Metrics of a method or constructor. Parameters include a trailing varargs parameter
-         * ({@code spread_parameter}); the receiver parameter ({@code Foo this}) is not counted.
-         */
-        private MethodInfo method(TSNode m) {
-            int begin = Syntax.firstLine(m);
-            int end = Syntax.lastLine(m);
-            TSNode params = Syntax.field(m, "parameters");
-            int parameters = 0;
-            if (params != null) {
-                for (TSNode p : Syntax.namedChildren(params)) {
-                    String k = p.getType();
-                    if (k.equals("formal_parameter") || k.equals("spread_parameter")) {
-                        parameters++;
-                    }
-                }
-            }
-            return new MethodInfo(syntax.text(Syntax.field(m, "name")), begin, SourceText.countLoc(lines, begin, end),
-                    complexity(m), parameters);
+        private MethodInfo method(int m) {
+            int begin = tree.firstLine(m);
+            int end = tree.lastLine(m);
+            return new MethodInfo(tree.tokenText(tree.name(m)), begin, SourceText.countLoc(lines, begin, end),
+                    complexity(tree, m), tree.count(m));
         }
 
         /**
@@ -279,52 +216,47 @@ public final class JavaAnalyzer implements LanguageSupport {
          * naming convention: without a symbol solver, {@code Util.run()} (a static call on a type) and
          * {@code list.add()} (a call on a variable) look alike.
          */
-        private Set<String> references(TSNode decl) {
+        private Set<String> references(int decl) {
             Set<String> refs = new HashSet<>();
-            Syntax.walkWhile(decl, n -> {
-                switch (n.getType()) {
-                    case "type_identifier" -> refs.add(syntax.text(n));
-                    case "scoped_type_identifier" -> {
-                        // `Map.Entry` contributes "Map.Entry" and its scope "Map", but not "Entry" alone.
-                        String text = stripWhitespace(syntax.text(n));
+            for (int n = decl + 1; n < tree.end(decl); n++) {
+                switch (tree.kind(n)) {
+                    case TYPE_NAME -> refs.add(tree.text(n));
+                    case SCOPED_TYPE_NAME -> {
+                        // `Map.Entry` contributes "Map.Entry" and its scope "Map", but not "Entry" alone (the parser
+                        // does not report the parts of a qualified name separately).
+                        String text = stripWhitespace(tree.text(n));
                         for (int dot = text.lastIndexOf('.'); dot >= 0; dot = text.lastIndexOf('.', dot - 1)) {
                             refs.add(text.substring(0, dot));
                         }
                         refs.add(text);
-                        // Do not descend: the inner type_identifiers would add "Entry" on its own.
-                        return false;
                     }
-                    case "marker_annotation", "annotation" ->
-                            refs.add(stripWhitespace(syntax.text(Syntax.field(n, "name"))));
-                    case "method_invocation", "field_access" -> {
-                        // `Outer.this` is a qualified this, not a static member access.
-                        TSNode field = n.getType().equals("field_access") ? Syntax.field(n, "field") : null;
-                        boolean qualifiedThis = field != null && field.getType().equals("this");
-                        TSNode object = qualifiedThis ? null : Syntax.field(n, "object");
-                        if (object != null && object.getType().equals("identifier")) {
-                            String s = syntax.text(object);
-                            if (!s.isEmpty() && Character.isUpperCase(s.codePointAt(0))) {
-                                refs.add(s);
-                            }
+                    case ANNOTATION_NAME -> refs.add(stripWhitespace(tree.text(n)));
+                    case MEMBER_OBJECT -> {
+                        String s = tree.text(n);
+                        if (!s.isEmpty() && Character.isUpperCase(s.codePointAt(0))) {
+                            refs.add(s);
                         }
                     }
                     default -> {
                     }
                 }
-                return true;
-            });
+            }
             return refs;
         }
     }
 
-    private static int countOfKind(List<TSNode> nodes, String kind) {
-        int n = 0;
-        for (TSNode c : nodes) {
-            if (c.getType().equals(kind)) {
-                n++;
-            }
-        }
-        return n;
+    /**
+     * The building kind shown in the viewers. Classes are split into "abstract" and "class" by their {@code abstract}
+     * modifier.
+     */
+    private static String kindOf(int sub, int flags) {
+        return switch (sub) {
+            case JavaParse.TYPE_INTERFACE -> "interface";
+            case JavaParse.TYPE_ENUM -> "enum";
+            case JavaParse.TYPE_RECORD -> "record";
+            case JavaParse.TYPE_ANNOTATION -> "annotation";
+            default -> (flags & JavaParse.TYPE_ABSTRACT) != 0 ? "abstract" : "class";
+        };
     }
 
     /**
@@ -332,33 +264,23 @@ public final class JavaAnalyzer implements LanguageSupport {
      *
      * <p>Decision points are {@code if}, the four loops, {@code catch}, {@code ?:}, every non-default {@code case}
      * label ({@code default} has no expression; {@code case 1, 2 ->} is one label and counts once) and every
-     * {@code &&} or {@code ||}. The walk covers the whole subtree, so lambdas and anonymous or local classes inside a
-     * method add to that method's complexity. The TypeScript and Rust analysers count the equivalent constructs of
-     * their languages.
+     * {@code &&} or {@code ||}; the parser marks them as {@link NodeKind#DECISION} nodes. Everything inside the node
+     * counts, so lambdas and anonymous or local classes inside a method add to that method's complexity. The
+     * TypeScript and Rust analysers count the equivalent constructs of their languages.
      */
-    static int complexity(TSNode node) {
-        int[] cx = {1};
-        Syntax.walk(node, n -> {
-            String kind = n.getType();
-            if (DECISIONS.contains(kind)) {
-                cx[0]++;
-            } else if (kind.equals("switch_label")) {
-                if (n.getNamedChildCount() > 0) {
-                    cx[0]++;
-                }
-            } else if (kind.equals("binary_expression")) {
-                String op = Syntax.operator(n);
-                if (op.equals("&&") || op.equals("||")) {
-                    cx[0]++;
-                }
+    static int complexity(Tree tree, int node) {
+        int cx = 1;
+        for (int n = node + 1; n < tree.end(node); n++) {
+            if (tree.kind(n) == NodeKind.DECISION) {
+                cx++;
             }
-        });
-        return cx[0];
+        }
+        return cx;
     }
 
     /**
-     * Removes all whitespace: tree-sitter keeps the source text, and {@code java.util . List} is a legal way to write
-     * a name. Whitespace is Unicode's White_Space property, as in the Rust and D editions
+     * Removes all whitespace: names are taken from the source text, and {@code java.util . List} is a legal way to
+     * write one. Whitespace is Unicode's White_Space property, as in the Rust and D editions
      * ({@link Character#isWhitespace} differs from it in a few code points).
      */
     static String stripWhitespace(String s) {

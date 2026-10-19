@@ -294,7 +294,7 @@ unittest // Java: default-package types are invisible from named packages; membe
     assert(a.dependencies["shop.Cart"] == ["other.Helper", "other.Util", "shop.Line"]);
 }
 
-unittest // Java: line numbers follow tree-sitter rows (no lone \r breaks); trailing block comments are tracked
+unittest // Java: lines break at \n only (no lone \r breaks); trailing block comments are tracked
 {
     auto f = Fixture.create();
     scope (exit) f.cleanup();

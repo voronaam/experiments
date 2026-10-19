@@ -1,9 +1,8 @@
 package dev.codecity.analysis;
 
-import org.treesitter.TSNode;
-import org.treesitter.TSParser;
-import org.treesitter.TreeSitterTsx;
-import org.treesitter.TreeSitterTypescript;
+import dev.codecity.analysis.TypeScriptParse.Field;
+import dev.codecity.analysis.TypeScriptParse.NodeKind;
+import dev.codecity.analysis.TypeScriptParse.Tree;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -18,9 +17,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
 /**
- * TypeScript support (tree-sitter). Directories are districts; classes, interfaces, enums and type aliases are
- * buildings; each file's top-level functions and constants form one "module" building named after the file — which is
- * where React components and other function-style code live.
+ * TypeScript support (parsed with the in-house {@link TypeScriptParse}). Directories are districts; classes,
+ * interfaces, enums and type aliases are buildings; each file's top-level functions and constants form one "module"
+ * building named after the file — which is where React components and other function-style code live.
  *
  * <h2>Identity</h2>
  * TypeScript has no package declaration, so everything is derived from the file's path relative to the root:
@@ -40,8 +39,9 @@ import java.util.regex.Pattern;
  * exported under that name. Re-exports ({@code export … from}) are not followed: an import through a barrel file
  * points at the barrel's module building, if it has one.
  *
- * <p>References are collected per identifier, without scope analysis, so a local variable that happens to share a
- * name with a top-level declaration or an import also creates an edge. The Rust and D editions mirror this analyser.
+ * <p>References are the identifier tokens the parser flagged as possible references ({@link TypeScriptParse#REF}),
+ * collected without scope analysis, so a local variable that happens to share a name with a top-level declaration or
+ * an import also creates an edge. The Rust and D editions mirror this analyser.
  */
 public final class TypeScriptAnalyzer implements LanguageSupport {
 
@@ -51,23 +51,11 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
     private static final Pattern TEST_FILE = Pattern.compile(".*\\.(test|spec)\\.(ts|tsx|mts|cts)$");
     /**
      * Node kinds of a function used as a value: {@code const f = () => …}, a method-valued class field, or a callback
-     * argument. {@code function} is what older versions of the grammar call {@code function_expression}.
+     * argument.
      */
-    private static final Set<String> FUNCTION_VALUES = Set.of(
-            "arrow_function", "function_expression", "function", "generator_function");
-    /**
-     * Decision points for {@link #complexity}: {@code for_in_statement} covers both {@code for … in} and
-     * {@code for … of}; {@code switch_case} is a {@code case} ({@code default} is a separate node kind and not
-     * counted). {@code &&}, {@code ||} and {@code ??} are counted separately.
-     */
-    private static final Set<String> DECISIONS = Set.of(
-            "if_statement", "for_statement", "for_in_statement", "while_statement", "do_statement",
-            "switch_case", "catch_clause", "ternary_expression");
+    private static final Set<NodeKind> FUNCTION_VALUES = Set.of(
+            NodeKind.ARROW, NodeKind.FUNCTION_EXPR, NodeKind.GENERATOR_EXPR);
 
-    // One parser per thread and grammar: a TSParser must not be shared between the threads parsing in parallel. .tsx
-    // needs its own grammar because JSX is ambiguous with the <T>expr type assertion of plain TypeScript.
-    private final ThreadLocal<TSParser> tsParser = ThreadLocal.withInitial(() -> Syntax.parser(TreeSitterTypescript::new));
-    private final ThreadLocal<TSParser> tsxParser = ThreadLocal.withInitial(() -> Syntax.parser(TreeSitterTsx::new));
     /**
      * Absolute directory → its project directory (see {@link #projectOf}), shared by the parsing threads. Cleared at the
      * start of every {@link #link}, which re-derives the projects, so a {@code package.json} added or removed during a
@@ -104,22 +92,22 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
 
     /**
      * Extracts one file in a single pass over its top-level statements, then builds the module building from whatever
-     * free code was found. A file with syntax errors still yields whatever tree-sitter could parse around them.
+     * free code was found. A file with syntax errors still yields whatever the parser recovered around them.
      */
     @Override
     public ParsedFile parse(Path root, Path file, String code) {
-        TSParser parser = file.getFileName().toString().endsWith(".tsx") ? tsxParser.get() : tsParser.get();
-        Syntax syntax = Syntax.parse(parser, code);
-        FileState st = new FileState(root, file, syntax, SourceText.lines(code));
-        st.visitStatements(syntax.root, "");
+        // .tsx enables JSX: in plain TypeScript <T>x is a type assertion, in TSX it is JSX.
+        Tree tree = TypeScriptParse.parse(code, file.getFileName().toString().endsWith(".tsx"));
+        FileState st = new FileState(root, file, tree, SourceText.lines(code));
+        st.visitStatements(tree.root, "");
         st.finishModule();
         Context ctx = new Context(st.path, st.imports, st.names, st.defaultExport);
-        return new ParsedFile(file, st.types, ctx, syntax.root.hasError());
+        return new ParsedFile(file, st.types, ctx, tree.hasError);
     }
 
     /** Per-file extraction state. Created for one {@link #parse} call and used by one thread only. */
     private final class FileState {
-        final Syntax syntax;
+        final Tree tree;
         final String[] lines;
         final Path file;
         final String path;
@@ -142,8 +130,8 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
         /** LOC of the free statements only; the module building's LOC is not the whole file's. */
         int moduleLoc;
 
-        FileState(Path root, Path file, Syntax syntax, String[] lines) {
-            this.syntax = syntax;
+        FileState(Path root, Path file, Tree tree, String[] lines) {
+            this.tree = tree;
             this.lines = lines;
             this.file = file;
             Path rel = root.relativize(file);
@@ -158,52 +146,59 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
             return path;
         }
 
+        /** Lines of code of a node. */
+        int loc(int n) {
+            return SourceText.countLoc(lines, tree.firstLine(n), tree.lastLine(n));
+        }
+
+        /** Text of the child with the given field, or "". */
+        String fieldText(int n, Field f) {
+            int c = tree.field(n, f);
+            return c < 0 ? "" : tree.text(c);
+        }
+
         /**
          * Visits the statements of a program or namespace body. {@code prefix} is the namespace path ("" at the top
          * level, {@code "N."} inside {@code namespace N}).
          *
-         * <p>Statement kinds handled here before {@link #declaration}:
-         * <ul>
-         *   <li>{@code export_statement}: {@code export [default] <declaration>} carries it in the
-         *       {@code declaration} field; {@code export default <expression>} in {@code value}; {@code export { … }}
-         *       and {@code export … from} have neither and are skipped.</li>
-         *   <li>{@code ambient_declaration} ({@code declare …}) wraps a declaration as its first named child.</li>
-         *   <li>{@code expression_statement}: the grammar parses a statement-level {@code namespace N { … }} as an
-         *       expression statement around an {@code internal_module}; that is unwrapped like a declaration. Any
-         *       other expression is free top-level code for the module building.</li>
-         * </ul>
+         * <p>Unwraps the statement forms that wrap a declaration: {@code export …} (a DECL child, or for
+         * {@code export default <expr>} a VALUE child) and {@code declare …} (AMBIENT). Expression statements are
+         * top-level code for the module building. Re-exports ({@code export { a } from "./b"}) have neither child and
+         * are ignored, as is {@code export declare …} (an ambient declaration inside an export, which is not unwrapped).
          */
-        void visitStatements(TSNode container, String prefix) {
-            for (TSNode child : Syntax.namedChildren(container)) {
-                TSNode decl = child;
+        void visitStatements(int container, String prefix) {
+            for (int child : tree.children(container)) {
+                int decl = child;
                 boolean isDefault = false;
-                switch (child.getType()) {
-                    case "import_statement" -> {
+                switch (tree.kind(child)) {
+                    case IMPORT -> {
                         addImport(child);
                         continue;
                     }
-                    case "export_statement" -> {
-                        // "default" is an anonymous keyword token, hence the search through all children.
-                        isDefault = Syntax.children(child).stream().anyMatch(c -> c.getType().equals("default"));
-                        decl = Syntax.field(child, "declaration");
-                        if (decl == null) {
-                            TSNode value = Syntax.field(child, "value");
-                            if (value != null && isDefault) {
+                    case EXPORT, EXPORT_DEFAULT -> {
+                        isDefault = tree.kind(child) == NodeKind.EXPORT_DEFAULT;
+                        decl = tree.field(child, Field.DECL);
+                        if (decl < 0) {
+                            int value = tree.field(child, Field.VALUE);
+                            if (value >= 0 && isDefault) {
                                 exportDefaultExpression(value);
                             }
                             continue;
                         }
                     }
-                    case "ambient_declaration", "expression_statement" -> {
-                        if (child.getNamedChildCount() == 0) {
+                    case AMBIENT -> {
+                        int[] kids = tree.children(child);
+                        if (kids.length == 0) {
                             continue;
                         }
-                        decl = child.getNamedChild(0);
-                        if (child.getType().equals("expression_statement")
-                                && !decl.getType().equals("internal_module")) {
-                            addStatement(child, decl);
-                            continue;
+                        decl = kids[0];
+                    }
+                    case EXPR_STMT -> {
+                        int[] kids = tree.children(child);
+                        if (kids.length > 0) {
+                            addStatement(child, kids[0]);
                         }
+                        continue;
                     }
                     default -> {
                     }
@@ -218,31 +213,45 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
         /**
          * Handles one declaration; returns the declared name (for default exports) or null.
          *
-         * <p>{@code class} is a class expression; {@code internal_module} is
-         * {@code namespace N} and {@code module} is {@code module N} or {@code declare module "name"}, whose quotes are
-         * stripped. Their bodies are visited recursively with the namespace added to the prefix.
+         * <p>Classes, interfaces, enums and type aliases become buildings; functions and variables go into the module
+         * building; namespaces ({@code namespace N}, {@code module N}, {@code declare module "name"}, whose quotes are
+         * stripped) are walked recursively with the namespace added to the prefix and do not become buildings.
          */
-        String declaration(TSNode decl, String prefix) {
-            switch (decl.getType()) {
-                case "class_declaration", "abstract_class_declaration", "class" -> {
-                    return addClass(decl, prefix);
+        String declaration(int decl, String prefix) {
+            switch (tree.kind(decl)) {
+                case CLASS_DECL, ABSTRACT_CLASS_DECL, CLASS_EXPR -> {
+                    return addClass(decl, prefix, null);
                 }
-                case "interface_declaration" -> {
-                    return addInterface(decl, prefix);
-                }
-                case "enum_declaration" -> {
-                    return addEnum(decl, prefix);
-                }
-                case "type_alias_declaration" -> {
-                    return addAlias(decl, prefix);
-                }
-                case "function_declaration", "generator_function_declaration" -> {
-                    String name = prefix + syntax.text(Syntax.field(decl, "name"));
-                    addFunction(name, decl, decl);
-                    moduleLoc += SourceText.countLoc(lines, Syntax.firstLine(decl), Syntax.lastLine(decl));
+                case INTERFACE -> {
+                    String name = prefix + fieldText(decl, Field.NAME);
+                    List<MethodInfo> methods = new ArrayList<>();
+                    int attributes = countMembers(tree.field(decl, Field.BODY), methods);
+                    type(name, "interface", decl, attributes, methods);
                     return name;
                 }
-                case "lexical_declaration", "variable_declaration" -> {
+                case ENUM -> {
+                    String name = prefix + fieldText(decl, Field.NAME);
+                    int body = tree.field(decl, Field.BODY);
+                    type(name, "enum", decl, body < 0 ? 0 : tree.children(body).length, List.of());
+                    return name;
+                }
+                case TYPE_ALIAS -> {
+                    String name = prefix + fieldText(decl, Field.NAME);
+                    List<MethodInfo> methods = new ArrayList<>();
+                    // Only an object-literal type (type P = { x: number }) has members to count; unions etc. have none.
+                    int value = tree.field(decl, Field.VALUE);
+                    int attributes = value >= 0 && tree.kind(value) == NodeKind.OBJECT_TYPE
+                            ? countMembers(value, methods) : 0;
+                    type(name, "type", decl, attributes, methods);
+                    return name;
+                }
+                case FUNCTION_DECL, GENERATOR_DECL -> {
+                    String name = prefix + fieldText(decl, Field.NAME);
+                    addFunction(name, decl, decl);
+                    moduleLoc += loc(decl);
+                    return name;
+                }
+                case VAR_DECL -> {
                     // const/let/var with one or more declarators. A function value becomes a function of the module
                     // building, a class expression a building named after the variable, anything else an attribute.
                     // Destructuring patterns get their pattern text as name. For "export default", the last
@@ -250,17 +259,18 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
                     // many declarators it has.
                     String last = null;
                     boolean free = false;
-                    for (TSNode d : Syntax.namedChildren(decl)) {
-                        if (!d.getType().equals("variable_declarator")) {
+                    for (int d : tree.children(decl)) {
+                        if (tree.kind(d) != NodeKind.DECLARATOR) {
                             continue;
                         }
-                        String name = prefix + syntax.text(Syntax.field(d, "name"));
-                        TSNode value = Syntax.field(d, "value");
-                        if (value != null && FUNCTION_VALUES.contains(value.getType())) {
+                        String simple = fieldText(d, Field.NAME);
+                        String name = prefix + simple;
+                        int value = tree.field(d, Field.VALUE);
+                        if (value >= 0 && FUNCTION_VALUES.contains(tree.kind(value))) {
                             addFunction(name, value, decl);
                             free = true;
-                        } else if (value != null && value.getType().equals("class")) {
-                            addClass(value, prefix, syntax.text(Syntax.field(d, "name")));
+                        } else if (value >= 0 && tree.kind(value) == NodeKind.CLASS_EXPR) {
+                            addClass(value, prefix, simple);
                         } else {
                             moduleAttributes++;
                             moduleNames.add(name);
@@ -270,14 +280,14 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
                         last = name;
                     }
                     if (free) {
-                        moduleLoc += SourceText.countLoc(lines, Syntax.firstLine(decl), Syntax.lastLine(decl));
+                        moduleLoc += loc(decl);
                     }
                     return last;
                 }
-                case "internal_module", "module" -> {
-                    TSNode body = Syntax.field(decl, "body");
-                    String name = syntax.text(Syntax.field(decl, "name")).replace("'", "").replace("\"", "");
-                    if (body != null) {
+                case MODULE -> {
+                    String name = fieldText(decl, Field.NAME).replace("'", "").replace("\"", "");
+                    int body = tree.field(decl, Field.BODY);
+                    if (body >= 0) {
                         visitStatements(body, prefix + name + ".");
                     }
                     return null;
@@ -290,18 +300,19 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
 
         /**
          * {@code export default <expression>}: an identifier names a declaration elsewhere in the file; an anonymous
-         * function or class is recorded under the name {@code default}. Other expressions (objects, calls, …) leave
-         * the file without a resolvable default export.
+         * function becomes a module-building function named {@code default}; a class expression becomes a building
+         * named after its own name or {@code default}. Other expressions (objects, calls, …) leave the file without a
+         * resolvable default export.
          */
-        void exportDefaultExpression(TSNode value) {
-            switch (value.getType()) {
-                case "identifier" -> defaultExport = syntax.text(value);
-                case "arrow_function", "function_expression", "function" -> {
+        void exportDefaultExpression(int value) {
+            switch (tree.kind(value)) {
+                case IDENT -> defaultExport = tree.text(value);
+                case ARROW, FUNCTION_EXPR -> {
                     addFunction("default", value, value);
-                    moduleLoc += SourceText.countLoc(lines, Syntax.firstLine(value), Syntax.lastLine(value));
+                    moduleLoc += loc(value);
                     defaultExport = "default";
                 }
-                case "class" -> defaultExport = addClass(value, "", "default");
+                case CLASS_EXPR -> defaultExport = addClass(value, "", "default");
                 default -> {
                 }
             }
@@ -316,37 +327,27 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
          * </pre>
          * {@code import "./m"} (side effects only) and {@code import x = require(…)} bind nothing usable here.
          */
-        void addImport(TSNode stmt) {
-            TSNode source = Syntax.field(stmt, "source");
-            if (source == null) {
+        void addImport(int stmt) {
+            int source = tree.field(stmt, Field.SOURCE);
+            if (source < 0) {
                 return;
             }
             // The source node is the string literal including its quotes.
-            String from = syntax.text(source).replaceAll("^['\"`]|['\"`]$", "");
-            for (TSNode clause : Syntax.namedChildren(stmt)) {
-                if (!clause.getType().equals("import_clause")) {
-                    continue;
-                }
-                for (TSNode part : Syntax.namedChildren(clause)) {
-                    switch (part.getType()) {
-                        case "identifier" -> imports.add(new Import(syntax.text(part), from, "default"));
-                        case "namespace_import" -> {
-                            for (TSNode id : Syntax.namedChildren(part)) {
-                                imports.add(new Import(syntax.text(id), from, "*"));
-                            }
+            String from = trimQuotes(tree.text(source));
+            for (int part : tree.children(stmt)) {
+                switch (tree.kind(part)) {
+                    case IMPORT_DEFAULT -> imports.add(new Import(tree.text(part), from, "default"));
+                    case IMPORT_NAMESPACE -> {
+                        for (int id : tree.children(part)) {
+                            imports.add(new Import(tree.text(id), from, "*"));
                         }
-                        case "named_imports" -> {
-                            for (TSNode spec : Syntax.namedChildren(part)) {
-                                if (!spec.getType().equals("import_specifier")) {
-                                    continue;
-                                }
-                                String name = syntax.text(Syntax.field(spec, "name"));
-                                TSNode alias = Syntax.field(spec, "alias");
-                                imports.add(new Import(alias == null ? name : syntax.text(alias), from, name));
-                            }
-                        }
-                        default -> {
-                        }
+                    }
+                    case IMPORT_SPECIFIER -> {
+                        String name = fieldText(part, Field.NAME);
+                        int alias = tree.field(part, Field.ALIAS);
+                        imports.add(new Import(alias < 0 ? name : tree.text(alias), from, name));
+                    }
+                    default -> {
                     }
                 }
             }
@@ -369,11 +370,11 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
         }
 
         /** Creates and records the building for a class, interface, enum or type alias spanning {@code decl}. */
-        TypeInfo type(String name, String kind, TSNode decl, int noa, List<MethodInfo> methods) {
+        TypeInfo type(String name, String kind, int decl, int noa, List<MethodInfo> methods) {
             Set<String> refs = new HashSet<>();
             collectRefs(decl, refs);
-            int begin = Syntax.firstLine(decl);
-            int end = Syntax.lastLine(decl);
+            int begin = tree.firstLine(decl);
+            int end = tree.lastLine(decl);
             TypeInfo t = new TypeInfo(Language.TYPESCRIPT, id(name, kind), name, packageName, module, kind, file,
                     begin, end, SourceText.countLoc(lines, begin, end), noa, test, List.copyOf(methods),
                     Set.copyOf(refs), List.of(), List.of());
@@ -381,43 +382,38 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
             return t;
         }
 
-        String addClass(TSNode decl, String prefix) {
-            return addClass(decl, prefix, null);
-        }
-
         /**
          * Adds a class building. Methods are method definitions, abstract and overload signatures, and fields whose
-         * value is a function ({@code handle = () => …}); other fields and
-         * constructor parameter properties are attributes. Static members count like instance members.
+         * value is a function ({@code handle = () => …}); other fields and constructor parameter properties are
+         * attributes. Static members count like instance members.
          *
          * @param fallbackName name for an anonymous class expression (the variable it is assigned to, or
          *                     {@code default}); null if there is none, and then nothing is added
          * @return the building's name, or null
          */
-        String addClass(TSNode decl, String prefix, String fallbackName) {
-            TSNode nameNode = Syntax.field(decl, "name");
-            String name = prefix + (nameNode != null ? syntax.text(nameNode) : fallbackName);
-            if (name.equals(prefix)) {
+        String addClass(int decl, String prefix, String fallbackName) {
+            int nameNode = tree.field(decl, Field.NAME);
+            if (nameNode < 0 && fallbackName == null) {
                 return null;
             }
+            String name = prefix + (nameNode >= 0 ? tree.text(nameNode) : fallbackName);
             List<MethodInfo> methods = new ArrayList<>();
             int attributes = 0;
-            TSNode body = Syntax.field(decl, "body");
-            if (body != null) {
-                for (TSNode member : Syntax.namedChildren(body)) {
-                    switch (member.getType()) {
-                        case "method_definition" -> {
-                            methods.add(method(member, Syntax.field(member, "name"), member));
-                            if (syntax.text(Syntax.field(member, "name")).equals("constructor")) {
+            int body = tree.field(decl, Field.BODY);
+            if (body >= 0) {
+                for (int member : tree.children(body)) {
+                    switch (tree.kind(member)) {
+                        case METHOD_DEF -> {
+                            methods.add(method(member, tree.field(member, Field.NAME), member));
+                            if (fieldText(member, Field.NAME).equals("constructor")) {
                                 attributes += parameterProperties(member);
                             }
                         }
-                        case "abstract_method_signature", "method_signature" ->
-                                methods.add(method(member, Syntax.field(member, "name"), null));
-                        case "public_field_definition" -> {
-                            TSNode value = Syntax.field(member, "value");
-                            if (value != null && FUNCTION_VALUES.contains(value.getType())) {
-                                methods.add(method(value, Syntax.field(member, "name"), member));
+                        case METHOD_SIG -> methods.add(method(member, tree.field(member, Field.NAME), -1));
+                        case FIELD_DEF -> {
+                            int value = tree.field(member, Field.VALUE);
+                            if (value >= 0 && FUNCTION_VALUES.contains(tree.kind(value))) {
+                                methods.add(method(value, tree.field(member, Field.NAME), member));
                             } else {
                                 attributes++;
                             }
@@ -427,60 +423,42 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
                     }
                 }
             }
-            String kind = decl.getType().equals("abstract_class_declaration") ? "abstract" : "class";
+            String kind = tree.kind(decl) == NodeKind.ABSTRACT_CLASS_DECL ? "abstract" : "class";
             type(name, kind, decl, attributes, methods);
             return name;
         }
 
-        /** Constructor parameters with an accessibility modifier ({@code private x: T}) declare fields. */
-        int parameterProperties(TSNode constructor) {
-            TSNode params = Syntax.field(constructor, "parameters");
+        /**
+         * Constructor parameters with an accessibility modifier ({@code private x: T}) declare fields. ({@code readonly}
+         * alone does too in TypeScript, but is not counted, to keep the metric stable across CodeCity versions.)
+         */
+        int parameterProperties(int constructor) {
+            int params = tree.field(constructor, Field.PARAMS);
             int n = 0;
-            if (params != null) {
-                for (TSNode p : Syntax.namedChildren(params)) {
-                    for (TSNode c : Syntax.namedChildren(p)) {
-                        if (c.getType().equals("accessibility_modifier") || c.getType().equals("readonly")) {
-                            n++;
-                            break;
-                        }
+            if (params >= 0) {
+                for (int p : tree.children(params)) {
+                    if (tree.kind(p) == NodeKind.PARAM_PROPERTY) {
+                        n++;
                     }
                 }
             }
             return n;
         }
 
-        String addInterface(TSNode decl, String prefix) {
-            String name = prefix + syntax.text(Syntax.field(decl, "name"));
-            List<MethodInfo> methods = new ArrayList<>();
-            int attributes = countMembers(Syntax.field(decl, "body"), methods);
-            type(name, "interface", decl, attributes, methods);
-            return name;
-        }
-
-        /** A type alias; only an object-type alias ({@code type P = { … }}) has members to count. */
-        String addAlias(TSNode decl, String prefix) {
-            String name = prefix + syntax.text(Syntax.field(decl, "name"));
-            List<MethodInfo> methods = new ArrayList<>();
-            TSNode value = Syntax.field(decl, "value");
-            int attributes = value != null && value.getType().equals("object_type") ? countMembers(value, methods) : 0;
-            type(name, "type", decl, attributes, methods);
-            return name;
-        }
-
         /**
-         * Counts the members of an interface body or object type: properties are attributes, method, call and
-         * construct signatures are methods (complexity 1). Index signatures are not counted.
+         * Counts the members of an interface body or object type: properties are attributes, method, call
+         * ({@code (x): T}) and construct ({@code new (x): T}) signatures are methods (complexity 1). Index signatures
+         * are not counted.
          */
-        int countMembers(TSNode body, List<MethodInfo> methods) {
-            int attributes = 0;
-            if (body == null) {
+        int countMembers(int body, List<MethodInfo> methods) {
+            if (body < 0) {
                 return 0;
             }
-            for (TSNode m : Syntax.namedChildren(body)) {
-                switch (m.getType()) {
-                    case "property_signature" -> attributes++;
-                    case "method_signature", "call_signature", "construct_signature" ->
-                            methods.add(method(m, Syntax.field(m, "name"), null));
+            int attributes = 0;
+            for (int m : tree.children(body)) {
+                switch (tree.kind(m)) {
+                    case PROPERTY_SIG -> attributes++;
+                    case METHOD_SIG, CALL_SIG, CONSTRUCT_SIG -> methods.add(method(m, tree.field(m, Field.NAME), -1));
                     default -> {
                     }
                 }
@@ -488,31 +466,19 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
             return attributes;
         }
 
-        String addEnum(TSNode decl, String prefix) {
-            String name = prefix + syntax.text(Syntax.field(decl, "name"));
-            TSNode body = Syntax.field(decl, "body");
-            // Every named child of the enum body except comments is a member.
-            type(name, "enum", decl, body == null ? 0 : countNamed(body), List.of());
-            return name;
-        }
-
         /**
-         * Measures one function-like node.
+         * Measures one function-like node. Parameters are the entries of the node's parameter list (an arrow
+         * function's single unparenthesised parameter counts as one).
          *
          * @param node     the node with the parameters and the line range
-         * @param nameNode node holding the name, or null for "(anonymous)"
-         * @param body     node whose complexity is measured (null for signatures without a body)
+         * @param nameNode node holding the name, or -1 for "(anonymous)"
+         * @param body     node whose complexity is measured (-1 for signatures without a body)
          */
-        MethodInfo method(TSNode node, TSNode nameNode, TSNode body) {
-            String name = nameNode == null ? "(anonymous)" : syntax.text(nameNode);
-            TSNode params = Syntax.field(node, "parameters");
-            // An arrow function with a single unparenthesised parameter (x => …) has a "parameter" field instead of a
-            // "parameters" list.
-            int count = params == null ? (Syntax.field(node, "parameter") != null ? 1 : 0) : countNamed(params);
-            int begin = Syntax.firstLine(node);
-            int end = Syntax.lastLine(node);
-            return new MethodInfo(name, begin, SourceText.countLoc(lines, begin, end),
-                    body == null ? 1 : complexity(body), count);
+        MethodInfo method(int node, int nameNode, int body) {
+            String name = nameNode < 0 ? "(anonymous)" : tree.text(nameNode);
+            int params = tree.field(node, Field.PARAMS);
+            int count = params < 0 ? 0 : tree.children(params).length;
+            return new MethodInfo(name, tree.firstLine(node), loc(node), body < 0 ? 1 : complexity(tree, body), count);
         }
 
         /**
@@ -521,8 +487,8 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
          * around an arrow function. The caller adds the statement's lines to the module building's LOC, once per
          * statement.
          */
-        void addFunction(String name, TSNode fn, TSNode statement) {
-            MethodInfo m = method(fn, null, fn);
+        void addFunction(String name, int fn, int statement) {
+            MethodInfo m = method(fn, -1, fn);
             functions.add(new MethodInfo(name, m.line(), m.loc(), m.complexity(), m.parameters()));
             moduleNames.add(name);
             collectRefs(statement, moduleRefs);
@@ -532,34 +498,39 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
          * Top-level code: {@code describe("cart", () => …)} or {@code app.get("/", handler)} becomes a method named
          * after the call, so test suites and route tables show up; anything else just adds lines and references.
          */
-        void addStatement(TSNode statement, TSNode expression) {
-            moduleLoc += SourceText.countLoc(lines, Syntax.firstLine(statement), Syntax.lastLine(statement));
+        void addStatement(int statement, int expression) {
+            moduleLoc += loc(statement);
             collectRefs(statement, moduleRefs);
-            if (!expression.getType().equals("call_expression")) {
+            if (tree.kind(expression) != NodeKind.CALL) {
                 return;
             }
-            TSNode args = Syntax.field(expression, "arguments");
-            if (args == null) {
-                return;
+            int args = tree.field(expression, Field.ARGS);
+            if (args < 0 || tree.kind(args) != NodeKind.ARGS) {
+                return; // no arguments, or a tagged template
             }
             boolean hasCallback = false;
             String label = null;
-            for (TSNode arg : Syntax.namedChildren(args)) {
-                hasCallback |= FUNCTION_VALUES.contains(arg.getType());
-                if (label == null && (arg.getType().equals("string") || arg.getType().equals("template_string"))) {
-                    label = syntax.text(arg);
+            for (int arg : tree.children(args)) {
+                hasCallback |= FUNCTION_VALUES.contains(tree.kind(arg));
+                if (label == null && (tree.kind(arg) == NodeKind.STR || tree.kind(arg) == NodeKind.TEMPLATE)) {
+                    label = tree.text(arg);
                 }
             }
             if (!hasCallback) {
                 return;
             }
-            String callee = syntax.text(Syntax.field(expression, "function"));
-            // e.g. describe("cart"); the label keeps its quotes and is cut to 48 characters including the ellipsis.
-            String name = callee + "(" + (label == null ? "" : label.length() > 48 ? label.substring(0, 47) + "…" : label) + ")";
-            int begin = Syntax.firstLine(statement);
-            int end = Syntax.lastLine(statement);
+            int[] parts = tree.children(expression);
+            String callee = parts.length == 0 ? "" : tree.text(parts[0]);
+            // e.g. describe("cart"); the label keeps its quotes and is cut to 48 characters (code points) including the
+            // ellipsis.
+            if (label == null) {
+                label = "";
+            } else if (label.codePointCount(0, label.length()) > 48) {
+                label = label.substring(0, label.offsetByCodePoints(0, 47)) + "…";
+            }
             // The complexity covers all arguments, so it includes the callback bodies.
-            functions.add(new MethodInfo(name, begin, SourceText.countLoc(lines, begin, end), complexity(args), 0));
+            functions.add(new MethodInfo(callee + "(" + label + ")", tree.firstLine(statement), loc(statement),
+                    complexity(tree, args), 0));
         }
 
         /**
@@ -582,43 +553,51 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
         }
 
         /**
-         * Every identifier and type identifier in the subtree, values included, since a component or function is used
-         * as a value ({@code <Button/>}, {@code render()}). Property names ({@code a.b}'s {@code b}) are
-         * {@code property_identifier} nodes and are not collected. Most names will not resolve; the linker drops them.
+         * Every identifier the parser flagged as a possible reference ({@link TypeScriptParse#REF}) under {@code node},
+         * values included, since a component or function is used as a value ({@code <Button/>}, {@code render()}).
+         * Property names ({@code a.b}'s {@code b}) are not flagged. Most names will not resolve; the linker drops them.
          */
-        void collectRefs(TSNode node, Set<String> refs) {
-            Syntax.walk(node, n -> {
-                String type = n.getType();
-                if (type.equals("type_identifier") || type.equals("identifier")) {
-                    refs.add(syntax.text(n));
+        void collectRefs(int node, Set<String> refs) {
+            for (int t = tree.tokenFirst(node), e = tree.tokenEnd(node); t < e; t++) {
+                if ((tree.flags(t) & TypeScriptParse.REF) != 0) {
+                    refs.add(tree.tokenText(t));
                 }
-            });
+            }
         }
     }
 
-    /** Named children except comments, which tree-sitter allows between the members of a list. */
-    static int countNamed(TSNode node) {
-        return (int) Syntax.namedChildren(node).stream().filter(c -> !c.getType().equals("comment")).count();
+    /**
+     * Strips quotes and backticks from both ends of a module specifier (all of them, like Rust's {@code trim_matches}).
+     */
+    private static String trimQuotes(String s) {
+        int a = 0;
+        int b = s.length();
+        while (a < b && isQuote(s.charAt(a))) {
+            a++;
+        }
+        while (b > a && isQuote(s.charAt(b - 1))) {
+            b--;
+        }
+        return s.substring(a, b);
+    }
+
+    private static boolean isQuote(char c) {
+        return c == '\'' || c == '"' || c == '`';
     }
 
     /**
-     * Cyclomatic complexity: 1 + {@link #DECISIONS} + short-circuit operators ({@code &&}, {@code ||}, {@code ??}).
-     * Nested functions inside {@code body} add to it, as in the Java analyser.
+     * McCabe cyclomatic complexity: 1 + decision points ({@code if}, loops, {@code case}, {@code catch}, {@code ?:},
+     * {@code &&}, {@code ||}, {@code ??}, as flagged {@link TypeScriptParse#DECISION} by the parser). Nested functions
+     * inside {@code node} count towards it, as in the Java analyser.
      */
-    static int complexity(TSNode body) {
-        int[] cx = {1};
-        Syntax.walk(body, n -> {
-            String type = n.getType();
-            if (DECISIONS.contains(type)) {
-                cx[0]++;
-            } else if (type.equals("binary_expression")) {
-                String op = Syntax.operator(n);
-                if (op.equals("&&") || op.equals("||") || op.equals("??")) {
-                    cx[0]++;
-                }
+    static int complexity(Tree tree, int node) {
+        int cx = 1;
+        for (int t = tree.tokenFirst(node), e = tree.tokenEnd(node); t < e; t++) {
+            if ((tree.flags(t) & TypeScriptParse.DECISION) != 0) {
+                cx++;
             }
-        });
-        return cx[0];
+        }
+        return cx;
     }
 
     /**

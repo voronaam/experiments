@@ -1,8 +1,9 @@
 package dev.codecity.analysis;
 
-import org.treesitter.TSNode;
-import org.treesitter.TSParser;
-import org.treesitter.TreeSitterRust;
+import dev.codecity.analysis.RustParse.Node;
+import dev.codecity.analysis.RustParse.NodeKind;
+import dev.codecity.analysis.RustParse.TokKind;
+import dev.codecity.analysis.RustParse.Tree;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -20,7 +21,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Rust support (tree-sitter). Crates and modules are districts; structs, enums, unions and traits are buildings whose
+ * Rust support, on the in-house parser {@link RustParse}. Crates and modules are districts; structs, enums, unions and traits are buildings whose
  * methods are collected from every {@code impl} block in the crate; each module's free functions and constants form a
  * "module" building. {@code use} paths ({@code crate::}, {@code super::}, {@code self::}, groups, globs, aliases) are
  * resolved so dependencies connect across files.
@@ -50,19 +51,11 @@ public final class RustAnalyzer implements LanguageSupport {
     private static final Pattern PACKAGE_NAME = Pattern.compile(
             "(?m)^\\[package\\][^\\n]*\\n(?:[ \\t\\r]*(?:[^\\[\\s][^\\n]*)?\\n)*?[ \\t]*name\\s*=\\s*\"([^\"]+)\"");
     /**
-     * Decision points for {@link #complexity}. {@code else if} is a nested {@code if_expression} and counts as well;
-     * {@code loop} counts although it has no condition (its exits are {@code break}s). {@code match} is handled per
-     * arm, see {@link #complexity}. The {@code ?} operator is not counted.
-     */
-    private static final Set<String> DECISIONS = Set.of(
-            "if_expression", "while_expression", "loop_expression", "for_expression", "match_arm");
-    /**
      * Last segment of a module building's fqn ({@code shop::cart::{fn}}). Braces cannot occur in a Rust identifier, so
      * the id never collides with a real item.
      */
     static final String FUNCTIONS = "{fn}";
 
-    private final ThreadLocal<TSParser> parser = ThreadLocal.withInitial(() -> Syntax.parser(TreeSitterRust::new));
     /**
      * Directory → the crate whose {@code Cargo.toml} sits in it, or empty if none does. Shared by the parsing threads
      * and cleared by {@link #link}, so each analysis reads the manifests afresh and a {@code Cargo.toml} added,
@@ -130,7 +123,7 @@ public final class RustAnalyzer implements LanguageSupport {
      */
     @Override
     public ParsedFile parse(Path root, Path file, String code) {
-        Syntax syntax = Syntax.parse(parser.get(), code);
+        Tree tree = RustParse.parse(code);
         Crate crate = crateOf(root, file.getParent());
         Path inCrate = crate.dir().relativize(file);
         List<String> modulePath = modulePath(sourceRoot(crate.dir(), file.getParent()).relativize(file));
@@ -139,10 +132,10 @@ public final class RustAnalyzer implements LanguageSupport {
         absolute.addAll(modulePath);
         String module = crate.name(); // the layout only shows module districts when there are several
 
-        FileState st = new FileState(syntax, SourceText.lines(code), file, module);
+        FileState st = new FileState(tree, SourceText.lines(code), file, module);
         Scope scope = newScope(absolute);
-        st.visitItems(syntax.root, scope, scope, file.getFileName().toString(), test);
-        return new ParsedFile(file, st.types, new Context(st.scopes, st.impls), syntax.root.hasError());
+        st.visitItems(0, scope, scope, file.getFileName().toString(), test);
+        return new ParsedFile(file, st.types, new Context(st.scopes, st.impls), tree.errors);
     }
 
     private static Scope newScope(List<String> path) {
@@ -197,7 +190,7 @@ public final class RustAnalyzer implements LanguageSupport {
 
     /** Per-file extraction state. Created for one {@link #parse} call and used by one thread only. */
     private final class FileState {
-        final Syntax syntax;
+        final Tree tree;
         final String[] lines;
         final Path file;
         final String module;
@@ -206,8 +199,8 @@ public final class RustAnalyzer implements LanguageSupport {
         /** See {@link Context#scopes}. */
         final Map<String, Scope> scopes = new HashMap<>();
 
-        FileState(Syntax syntax, String[] lines, Path file, String module) {
-            this.syntax = syntax;
+        FileState(Tree tree, String[] lines, Path file, String module) {
+            this.tree = tree;
             this.lines = lines;
             this.file = file;
             this.module = module;
@@ -222,26 +215,40 @@ public final class RustAnalyzer implements LanguageSupport {
             return String.join("::", scope.path()) + "::" + name;
         }
 
+        /** Lines of code of node {@code n}. */
+        int loc(int n) {
+            return SourceText.countLoc(lines, tree.firstLine(n), tree.lastLine(n));
+        }
+
+        /** The item's name (its {@code name} token), "" if it has none. */
+        String name(int n) {
+            return tree.tokText(tree.node(n).name);
+        }
+
         /**
-         * Visits the items of a file or an inline {@code mod} body, adding buildings, impls and {@code use} entries,
-         * and finally the module building if the module has free functions, constants or statics.
+         * Visits the items of a file or an inline {@code mod} body (the children of a {@code FILE} or
+         * {@code DECL_BODY} node), adding buildings, impls and {@code use} entries, and finally the module building if
+         * the module has free functions, constants or statics.
          *
          * <p>Attributes are separate sibling nodes that precede their item. {@code cfgTest} remembers whether one of
          * them is {@code #[cfg(test)]} and applies to the next item only. Only that exact form is recognised (with
          * any spacing), not e.g. {@code #[cfg(all(test, …))]}; inner attributes ({@code #![cfg(test)]}) are not
-         * looked at.
+         * looked at. Any other node in between, including a comment (the parser records one as a
+         * {@code COMMENT} node), ends the attribute's effect.
          *
          * <p>{@code mod name;} (without a body) declares a module in another file, which is parsed on its own;
          * {@code mod name { … }} is visited recursively with a child scope. Macros, type aliases, {@code extern}
-         * blocks and the like are ignored.
+         * blocks and the like are ignored, and so is a function without a body (a signature, which valid code only
+         * has in traits and {@code extern} blocks).
          *
-         * @param scope    module whose names are in scope, which also decides the fqns
-         * @param district scope whose module path decides the district; differs from {@code scope} inside
-         *                 {@code #[cfg(test)]} modules, which stay in their parent's district instead of adding one
-         * @param label    name of the module building: the file name, or {@code mod name} for an inline module
-         * @param test     everything in here is test code
+         * @param container the {@code FILE} or {@code DECL_BODY} node
+         * @param scope     module whose names are in scope, which also decides the fqns
+         * @param district  scope whose module path decides the district; differs from {@code scope} inside
+         *                  {@code #[cfg(test)]} modules, which stay in their parent's district instead of adding one
+         * @param label     name of the module building: the file name, or {@code mod name} for an inline module
+         * @param test      everything in here is test code
          */
-        void visitItems(TSNode container, Scope scope, Scope district, String label, boolean test) {
+        void visitItems(int container, Scope scope, Scope district, String label, boolean test) {
             List<MethodInfo> functions = new ArrayList<>();
             Set<String> functionRefs = new HashSet<>();
             int constants = 0;
@@ -250,59 +257,56 @@ public final class RustAnalyzer implements LanguageSupport {
             int first = Integer.MAX_VALUE;
             int last = 0;
             boolean cfgTest = false;
-            for (TSNode item : Syntax.namedChildren(container)) {
-                String type = item.getType();
-                if (type.equals("attribute_item")) {
+            for (int item : tree.children(container)) {
+                NodeKind kind = tree.node(item).kind;
+                if (kind == NodeKind.ATTR) {
                     // Spaces removed so that "#[cfg( test )]" matches too.
-                    String attr = syntax.text(item).replace(" ", "");
+                    String attr = tree.nodeText(item).replace(" ", "");
                     cfgTest |= attr.contains("cfg(test)");
                     continue;
                 }
-                switch (type) {
-                    case "use_declaration" -> expandUse(Syntax.field(item, "argument"), List.of(), scope);
-                    case "struct_item", "union_item" -> addType(item, scope, district,
-                            type.equals("union_item") ? "union" : "struct",
-                            fieldCount(Syntax.field(item, "body")), List.of(), test || cfgTest);
-                    case "enum_item" -> {
-                        TSNode body = Syntax.field(item, "body");
-                        int variants = 0;
-                        if (body != null) {
-                            for (TSNode v : Syntax.namedChildren(body)) {
-                                variants += v.getType().equals("enum_variant") ? 1 : 0;
-                            }
+                boolean isTest = test || cfgTest;
+                switch (kind) {
+                    case USE -> {
+                        List<Integer> children = tree.children(item);
+                        if (!children.isEmpty()) {
+                            expandUse(children.getLast(), List.of(), scope);
                         }
-                        addType(item, scope, district, "enum", variants, List.of(), test || cfgTest);
                     }
-                    case "trait_item" -> addType(item, scope, district, "trait", 0,
-                            functionsIn(Syntax.field(item, "body")), test || cfgTest);
-                    case "impl_item" -> addImpl(item, scope, district, label, test || cfgTest);
-                    case "function_item" -> {
-                        functions.add(function(item));
+                    case STRUCT, UNION -> addType(item, scope, district, kind == NodeKind.UNION ? "union" : "struct",
+                            tree.node(item).value, List.of(), isTest);
+                    case ENUM -> addType(item, scope, district, "enum", tree.node(item).value, List.of(), isTest);
+                    case TRAIT -> addType(item, scope, district, "trait", 0,
+                            functionsIn(tree.child(item, NodeKind.DECL_BODY)), isTest);
+                    case IMPL -> addImpl(item, scope, district, label, isTest);
+                    case FN, CONST, STATIC -> {
+                        if (kind == NodeKind.FN) {
+                            if (tree.child(item, NodeKind.BODY) < 0) {
+                                break; // a signature: valid code has none at module level
+                            }
+                            functions.add(function(item));
+                        } else {
+                            constants++;
+                        }
                         collectRefs(item, functionRefs);
-                        moduleLoc += SourceText.countLoc(lines, Syntax.firstLine(item), Syntax.lastLine(item));
-                        first = Math.min(first, Syntax.firstLine(item));
-                        last = Math.max(last, Syntax.lastLine(item));
+                        moduleLoc += loc(item);
+                        first = Math.min(first, tree.firstLine(item));
+                        last = Math.max(last, tree.lastLine(item));
                     }
-                    case "const_item", "static_item" -> {
-                        constants++;
-                        collectRefs(item, functionRefs);
-                        moduleLoc += SourceText.countLoc(lines, Syntax.firstLine(item), Syntax.lastLine(item));
-                        first = Math.min(first, Syntax.firstLine(item));
-                        last = Math.max(last, Syntax.lastLine(item));
-                    }
-                    case "mod_item" -> {
-                        TSNode body = Syntax.field(item, "body");
-                        if (body != null) {
+                    case MOD -> {
+                        int body = tree.child(item, NodeKind.DECL_BODY);
+                        if (body >= 0) {
                             List<String> child = new ArrayList<>(scope.path());
-                            child.add(syntax.text(Syntax.field(item, "name")));
+                            child.add(name(item));
                             Scope childScope = newScope(child);
                             visitItems(body, childScope, cfgTest ? district : childScope, "mod " + child.getLast(),
-                                    test || cfgTest);
+                                    isTest);
                         }
                     }
                     default -> {
                     }
                 }
+                // The attribute applied to this item only.
                 cfgTest = false;
             }
             // Registered by module path too, so a module building created later for impls (see link) finds its scope.
@@ -318,80 +322,55 @@ public final class RustAnalyzer implements LanguageSupport {
 
         /**
          * Adds a struct, union, enum or trait building. Its own methods are a trait's declared and default methods;
-         * methods from {@code impl} blocks are merged in by {@link #link}.
+         * methods from {@code impl} blocks are merged in by {@link #link}. {@code noa} is the field or variant count
+         * the parser stored on the item.
          */
-        void addType(TSNode item, Scope scope, Scope district, String kind, int noa, List<MethodInfo> methods,
+        void addType(int item, Scope scope, Scope district, String kind, int noa, List<MethodInfo> methods,
                      boolean test) {
-            String name = syntax.text(Syntax.field(item, "name"));
+            String name = name(item);
             Set<String> refs = new HashSet<>();
             collectRefs(item, refs);
-            int begin = Syntax.firstLine(item);
-            int end = Syntax.lastLine(item);
             String id = fqn(scope, name);
             scopes.put(id, scope);
-            types.add(new TypeInfo(Language.RUST, id, name, packageOf(district), module, kind, file, begin, end,
-                    SourceText.countLoc(lines, begin, end), noa, test, List.copyOf(methods), Set.copyOf(refs),
-                    List.of(), List.of()));
+            types.add(new TypeInfo(Language.RUST, id, name, packageOf(district), module, kind, file,
+                    tree.firstLine(item), tree.lastLine(item), loc(item), noa, test, List.copyOf(methods),
+                    Set.copyOf(refs), List.of(), List.of()));
         }
 
         /**
          * Records an impl block for the linker. References come from the body only: the implemented type is the
          * target, not a dependency, and the trait is resolved separately in {@link #link}.
          */
-        void addImpl(TSNode item, Scope scope, Scope district, String label, boolean test) {
-            TSNode typeNode = Syntax.field(item, "type");
-            TSNode traitNode = Syntax.field(item, "trait");
+        void addImpl(int item, Scope scope, Scope district, String label, boolean test) {
+            int body = tree.child(item, NodeKind.DECL_BODY);
+            int trait = tree.child(item, NodeKind.IMPL_TRAIT);
             Set<String> refs = new HashSet<>();
-            collectRefs(Syntax.field(item, "body") == null ? item : Syntax.field(item, "body"), refs);
-            int begin = Syntax.firstLine(item);
-            int end = Syntax.lastLine(item);
-            impls.add(new Impl(scope, district, label, typeName(typeNode), traitNode == null ? null : typeName(traitNode),
-                    functionsIn(Syntax.field(item, "body")), refs, SourceText.countLoc(lines, begin, end), file, begin, test));
+            collectRefs(body < 0 ? item : body, refs);
+            impls.add(new Impl(scope, district, label, typeName(tree.child(item, NodeKind.IMPL_TYPE)),
+                    trait < 0 ? null : typeName(trait), functionsIn(body), refs, loc(item), file,
+                    tree.firstLine(item), test));
         }
 
         /**
-         * {@code S<T>} → {@code S}; {@code crate::m::Other} stays a path; references are unwrapped
-         * ({@code &S}, {@code *const S} → {@code S}). Other type forms ({@code dyn Trait}, tuples, …) are returned as
-         * their source text, which then resolves to nothing.
+         * {@code S<T>} → {@code S}; {@code crate::m::Other} stays a path; references and pointers are unwrapped
+         * ({@code &S}, {@code *const S} → {@code S}). The parser has already found this "core" of the
+         * {@code IMPL_TYPE}/{@code IMPL_TRAIT} node's type (its {@code name} to {@code value} tokens). Other type
+         * forms ({@code dyn Trait}, tuples, …) are their source text, which then resolves to nothing.
          */
-        String typeName(TSNode n) {
-            if (n == null) {
+        String typeName(int n) {
+            if (n < 0) {
                 return "";
             }
-            return switch (n.getType()) {
-                case "generic_type" -> typeName(Syntax.field(n, "type"));
-                case "reference_type", "pointer_type" -> typeName(Syntax.field(n, "type"));
-                default -> syntax.text(n);
-            };
+            Node node = tree.node(n);
+            return tree.rangeText(node.name, node.value);
         }
 
-        /** Fields of a struct or union: named fields, or the positions of a tuple struct; 0 for a unit struct. */
-        int fieldCount(TSNode body) {
-            if (body == null) {
-                return 0;
-            }
-            if (body.getType().equals("field_declaration_list")) {
-                int n = 0;
-                for (TSNode f : Syntax.namedChildren(body)) {
-                    n += f.getType().equals("field_declaration") ? 1 : 0;
-                }
-                return n;
-            }
-            // Tuple struct (ordered_field_declaration_list): count the children in the "type" field. The list also
-            // holds punctuation and visibility modifiers, so counting all children would be wrong.
-            int n = 0;
-            for (int i = 0; i < body.getChildCount(); i++) {
-                n += "type".equals(body.getFieldNameForChild(i)) ? 1 : 0;
-            }
-            return n;
-        }
-
-        /** Functions in an impl or trait body; {@code function_signature_item} is a trait method without a default. */
-        List<MethodInfo> functionsIn(TSNode body) {
+        /** Functions in an impl or trait body, with or without a body (a trait method without a default). */
+        List<MethodInfo> functionsIn(int body) {
             List<MethodInfo> list = new ArrayList<>();
-            if (body != null) {
-                for (TSNode m : Syntax.namedChildren(body)) {
-                    if (m.getType().equals("function_item") || m.getType().equals("function_signature_item")) {
+            if (body >= 0) {
+                for (int m : tree.children(body)) {
+                    if (tree.node(m).kind == NodeKind.FN) {
                         list.add(function(m));
                     }
                 }
@@ -399,57 +378,56 @@ public final class RustAnalyzer implements LanguageSupport {
             return list;
         }
 
-        MethodInfo function(TSNode fn) {
-            TSNode params = Syntax.field(fn, "parameters");
-            int count = 0;
-            if (params != null) {
-                for (TSNode p : Syntax.namedChildren(params)) {
-                    // Only "parameter" nodes: the self receiver is a self_parameter and does not count.
-                    count += p.getType().equals("parameter") ? 1 : 0;
-                }
-            }
-            TSNode body = Syntax.field(fn, "body");
-            int begin = Syntax.firstLine(fn);
-            int end = Syntax.lastLine(fn);
-            return new MethodInfo(syntax.text(Syntax.field(fn, "name")), begin, SourceText.countLoc(lines, begin, end),
-                    body == null ? 1 : complexity(body), count);
+        /** Metrics of one function. The parser counted its parameters ({@code self} is not counted). */
+        MethodInfo function(int fn) {
+            int body = tree.child(fn, NodeKind.BODY);
+            return new MethodInfo(name(fn), tree.firstLine(fn), loc(fn), body < 0 ? 1 : complexity(tree, body),
+                    tree.node(fn).value);
         }
 
         /**
-         * Collects names that may refer to project items: type names, whole paths ({@code net::http::get},
-         * {@code Shape::Circle}, without whitespace) and capitalised plain identifiers (unit structs, tuple-struct
-         * constructors and enum variants used as values). The walk does not descend into a path, so its segments are
-         * not collected again individually. A qualified path ({@code <T as Trait>::Item}) is the exception: its text
-         * names nothing resolvable, so the types inside the brackets are collected instead. Lower-case plain identifiers (variables, local function calls) are left
-         * out: only a path can lead to another module's function building.
+         * Collects names under {@code node} that may refer to project items: type names, whole paths
+         * ({@code net::http::get}, {@code Shape::Circle}, without whitespace) and capitalised plain identifiers (unit
+         * structs, tuple-struct constructors and enum variants used as values). The walk does not descend into a
+         * path, so its segments are not collected again individually. For a qualified path
+         * ({@code <T as Trait>::Item}) the text names nothing resolvable, so the parser emitted the types inside the
+         * brackets instead (see {@link RustParse}, "Reference leaves"). Lower-case plain identifiers (variables,
+         * local function calls) are left out: only a path can lead to another module's function building. Paths of
+         * {@code use} declarations inside items count like paths, a single name or an {@code as} alias like an
+         * identifier.
          */
-        void collectRefs(TSNode node, Set<String> refs) {
-            Syntax.walk(node, n -> {
-                switch (n.getType()) {
-                    case "type_identifier" -> refs.add(syntax.text(n));
-                    case "scoped_type_identifier", "scoped_identifier" -> {
-                        TSNode path = Syntax.field(n, "path");
-                        if (path != null && path.getType().equals("bracketed_type")) {
-                            collectRefs(path, refs);
-                        } else {
-                            refs.add(syntax.text(n).replaceAll("\\s+", ""));
+        void collectRefs(int node, Set<String> refs) {
+            int end = tree.node(node).end;
+            int i = node + 1;
+            while (i < end) {
+                Node n = tree.node(i);
+                switch (n.kind) {
+                    case TYPE_IDENT -> refs.add(tree.tokText(n.first));
+                    case IDENT -> addIdentifier(tree.tokText(n.first), refs);
+                    case USE_AS -> {
+                        if (n.name != RustParse.NONE) {
+                            addIdentifier(tree.tokText(n.name), refs);
                         }
                     }
-                    case "identifier" -> {
-                        String s = syntax.text(n);
-                        if (!s.isEmpty() && Character.isUpperCase(s.charAt(0))) {
-                            refs.add(s);
+                    case PATH, USE_PATH, USE_PREFIX -> {
+                        if (n.kind != NodeKind.PATH && n.first == n.last) {
+                            addIdentifier(tree.tokText(n.first), refs);
+                        } else {
+                            refs.add(withoutWhitespace(tree.rangeText(n.first, n.last)));
+                            i = n.end; // nothing inside a path is a separate reference
+                            continue;
                         }
                     }
                     default -> {
                     }
                 }
-            }, n -> !n.getType().equals("scoped_type_identifier") && !n.getType().equals("scoped_identifier"));
+                i++;
+            }
         }
 
         /**
          * Flattens a use tree into alias → path entries and glob imports. Recursive over the tree; {@code prefix} is
-         * the path of the enclosing group:
+         * the path accumulated from enclosing {@code a::b::{…}} groups:
          * <pre>
          *   use a::b::C;                → C ↦ [a, b, C]
          *   use a::{b::C, D as E, self}; → C ↦ [a, b, C], E ↦ [a, D], a ↦ [a]
@@ -457,61 +435,84 @@ public final class RustAnalyzer implements LanguageSupport {
          *   use x as _;                 → nothing (only brings trait methods into scope)
          * </pre>
          * Paths are stored as written; {@link Resolver#absolute} makes them absolute when they are used.
-         * {@code metavariable} appears for {@code use $crate::…} inside macros.
          */
-        void expandUse(TSNode n, List<String> prefix, Scope scope) {
-            if (n == null) {
-                return;
-            }
-            switch (n.getType()) {
-                case "identifier", "crate", "self", "super", "metavariable" -> {
-                    String name = syntax.text(n);
-                    List<String> path = concat(prefix, List.of(name));
-                    if (name.equals("self") && !prefix.isEmpty()) {
-                        scope.uses().put(prefix.getLast(), prefix); // use a::b::{self}
+        void expandUse(int n, List<String> prefix, Scope scope) {
+            Node node = tree.node(n);
+            switch (node.kind) {
+                case USE_PATH -> {
+                    if (node.first == node.last) {
+                        // A single name, at the top level or inside a `{…}` list.
+                        String name = tree.tokText(node.first);
+                        if (name.equals("self") && !prefix.isEmpty()) {
+                            scope.uses().put(prefix.getLast(), prefix); // use a::b::{self}
+                        } else {
+                            scope.uses().put(name, concat(prefix, List.of(name)));
+                        }
                     } else {
-                        scope.uses().put(name, path);
+                        List<String> path = concat(prefix, segments(n));
+                        String alias = path.isEmpty() ? "" : path.getLast();
+                        if (alias.equals("self")) {
+                            path = path.subList(0, path.size() - 1);
+                            alias = path.isEmpty() ? "self" : path.getLast();
+                        }
+                        scope.uses().put(alias, path);
                     }
                 }
-                case "scoped_identifier" -> {
-                    List<String> path = concat(prefix, segments(n));
-                    String alias = path.getLast();
-                    if (alias.equals("self")) {
-                        path = path.subList(0, path.size() - 1);
-                        alias = path.isEmpty() ? "self" : path.getLast();
-                    }
-                    scope.uses().put(alias, path);
-                }
-                case "use_as_clause" -> {
-                    String alias = syntax.text(Syntax.field(n, "alias"));
+                case USE_AS -> {
+                    String alias = tree.tokText(node.name);
                     if (!alias.equals("_")) {
-                        scope.uses().put(alias, concat(prefix, segments(Syntax.field(n, "path"))));
+                        scope.uses().put(alias, concat(prefix, segments(tree.child(n, NodeKind.USE_PATH))));
                     }
                 }
-                case "scoped_use_list" -> {
-                    TSNode path = Syntax.field(n, "path");
-                    expandUse(Syntax.field(n, "list"), path == null ? prefix : concat(prefix, segments(path)), scope);
+                case USE_GROUP -> {
+                    List<String> p = concat(prefix, segments(tree.child(n, NodeKind.USE_PREFIX)));
+                    for (int c : tree.children(n)) {
+                        if (tree.node(c).kind != NodeKind.USE_PREFIX) {
+                            expandUse(c, p, scope);
+                        }
+                    }
                 }
-                case "use_list" -> Syntax.namedChildren(n).forEach(c -> expandUse(c, prefix, scope));
-                case "use_wildcard" -> {
-                    List<String> path = n.getNamedChildCount() == 0 ? prefix : concat(prefix, segments(n.getNamedChild(0)));
-                    scope.globs().add(path);
-                }
+                case USE_GLOB -> scope.globs().add(concat(prefix, segments(tree.child(n, NodeKind.USE_PREFIX))));
                 default -> {
                 }
             }
         }
 
-        /** A path node as a list of segments: {@code a::b::C} → [a, b, C]. */
-        List<String> segments(TSNode n) {
-            if (n == null) {
-                return List.of();
+        /** The segments of a use path node: {@code a::b::c} → [a, b, c] (a leading {@code ::} adds none). */
+        List<String> segments(int n) {
+            List<String> out = new ArrayList<>();
+            if (n >= 0) {
+                Node node = tree.node(n);
+                for (int t = node.first; t <= node.last; t++) {
+                    if (tree.tokens[t].kind == TokKind.IDENT) {
+                        out.add(tree.tokText(t));
+                    }
+                }
             }
-            if (n.getType().equals("scoped_identifier") || n.getType().equals("scoped_type_identifier")) {
-                return concat(segments(Syntax.field(n, "path")), List.of(syntax.text(Syntax.field(n, "name"))));
-            }
-            return List.of(syntax.text(n));
+            return out;
         }
+    }
+
+    /** An identifier is a reference if capitalised. Lifetimes and labels ({@code 'a}) count without their quote. */
+    private static void addIdentifier(String s, Set<String> refs) {
+        String name = s.startsWith("'") ? s.substring(1) : s;
+        if (!name.isEmpty() && Character.isUpperCase(name.codePointAt(0))) {
+            refs.add(name);
+        }
+    }
+
+    /** The text without whitespace (Unicode White_Space, as Rust's {@code char::is_whitespace}). */
+    private static String withoutWhitespace(String s) {
+        StringBuilder b = new StringBuilder(s.length());
+        s.codePoints().filter(c -> !isRustWhitespace(c)).forEach(b::appendCodePoint);
+        return b.toString();
+    }
+
+    /** The Unicode White_Space property, which Rust's {@code char::is_whitespace} implements. */
+    private static boolean isRustWhitespace(int c) {
+        return (c >= 0x09 && c <= 0x0D) || c == 0x20 || c == 0x85 || c == 0xA0 || c == 0x1680
+                || (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F
+                || c == 0x3000;
     }
 
     private static List<String> concat(List<String> a, List<String> b) {
@@ -521,26 +522,23 @@ public final class RustAnalyzer implements LanguageSupport {
     }
 
     /**
-     * Cyclomatic complexity: 1 + {@link #DECISIONS} + {@code &&}/{@code ||}, with a {@code match} of k arms adding
-     * k - 1 (each arm adds one, the match itself takes one off). The result is at least 1, e.g. for a match without
-     * arms. Closures inside {@code body} add to it.
+     * McCabe cyclomatic complexity of a function body: 1 + {@code if}, {@code while}, {@code loop}, {@code for}, each
+     * {@code &&}/{@code ||}, and k - 1 per {@code match} with k arms (each arm adds one, the match itself takes one
+     * off). {@code else if} counts as another {@code if}; {@code ?} does not. Closures and nested functions count
+     * towards the enclosing function. Clamped to at least 1 because an empty {@code match} would make the sum go down.
      */
-    static int complexity(TSNode body) {
-        int[] cx = {1};
-        Syntax.walk(body, n -> {
-            String type = n.getType();
-            if (DECISIONS.contains(type)) {
-                cx[0]++;
-            } else if (type.equals("match_expression")) {
-                cx[0]--; // a match with k arms adds k - 1 paths
-            } else if (type.equals("binary_expression")) {
-                String op = Syntax.operator(n);
-                if (op.equals("&&") || op.equals("||")) {
-                    cx[0]++;
+    static int complexity(Tree tree, int body) {
+        int cx = 1;
+        int end = tree.node(body).end;
+        for (int i = body + 1; i < end; i++) {
+            switch (tree.node(i).kind) {
+                case IF, WHILE, LOOP, FOR, ARM, AND_OR -> cx++;
+                case MATCH -> cx--; // a match with k arms adds k - 1 paths
+                default -> {
                 }
             }
-        });
-        return Math.max(1, cx[0]);
+        }
+        return Math.max(1, cx);
     }
 
     // ------------------------------------------------------------------ crates

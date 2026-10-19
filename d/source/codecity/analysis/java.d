@@ -1,9 +1,10 @@
-/// Java support (tree-sitter-java), mirroring the metrics the JavaParser-based Java edition computes.
+/// Java support. The source is parsed by the in-house parser in `codecity.analysis.java_parse`.
 ///
 /// `parse` turns one `.java` file into a `TypeDecl` per class, interface, enum, record and annotation type, including
 /// member types (`Outer.Inner`), with these metrics: lines of code, number of attributes (fields, record components,
 /// enum constants), methods (and constructors) with their LOC, cyclomatic complexity and parameter count. It also
-/// records the raw type names each type mentions and the file's imports.
+/// records the raw type names each type mentions (`List`, `Map.Entry`, `Util` from `Util.run()`) and the file's
+/// imports.
 ///
 /// `link` then resolves those names with (a simplified form of) Java's own scoping rules to the fqns of project
 /// types, which gives the dependency edges. Names that resolve to nothing in the project (JDK, libraries) are
@@ -11,78 +12,54 @@
 module codecity.analysis.java;
 
 import codecity.analysis : Linked, ParsedFile;
-import codecity.analysis.syntax;
+import codecity.analysis.java_parse : NodeKind, Tree;
+import jp = codecity.analysis.java_parse;
 import codecity.analysis.text;
-import codecity.c.treesitter;
 import codecity.model;
-import std.algorithm : canFind, endsWith, filter, sort;
-import std.array : array, join;
-import std.ascii : isUpper;
+import std.algorithm : endsWith;
+import std.array : join;
 import std.path : baseName;
 import std.string : indexOf, lastIndexOf;
 import std.uni : isWhite;
 
-/// tree-sitter-java node kinds that declare a type (a building).
-private immutable string[] typeDeclarations = [
-    "class_declaration", "interface_declaration", "enum_declaration", "record_declaration",
-    "annotation_type_declaration",
-];
-
 /// Analyses one Java file. `root` is the analysed directory, used for the build module (`moduleOf`) and the
-/// test-directory check. The file counts as failed when the tree contains syntax errors; whatever was recognised is
-/// still returned.
+/// test-directory check. The file counts as failed when it has syntax errors; whatever was recognised is still
+/// returned.
 ParsedFile parse(string root, string file, string code)
 {
-    auto tree = codecity.analysis.syntax.parse("java", &tree_sitter_java, code);
-    if (tree is null) return ParsedFile(null, null, true);
-    scope (exit) ts_tree_delete(tree);
-    auto src = Src(code);
-    auto program = ts_tree_root_node(tree);
+    auto tree = jp.parse(code);
     auto lines = lines(code);
     const relative = relativeTo(file, root);
     const module_ = moduleOf(relative);
     const test = isTest(relative);
 
     // First pass over the top level: the package and the imports, which apply to every type in the file.
+    // `explicit`: single-type imports, resolved first. `wildcard`: packages (or types) imported with `.*`.
     string pkg;
     string[] explicit, wildcard;
-    foreach (n; namedChildren(program))
+    const top = tree.children(0);
+    foreach (n; top)
     {
-        switch (kind(n))
+        const node = tree.nodes[n];
+        if (node.kind == NodeKind.package_)
         {
-        case "package_declaration":
-            // `@Deprecated package a.b;` (package-info.java): skip annotations, the name is the first other child.
-            // Whitespace is removed because the grammar allows it between the dots.
-            foreach (c; namedChildren(n))
-                if (kind(c) != "annotation" && kind(c) != "marker_annotation")
-                {
-                    pkg = stripWs(src.text(c));
-                    break;
-                }
-            break;
-        case "import_declaration":
-            // `static` is an anonymous token, `*` a named `asterisk` node; the name is a scoped_identifier
-            // (`a.b.C`) or, for a class in the default package, a plain identifier.
+            // Package annotations (allowed in package-info.java) are separate nodes; the name child is the name.
+            const name = nameChild(tree, n);
+            if (name != jp.NONE) pkg = stripWs(nodeText(tree, code, name));
+        }
+        else if (node.kind == NodeKind.import_)
+        {
+            const name = nameChild(tree, n);
+            if (name == jp.NONE) continue;
+            const isStatic = (node.flags & jp.importStatic) != 0;
+            const asterisk = (node.flags & jp.importAsterisk) != 0;
+            // Names may be written with whitespace or line breaks around the dots; normalise to `a.b.C`.
             //   import a.B;              → explicit "a.B"
             //   import a.*;              → wildcard "a"
             //   import static a.B.c;     → explicit "a.B" (the member's type)
             //   import static a.B.*;     → explicit "a.B" (all members of that type)
             // Static imports thus make the type they import from a dependency.
-            bool isStatic, asterisk;
-            foreach (c; children(n)) if (kind(c) == "static") isStatic = true;
-            TSNode name;
-            bool found;
-            foreach (c; namedChildren(n))
-            {
-                if (kind(c) == "asterisk") asterisk = true;
-                if (!found && (kind(c) == "scoped_identifier" || kind(c) == "identifier"))
-                {
-                    name = c;
-                    found = true;
-                }
-            }
-            if (!found) break;
-            auto text = stripWs(src.text(name));
+            auto text = stripWs(nodeText(tree, code, name));
             if (isStatic && !asterisk)
             {
                 const dot = text.lastIndexOf('.');
@@ -94,24 +71,42 @@ ParsedFile parse(string root, string file, string code)
                 else wildcard ~= text;
             }
             else explicit ~= text;
-            break;
-        default:
-            break;
         }
     }
 
     // Second pass: only top-level type declarations; collectType recurses into member types.
-    auto ctx = FileCtx(&src, lines, file, pkg, module_, test, explicit, wildcard);
+    auto ctx = FileCtx(&tree, code, lines, file, pkg, module_, test, explicit, wildcard);
     TypeDecl[] types;
-    foreach (n; namedChildren(program))
-        if (typeDeclarations.canFind(kind(n))) collectType(ctx, n, "", types);
-    return ParsedFile(types, null, ts_node_has_error(program));
+    foreach (n; top)
+        if (tree.nodes[n].kind == NodeKind.typeDecl) collectType(ctx, n, "", types);
+    return ParsedFile(types, null, tree.error);
+}
+
+/// The `NodeKind.name` child of a package or import node, or `jp.NONE`.
+private size_t nameChild(ref const Tree tree, size_t n)
+{
+    foreach (c; tree.children(n))
+        if (tree.nodes[c].kind == NodeKind.name) return c;
+    return jp.NONE;
+}
+
+/// Source text of a node's whole token span.
+private string nodeText(ref const Tree tree, string code, size_t n)
+{
+    return tree.text(code, tree.nodes[n].first, tree.nodes[n].last);
+}
+
+/// Source text of a single token, "" for `jp.NONE`, as a copy: names outlive the source text in the parse cache.
+private string tokenText(ref const Tree tree, string code, uint t)
+{
+    return t == jp.NONE ? "" : tree.text(code, t, t).idup;
 }
 
 /// Per-file facts shared by every type in the file.
 private struct FileCtx
 {
-    Src* src;
+    const(Tree)* tree;
+    string code;
     string[] lines;
     string file;
     string pkg;
@@ -124,59 +119,46 @@ private struct FileCtx
 /// Adds a type and, recursively, the member types declared in its body (local classes are not types).
 ///
 /// `outer` is the enclosing type's package-relative name ("" at top level), so a member type is named `Outer.Inner`
-/// and its fqn is `pkg.Outer.Inner`. Only direct members of the body are inspected for attributes, methods and
-/// member types; classes declared inside methods, initialisers or anonymous classes are part of the enclosing
-/// type. The outer type's LOC span and references cover its member types' text too, because both are computed over
-/// the whole declaration. The outer type is emitted before its member types.
-private void collectType(ref FileCtx ctx, TSNode decl, string outer, ref TypeDecl[] output)
+/// and its fqn is `pkg.Outer.Inner`. Metrics:
+/// - `noa` (attributes): one per declared variable in fields and interface constants (`int a, b;` is two), one per
+///   enum constant and one per record component (a varargs component `int... xs` is not counted);
+/// - methods: methods and constructors (initialiser blocks and compact record constructors are not counted);
+/// - `loc`: the whole declaration, including member types, so an outer type's LOC contains its inner types';
+/// - references: collected from the whole declaration, member types included.
+///
+/// The outer type is emitted before its member types, so `output` is in pre-order.
+private void collectType(ref FileCtx ctx, size_t decl, string outer, ref TypeDecl[] output)
 {
-    const simple = ctx.src.fieldText(decl, "name");
-    const name = outer.length ? outer ~ "." ~ simple : simple.idup;
+    const tree = ctx.tree;
+    const node = tree.nodes[decl];
+    const simple = tokenText(*tree, ctx.code, node.name);
+    const name = outer.length ? outer ~ "." ~ simple : simple;
     const fqn = ctx.pkg.length ? ctx.pkg ~ "." ~ name : name;
-    auto body_ = child(decl, "body");
 
     MethodInfo[] methods;
-    uint noa;
-    TSNode[] nested;
-    // Record components (`record P(int x, int y)`) are the record's fields; the grammar has them as the
-    // declaration's formal parameters.
-    if (kind(decl) == "record_declaration")
+    // Record components (`record P(int x, int y)`) are the record's fields; `count` is 0 for other kinds.
+    uint noa = node.count;
+    size_t[] nested;
+    foreach (m; tree.children(decl))
     {
-        auto params = child(decl, "parameters");
-        if (!isNull(params))
-            foreach (p; namedChildren(params)) if (kind(p) == "formal_parameter") noa++;
-    }
-    if (!isNull(body_))
-    {
-        TSNode[] members;
-        foreach (m; namedChildren(body_))
+        const member = tree.nodes[m];
+        switch (member.kind)
         {
-            // enum bodies keep their non-constant members in a nested enum_body_declarations node
-            if (kind(m) == "enum_body_declarations") members ~= namedChildren(m);
-            else members ~= m;
-        }
-        foreach (m; members)
-        {
-            const k = kind(m);
-            // `int a, b;` declares two attributes: count declarators, not declarations. constant_declaration is a
-            // field in an interface (or annotation type) body.
-            if (k == "field_declaration" || k == "constant_declaration")
-            {
-                foreach (d; namedChildren(m)) if (kind(d) == "variable_declarator") noa++;
-            }
-            else if (k == "enum_constant") noa++;
-            else if (k == "method_declaration" || k == "constructor_declaration") methods ~= method(ctx, m);
-            else if (typeDeclarations.canFind(k)) nested ~= m;
+        case NodeKind.field: noa += member.count; break;
+        case NodeKind.enumConstant: noa++; break;
+        case NodeKind.method: methods ~= method(ctx, m); break;
+        case NodeKind.typeDecl: nested ~= m; break;
+        default: break;
         }
     }
-    const begin = firstLine(decl), end = lastLine(decl);
+    const begin = tree.firstLine(decl), end = tree.lastLine(ctx.code, decl);
     TypeDecl t;
     t.language = Language.java;
     t.fqn = fqn;
     t.name = name;
     t.pkg = ctx.pkg;
     t.module_ = ctx.module_;
-    t.kind = kindOf(*ctx.src, decl);
+    t.kind = kindOf(node.sub, node.flags);
     t.file = ctx.file;
     t.line = begin;
     t.endLine = end;
@@ -184,95 +166,72 @@ private void collectType(ref FileCtx ctx, TSNode decl, string outer, ref TypeDec
     t.noa = noa;
     t.test = ctx.test;
     t.methods = methods;
-    t.references = references(*ctx.src, decl);
+    t.references = references(*tree, ctx.code, decl);
     t.explicitImports = ctx.explicit;
     t.wildcardImports = ctx.wildcard;
     output ~= t;
     foreach (n; nested) collectType(ctx, n, name, output);
 }
 
-/// The building kind shown in the viewer. Classes with an `abstract` modifier are reported as "abstract".
-private string kindOf(ref const Src src, TSNode decl)
+/// The building kind shown in the viewer. Classes are split into "abstract" and "class" by their `abstract`
+/// modifier.
+private string kindOf(ubyte sub, ubyte flags)
 {
-    switch (kind(decl))
+    switch (sub)
     {
-    case "interface_declaration": return "interface";
-    case "enum_declaration": return "enum";
-    case "record_declaration": return "record";
-    case "annotation_type_declaration": return "annotation";
-    default:
-        foreach (c; namedChildren(decl))
-            if (kind(c) == "modifiers")
-            {
-                foreach (m; children(c)) if (src.text(m) == "abstract") return "abstract";
-                break;
-            }
-        return "class";
+    case jp.typeInterface: return "interface";
+    case jp.typeEnum: return "enum";
+    case jp.typeRecord: return "record";
+    case jp.typeAnnotation: return "annotation";
+    default: return (flags & jp.typeAbstract) ? "abstract" : "class";
     }
 }
 
-/// Metrics of one method or constructor. Varargs (`String... args`) is a spread_parameter in the grammar and counts
-/// as one parameter; the receiver parameter (`Foo this`) is neither kind and does not count.
-private MethodInfo method(ref FileCtx ctx, TSNode m)
+/// Metrics of one method or constructor. Parameters include a trailing varargs parameter; the receiver parameter
+/// (`Foo this`) is not counted (the parser does both).
+private MethodInfo method(ref FileCtx ctx, size_t m)
 {
-    const begin = firstLine(m), end = lastLine(m);
-    uint parameters;
-    auto p = child(m, "parameters");
-    if (!isNull(p))
-        foreach (c; namedChildren(p))
-            if (kind(c) == "formal_parameter" || kind(c) == "spread_parameter") parameters++;
-    return MethodInfo(ctx.src.fieldText(m, "name").idup, begin, countLoc(ctx.lines, begin, end), complexity(m), parameters);
+    const tree = ctx.tree;
+    const begin = tree.firstLine(m), end = tree.lastLine(ctx.code, m);
+    return MethodInfo(tokenText(*tree, ctx.code, tree.nodes[m].name), begin, countLoc(ctx.lines, begin, end),
+        complexity(*tree, m), tree.nodes[m].count);
 }
 
 /// McCabe cyclomatic complexity: 1 + number of decision points.
 ///
-/// Decision points: `if`, the loops, `catch`, `?:`, every non-default `case` label (old `case X:` and arrow
-/// `case X ->` both parse as switch_label; `case A, B:` is one label and counts once) and every `&&`/`||`. `else`
-/// and `finally` do not branch and do not count. The walk covers the whole subtree, so lambdas and anonymous classes
-/// inside a method add to that method.
-uint complexity(TSNode node)
+/// Decision points are branches and loops, each `catch`, each `?:`, each non-default `case` label, and each `&&` /
+/// `||` (short-circuit operators add a path each); the parser marks them as `NodeKind.decision` nodes. `else` and
+/// `finally` do not branch and do not count. Everything inside the node counts, so lambdas and anonymous or local
+/// classes in a method add to that method's complexity.
+uint complexity(ref const Tree tree, size_t node)
 {
     uint cx = 1;
-    walk(node, (TSNode n) {
-        switch (kind(n))
-        {
-        case "if_statement", "for_statement", "enhanced_for_statement", "while_statement", "do_statement",
-                "catch_clause", "ternary_expression":
-            cx++;
-            break;
-        case "switch_label":
-            if (ts_node_named_child_count(n) > 0) cx++; // `default` labels have no expression
-            break;
-        case "binary_expression":
-            const op = operator(n);
-            if (op == "&&" || op == "||") cx++;
-            break;
-        default:
-            break;
-        }
-        return true;
-    });
+    foreach (ref n; tree.nodes[node + 1 .. tree.nodes[node].end])
+        if (n.kind == NodeKind.decision) cx++;
     return cx;
 }
 
 /// Type names used in a declaration: types, annotations, and upper-case call/field scopes (`Util.run()`).
 ///
 /// The names are raw source text (`List`, `Map.Entry`, `com.acme.Order`); `resolve` turns them into fqns later.
-/// For `x.run()` and `Util.run()` the grammar cannot tell a variable from a type, so the Java convention decides: an
+/// For `x.run()` and `Util.run()` the parser cannot tell a variable from a type, so the Java convention decides: an
 /// identifier starting with an upper-case letter is taken to be a type. Unresolvable guesses (constants such as
 /// `MAX.foo`) are harmless, since `link` drops names that are not project types.
-private bool[string] references(ref const Src src, TSNode decl)
+private bool[string] references(ref const Tree tree, string code, size_t decl)
 {
     bool[string] refs;
-    walk(decl, (TSNode n) {
-        switch (kind(n))
+    foreach (ref n; tree.nodes[decl + 1 .. tree.nodes[decl].end])
+    {
+        switch (n.kind)
         {
-        case "type_identifier":
-            refs[src.text(n).idup] = true;
-            return true;
-        case "scoped_type_identifier":
-            // like JavaParser: `Map.Entry` contributes "Map.Entry" and its scope "Map", but not "Entry" alone
-            auto text = stripWs(src.text(n));
+        case NodeKind.typeName:
+            refs[tree.text(code, n.first, n.last).idup] = true;
+            break;
+        case NodeKind.scopedTypeName:
+        {
+            // a qualified name: `Map.Entry` contributes "Map.Entry" and its scope "Map", but not "Entry" alone
+            // (the parser does not report the parts of a qualified name separately)
+            auto text = stripWs(tree.text(code, n.first, n.last));
             string prefix = text;
             while (true)
             {
@@ -282,26 +241,21 @@ private bool[string] references(ref const Src src, TSNode decl)
                 refs[prefix] = true;
             }
             refs[text] = true;
-            // Do not descend: its type_identifier parts would add "Entry" on its own.
-            return false;
-        case "marker_annotation", "annotation":
-            refs[stripWs(src.fieldText(n, "name"))] = true;
-            return true;
-        case "method_invocation", "field_access":
-            // `Outer.this` is a qualified this, not a static member access (JavaParser models it as ThisExpr)
-            auto field = child(n, "field");
-            const qualifiedThis = kind(n) == "field_access" && !isNull(field) && kind(field) == "this";
-            auto object = child(n, "object");
-            if (!qualifiedThis && !isNull(object) && kind(object) == "identifier")
-            {
-                const s = src.text(object);
-                if (s.length && isUpperStart(s)) refs[s.idup] = true;
-            }
-            return true;
-        default:
-            return true;
+            break;
         }
-    });
+        case NodeKind.annotationName:
+            refs[stripWs(tree.text(code, n.first, n.last))] = true;
+            break;
+        case NodeKind.memberObject:
+        {
+            const s = tree.text(code, n.first, n.last);
+            if (isUpperStart(s)) refs[s.idup] = true;
+            break;
+        }
+        default:
+            break;
+        }
+    }
     return refs;
 }
 

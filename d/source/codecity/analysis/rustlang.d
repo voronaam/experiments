@@ -1,6 +1,7 @@
-/// Rust support (tree-sitter). Crates and modules are districts; structs, enums, unions and traits are buildings
-/// whose methods are collected from every `impl` block in the crate; each module's free functions and constants
-/// form a "module" building. `use` paths are resolved so dependencies connect across files.
+/// Rust support, on the in-house parser `codecity.analysis.rust_parse`. Crates and modules are
+/// districts; structs, enums, unions and traits are buildings whose methods are collected from every `impl` block in
+/// the crate; each module's free functions and constants form a "module" building. `use` paths are resolved so
+/// dependencies connect across files.
 ///
 /// Naming: fqns are absolute Rust paths starting with the crate name (`shop::cart::Cart`); a module's function
 /// building is `shop::cart::{fn}` (see `functionsId`). The district is the module path without the crate
@@ -18,9 +19,8 @@ module codecity.analysis.rustlang;
 
 import codecity.analysis : Context, Linked, ParsedFile;
 import codecity.analysis.java : isUpperStart, relativeTo;
-import codecity.analysis.syntax;
+import codecity.analysis.rust_parse;
 import codecity.analysis.text;
-import codecity.c.treesitter;
 import codecity.model;
 import core.sync.mutex : Mutex;
 import std.algorithm : canFind, endsWith, startsWith;
@@ -94,9 +94,7 @@ private struct Crate
 /// `#[path]` attributes are not followed. Files under the crate's `tests/` or `benches/` are test code.
 ParsedFile parse(string root, string file, string code)
 {
-    auto tree = codecity.analysis.syntax.parse("rust", &tree_sitter_rust, code);
-    if (tree is null) return ParsedFile(null, null, true);
-    scope (exit) ts_tree_delete(tree);
+    auto tree = codecity.analysis.rust_parse.parse(code);
     auto crate = crateOf(root, file.dirName);
     const inCrate = relativeTo(file, crate.dir);
     const sourceRoot = sourceRootOf(crate.dir, file.dirName);
@@ -105,11 +103,10 @@ ParsedFile parse(string root, string file, string code)
     const test = first == "tests" || first == "benches";
 
     // The crate is the build module of every type in it.
-    auto st = new FileState(Src(code), lines(code), file, crate.name);
+    auto st = new FileState(code, tree, file, crate.name);
     auto scope_ = st.addScope(new Scope([crate.name] ~ modulePath));
-    auto rootNode = ts_tree_root_node(tree);
-    st.visitItems(rootNode, scope_, scope_, file.baseName, test);
-    return ParsedFile(st.types, st.ctx, ts_node_has_error(rootNode));
+    st.visitItems(0, scope_, scope_, file.baseName, test);
+    return ParsedFile(st.types, st.ctx, tree.errors);
 }
 
 /// The directory module paths are relative to: the nearest one (within the crate) holding `lib.rs` or `main.rs`.
@@ -206,17 +203,19 @@ package string readCrateName(string dir)
 /// Everything collected while walking one file.
 private final class FileState
 {
-    Src src;
+    string code;
+    Tree tree;
     string[] lines;
     /// module_ is the crate name.
     string file, module_;
     TypeDecl[] types;
     RustContext ctx;
 
-    this(Src src, string[] lines, string file, string module_)
+    this(string code, Tree tree, string file, string module_)
     {
-        this.src = src;
-        this.lines = lines;
+        this.code = code;
+        this.tree = tree;
+        this.lines = codecity.analysis.text.lines(code);
         this.file = file;
         this.module_ = module_;
         ctx = new RustContext;
@@ -233,32 +232,41 @@ private final class FileState
 
     static string fqn(Scope s, string name) { return s.path.join("::") ~ "::" ~ name; }
 
-    uint loc(TSNode n) { return countLoc(lines, firstLine(n), lastLine(n)); }
+    uint loc(size_t n) { return countLoc(lines, tree.firstLine(n), tree.lastLine(n)); }
+
+    /// Text of a token ("" for `none`), copied so that the result does not keep the source alive.
+    string tok(uint t) { return tree.tokText(code, t).idup; }
+
+    /// The item's name (its `name` token), "" if it has none.
+    string name(size_t n) { return tok(tree.nodes[n].name); }
 
     /// `district`: scope whose module path decides the district; differs from `scope_` inside `#[cfg(test)]`
     /// modules, which stay in their parent's district instead of adding one.
     ///
-    /// Visits the items of a file or of an inline `mod` body. Types become buildings; impl blocks are recorded for
-    /// linking; free functions, `const` and `static` items are collected into the module's function building
-    /// (named `label`: the file name, or `mod name` for an inline module), which is only emitted when there is at
-    /// least one of them. `mod x;` without a body is skipped here: its file is parsed on its own.
-    void visitItems(TSNode container, Scope scope_, Scope district, string label, bool test)
+    /// Visits the items of a file or of an inline `mod` body (the children of a `file` or `declBody` node). Types
+    /// become buildings; impl blocks are recorded for linking; free functions, `const` and `static` items are
+    /// collected into the module's function building (named `label`: the file name, or `mod name` for an inline
+    /// module), which is only emitted when there is at least one of them. `mod x;` without a body is skipped here:
+    /// its file is parsed on its own.
+    void visitItems(size_t container, Scope scope_, Scope district, string label, bool test)
     {
         MethodInfo[] functions;
         bool[string] functionRefs;
         uint constants, moduleLoc;
+        // Line span of the free items, reported as the module building's position.
         uint first = uint.max, last = 0;
         bool cfgTest;
-        foreach (item; namedChildren(container))
+        foreach (item; tree.children(container))
         {
-            const k = kind(item);
-            // In tree-sitter-rust an outer attribute is a sibling node *before* the item it applies to, so remember
-            // `#[cfg(test)]` until the next item (cfgTest is reset after every item). Only spaces are removed before
-            // the check, so `#[cfg( test )]` matches; `#[cfg(all(test, …))]` does not.
-            if (k == "attribute_item")
+            const k = tree.nodes[item].kind;
+            // Outer attributes precede the item they apply to, so remember `#[cfg(test)]` until the next item. Only
+            // spaces are removed before the check, so `#[cfg( test )]` matches; `#[cfg(all(test, …))]` does not. Any
+            // other node in between, including a comment (the parser records one as a `comment` node), ends the
+            // attribute's effect.
+            if (k == NodeKind.attr)
             {
                 string attr;
-                foreach (dchar c; src.text(item)) if (c != ' ') attr ~= c;
+                foreach (dchar c; tree.nodeText(code, item)) if (c != ' ') attr ~= c;
                 if (attr.canFind("cfg(test)")) cfgTest = true;
                 continue;
             }
@@ -267,46 +275,55 @@ private final class FileState
             const isTest = test || cfgTest;
             switch (k)
             {
-            case "use_declaration":
-                auto arg = child(item, "argument");
-                if (!isNull(arg)) expandUse(arg, null, scope_);
+            case NodeKind.use:
+            {
+                // The use tree is the item's last child.
+                auto parts = tree.children(item);
+                if (parts.length) expandUse(parts[$ - 1], null, scope_);
                 break;
-            case "struct_item", "union_item":
-                addType(item, scope_, district, k == "union_item" ? "union" : "struct", fieldCount(child(item, "body")), null, isTest);
+            }
+            case NodeKind.struct_, NodeKind.union_:
+                addType(item, scope_, district, k == NodeKind.union_ ? "union" : "struct", tree.nodes[item].value, null,
+                    isTest);
                 break;
-            case "enum_item":
-                uint variants;
-                auto b = child(item, "body");
-                if (!isNull(b)) foreach (v; namedChildren(b)) if (kind(v) == "enum_variant") variants++;
-                addType(item, scope_, district, "enum", variants, null, isTest);
+            case NodeKind.enum_:
+                addType(item, scope_, district, "enum", tree.nodes[item].value, null, isTest);
                 break;
             // A trait's attributes are 0; its methods are its declared functions, with or without default bodies.
-            case "trait_item":
-                addType(item, scope_, district, "trait", 0, functionsIn(child(item, "body")), isTest);
+            case NodeKind.trait:
+                addType(item, scope_, district, "trait", 0, functionsIn(tree.child(item, NodeKind.declBody)), isTest);
                 break;
-            case "impl_item":
+            case NodeKind.impl:
                 addImpl(item, scope_, district, label, isTest);
                 break;
-            case "function_item", "const_item", "static_item":
-                if (k == "function_item") functions ~= function_(item);
+            case NodeKind.fn, NodeKind.const_, NodeKind.static_:
+                // A function without a body is a signature, which does not belong here; valid code has none at module
+                // level.
+                if (k == NodeKind.fn && tree.child(item, NodeKind.body_) == noNode) break;
+                if (k == NodeKind.fn) functions ~= function_(item);
                 else constants++;
-                collectRefs(src, item, functionRefs);
+                collectRefs(code, tree, item, functionRefs);
                 moduleLoc += loc(item);
-                if (firstLine(item) < first) first = firstLine(item);
-                if (lastLine(item) > last) last = lastLine(item);
+                if (tree.firstLine(item) < first) first = tree.firstLine(item);
+                if (tree.lastLine(item) > last) last = tree.lastLine(item);
                 break;
-            case "mod_item":
-                auto body_ = child(item, "body");
-                if (!isNull(body_))
+            case NodeKind.mod:
+            {
+                const body_ = tree.child(item, NodeKind.declBody);
+                if (body_ != noNode)
                 {
-                    const name = src.fieldText(item, "name").idup;
-                    auto childScope = addScope(new Scope(scope_.path ~ name));
-                    visitItems(body_, childScope, cfgTest ? district : childScope, "mod " ~ name, isTest);
+                    const modName = name(item);
+                    auto childScope = addScope(new Scope(scope_.path ~ modName));
+                    // The module always gets its own scope (its names are `parent::tests::…`), but a cfg(test)
+                    // module does not get its own district.
+                    visitItems(body_, childScope, cfgTest ? district : childScope, "mod " ~ modName, isTest);
                 }
                 break;
+            }
             default:
                 break;
             }
+            // The attribute applied to this item only.
             cfgTest = false;
         }
         if (functions.length || constants > 0)
@@ -332,23 +349,24 @@ private final class FileState
         }
     }
 
-    void addType(TSNode item, Scope scope_, Scope district, string kind_, uint noa, MethodInfo[] methods, bool test)
+    /// Adds a struct, union, enum or trait building. Its methods (other than a trait's own) arrive in `link`.
+    void addType(size_t item, Scope scope_, Scope district, string kind_, uint noa, MethodInfo[] methods, bool test)
     {
-        const name = src.fieldText(item, "name").idup;
+        const typeName_ = name(item);
         bool[string] refs;
-        collectRefs(src, item, refs);
-        const id = fqn(scope_, name);
+        collectRefs(code, tree, item, refs);
+        const id = fqn(scope_, typeName_);
         ctx.scopeOf[id] = scope_;
         TypeDecl t;
         t.language = Language.rust;
         t.fqn = id;
-        t.name = name;
+        t.name = typeName_;
         t.pkg = packageOf(district);
         t.module_ = module_;
         t.kind = kind_;
         t.file = file;
-        t.line = firstLine(item);
-        t.endLine = lastLine(item);
+        t.line = tree.firstLine(item);
+        t.endLine = tree.lastLine(item);
         t.loc = loc(item);
         t.noa = noa;
         t.test = test;
@@ -357,67 +375,67 @@ private final class FileState
         types ~= t;
     }
 
-    /// Records an impl block. Its references come from the body only: the implemented type is the impl's target and
-    /// the trait becomes a dependency through `trait_` in `link`.
-    void addImpl(TSNode item, Scope scope_, Scope district, string label, bool test)
+    /// Records an impl block. Its references come from the body only (the header with type, trait and generics is
+    /// not scanned): the implemented type is the impl's target and the trait becomes a dependency through `trait_`
+    /// in `link`.
+    void addImpl(size_t item, Scope scope_, Scope district, string label, bool test)
     {
-        auto body_ = child(item, "body");
+        const body_ = tree.child(item, NodeKind.declBody);
         bool[string] refs;
-        collectRefs(src, isNull(body_) ? item : body_, refs);
-        auto traitNode = child(item, "trait");
-        ctx.impls ~= Impl(scope_, district, label, typeName(child(item, "type")), isNull(traitNode) ? null : typeName(traitNode),
-            functionsIn(body_), refs, loc(item), file, firstLine(item), test);
+        collectRefs(code, tree, body_ == noNode ? item : body_, refs);
+        const traitNode = tree.child(item, NodeKind.implTrait);
+        ctx.impls ~= Impl(scope_, district, label, typeName(tree.child(item, NodeKind.implType)),
+            traitNode == noNode ? null : typeName(traitNode), functionsIn(body_), refs, loc(item), file,
+            tree.firstLine(item), test);
     }
 
-    /// `S<T>` → `S`; `crate::m::Other` stays a path; references are unwrapped.
-    string typeName(TSNode n)
+    /// `S<T>` → `S`; `crate::m::Other` stays a path; references and pointers are unwrapped. The parser has already
+    /// found this "core" of the `implType`/`implTrait` node's type (its `name` to `value` tokens).
+    string typeName(size_t n)
     {
-        if (isNull(n)) return "";
-        switch (kind(n))
-        {
-        case "generic_type", "reference_type", "pointer_type":
-            return typeName(child(n, "type"));
-        default:
-            return src.text(n).idup;
-        }
+        if (n == noNode) return "";
+        const node = tree.nodes[n];
+        return tree.rangeText(code, node.name, node.value).idup;
     }
 
-    /// The functions of an impl or trait body. function_signature_item is a trait method without a default body.
-    MethodInfo[] functionsIn(TSNode body_)
+    /// Functions of an impl or trait body, with or without a body (a trait method without a default).
+    MethodInfo[] functionsIn(size_t body_)
     {
         MethodInfo[] list;
-        if (isNull(body_)) return list;
-        foreach (m; namedChildren(body_))
-            if (kind(m) == "function_item" || kind(m) == "function_signature_item") list ~= function_(m);
+        if (body_ == noNode) return list;
+        foreach (m; tree.children(body_)) if (tree.nodes[m].kind == NodeKind.fn) list ~= function_(m);
         return list;
     }
 
-    /// Metrics of one function. Only `parameter` nodes count, so `self`/`&mut self` (a self_parameter) is not a
-    /// parameter. Without a body the complexity is 1.
-    MethodInfo function_(TSNode f)
+    /// Metrics of one function. The parser counted its parameters (`self` is not counted). Without a body the
+    /// complexity is 1.
+    MethodInfo function_(size_t f)
     {
-        uint parameters;
-        auto p = child(f, "parameters");
-        if (!isNull(p)) foreach (c; namedChildren(p)) if (kind(c) == "parameter") parameters++;
-        auto body_ = child(f, "body");
-        return MethodInfo(src.fieldText(f, "name").idup, firstLine(f), loc(f), isNull(body_) ? 1 : complexity(body_), parameters);
+        const body_ = tree.child(f, NodeKind.body_);
+        return MethodInfo(name(f), tree.firstLine(f), loc(f), body_ == noNode ? 1 : complexity(tree, body_),
+            tree.nodes[f].value);
     }
 
     /// Flattens a use tree into alias → path entries and glob imports.
     ///
-    /// `prefix` is the path of the enclosing `a::b::{…}` group. For example
-    /// `use a::b::{self, C as D, e::F, g::*};` gives uses b → a::b, D → a::b::C, F → a::b::e::F and the glob a::b::g.
-    /// `metavariable` covers `$crate` in macro bodies.
-    void expandUse(TSNode n, string[] prefix, Scope scope_)
+    /// `prefix` is the path accumulated from enclosing `a::b::{…}` groups. For example
+    /// `use crate::net::{self, http::Client as C, tls::*};` yields `net → [crate, net]`,
+    /// `C → [crate, net, http, Client]` and the glob `[crate, net, tls]`.
+    void expandUse(size_t n, string[] prefix, Scope scope_)
     {
-        switch (kind(n))
+        const node = tree.nodes[n];
+        switch (node.kind)
         {
-        case "identifier", "crate", "self", "super", "metavariable":
-            const name = src.text(n).idup;
-            if (name == "self" && prefix.length) scope_.uses[prefix[$ - 1]] = prefix.dup; // a::{self}
-            else scope_.uses[name] = prefix ~ name;
-            break;
-        case "scoped_identifier":
+        case NodeKind.usePath:
+        {
+            if (node.first == node.last)
+            {
+                // A single name, at the top level or inside a `{…}` list.
+                const single = tok(node.first);
+                if (single == "self" && prefix.length) scope_.uses[prefix[$ - 1]] = prefix.dup; // a::{self}
+                else scope_.uses[single] = prefix ~ single;
+                break;
+            }
             // `use a::b::C;` binds the last segment; `use a::b::self` binds `b`.
             auto path = prefix ~ segments(n);
             string alias_ = path.length ? path[$ - 1] : "";
@@ -428,114 +446,111 @@ private final class FileState
             }
             scope_.uses[alias_] = path;
             break;
-        case "use_as_clause":
-            const alias_ = src.fieldText(n, "alias").idup;
+        }
+        case NodeKind.useAs:
+        {
+            const alias_ = tok(node.name);
             // `use Trait as _;` only brings trait methods into scope and binds no name.
-            if (alias_ != "_") scope_.uses[alias_] = prefix ~ segments(child(n, "path"));
+            if (alias_ != "_") scope_.uses[alias_] = prefix ~ segments(tree.child(n, NodeKind.usePath));
             break;
-        case "scoped_use_list":
-            auto list = child(n, "list");
-            if (!isNull(list)) expandUse(list, prefix ~ segments(child(n, "path")), scope_);
+        }
+        case NodeKind.useGroup:
+        {
+            auto p = prefix ~ segments(tree.child(n, NodeKind.usePrefix));
+            foreach (c; tree.children(n))
+                if (tree.nodes[c].kind != NodeKind.usePrefix) expandUse(c, p, scope_);
             break;
-        case "use_list":
-            foreach (c; namedChildren(n)) expandUse(c, prefix, scope_);
-            break;
-        case "use_wildcard":
-            // `use a::*;` has the path as its only named child; `*` inside a group (`a::{*}`) has none.
-            scope_.globs ~= prefix ~ (ts_node_named_child_count(n) ? segments(ts_node_named_child(n, 0)) : null);
+        }
+        case NodeKind.useGlob:
+            scope_.globs ~= prefix ~ segments(tree.child(n, NodeKind.usePrefix));
             break;
         default:
             break;
         }
     }
 
-    /// The segments of a (possibly scoped) path node: `a::b::C` → [a, b, C].
-    string[] segments(TSNode n)
+    /// The segments of a use path: `a::b::c` → [a, b, c] (a leading `::` adds none).
+    string[] segments(size_t n)
     {
-        if (isNull(n)) return null;
-        if (kind(n) == "scoped_identifier" || kind(n) == "scoped_type_identifier")
-            return segments(child(n, "path")) ~ src.fieldText(n, "name").idup;
-        return [src.text(n).idup];
+        if (n == noNode) return null;
+        string[] output;
+        const node = tree.nodes[n];
+        foreach (t; node.first .. node.last + 1)
+            if (tree.tokens[t].kind == TokKind.ident) output ~= tok(t);
+        return output;
     }
 }
 
-/// Attributes of a struct or union: named fields (`field_declaration_list`) or tuple fields
-/// (`ordered_field_declaration_list`); a unit struct has no body and no fields.
-private uint fieldCount(TSNode body_)
+/// Names under node `node` that may refer to project items: type identifiers, whole paths (`net::http::get`,
+/// `Order::new`; whitespace removed, not descended into) and capitalised identifiers (e.g. a tuple-struct constructor
+/// call `Price(3)`). Lower-case single identifiers are skipped as they are almost always locals. A path is not
+/// descended into, so `Cart::new()` contributes only `Cart::new`, which `Resolver.resolve` maps to the type `Cart`.
+/// For a qualified path (`<T as Trait>::Item`) the text names nothing resolvable, so the parser emitted the types
+/// inside the brackets instead (see `rust_parse`, "Reference leaves"). Paths of `use` declarations inside items count
+/// like paths, a single name or an `as` alias like an identifier.
+private void collectRefs(string code, ref const Tree tree, size_t node, ref bool[string] refs)
 {
-    if (isNull(body_)) return 0;
-    uint n;
-    if (kind(body_) == "field_declaration_list")
+    size_t i = node + 1;
+    const end = tree.nodes[node].end;
+    while (i < end)
     {
-        foreach (f; namedChildren(body_)) if (kind(f) == "field_declaration") n++;
-        return n;
-    }
-    // tuple struct: count the "type" fields. Each tuple element's type is a child in the grammar field "type";
-    // visibility modifiers and attributes are children too, but in no field.
-    foreach (i; 0 .. ts_node_child_count(body_)) if (fieldNameForChild(body_, i) == "type") n++;
-    return n;
-}
-
-/// Names a type might depend on, as written: every type identifier, every path (`net::http::get`,
-/// `crate::cart::Cart`) as a whole, and plain identifiers starting with an upper-case letter (unit structs, enum
-/// variants, tuple-struct constructors or constants used as values). Lower-case identifiers are locals or
-/// functions and are skipped. A path is not descended into, so `Cart::new()` contributes only `Cart::new`, which
-/// `Resolver.resolve` maps to the type `Cart`. A qualified path (`<T as Trait>::Item`) names nothing resolvable as
-/// text, so the types inside its brackets are collected instead.
-private void collectRefs(ref Src src, TSNode node, ref bool[string] refs)
-{
-    walk(node, (TSNode n) {
-        switch (kind(n))
+        const n = tree.nodes[i];
+        switch (n.kind)
         {
-        case "type_identifier":
-            refs[src.text(n).idup] = true;
-            return true;
-        case "scoped_type_identifier", "scoped_identifier":
-            auto path = child(n, "path");
-            if (!isNull(path) && kind(path) == "bracketed_type")
+        case NodeKind.typeIdent:
+            refs[tree.tokText(code, n.first).idup] = true;
+            break;
+        case NodeKind.ident:
+            addIdentifier(tree.tokText(code, n.first), refs);
+            break;
+        case NodeKind.useAs:
+            if (n.name != none) addIdentifier(tree.tokText(code, n.name), refs);
+            break;
+        case NodeKind.usePath, NodeKind.usePrefix, NodeKind.path:
+            if (n.kind != NodeKind.path && n.first == n.last)
             {
-                collectRefs(src, path, refs);
-                return false;
+                addIdentifier(tree.tokText(code, n.first), refs);
+                break;
             }
             string s;
-            foreach (dchar c; src.text(n)) if (!isWhite(c)) s ~= c;
+            foreach (dchar c; tree.rangeText(code, n.first, n.last)) if (!isWhite(c)) s ~= c;
             refs[s] = true;
-            return false;
-        case "identifier":
-            const s = src.text(n);
-            if (isUpperStart(s)) refs[s.idup] = true;
-            return true;
+            i = n.end; // nothing inside a path is a separate reference
+            continue;
         default:
-            return true;
+            break;
         }
-    });
+        i++;
+    }
 }
 
-/// Cyclomatic complexity: 1 + `if`, `while`, `loop`, `for`, `&&`/`||`, plus k - 1 for a `match` with k arms
-/// (`if let`/`while let` parse as if/while expressions; `?` does not count). Nested closures count towards the
-/// enclosing function.
-uint complexity(TSNode body_)
+/// An identifier is a reference if capitalised. Lifetimes and labels (`'a`) are identifiers without their quote.
+private void addIdentifier(string s, ref bool[string] refs)
 {
-    // Signed: a match is visited (and decremented) before its arms, and a match without arms would go below 1.
+    if (s.length && s[0] == '\'') s = s[1 .. $];
+    if (isUpperStart(s)) refs[s.idup] = true;
+}
+
+/// McCabe cyclomatic complexity of a function body: 1 + `if`, `while`, `loop`, `for`, each `&&`/`||`, and k - 1 per
+/// `match` with k arms. `else if` counts as another `if`; `?` does not. Closures and nested functions count towards
+/// the enclosing function. Clamped to at least 1 because an empty `match` would make the sum go down.
+uint complexity(ref const Tree tree, size_t body_)
+{
     int cx = 1;
-    walk(body_, (TSNode n) {
-        switch (kind(n))
+    foreach (ref n; tree.nodes[body_ + 1 .. tree.nodes[body_].end])
+    {
+        switch (n.kind)
         {
-        case "if_expression", "while_expression", "loop_expression", "for_expression", "match_arm":
+        case NodeKind.if_, NodeKind.while_, NodeKind.loop, NodeKind.for_, NodeKind.arm, NodeKind.andOr:
             cx++;
             break;
-        case "match_expression":
+        case NodeKind.match:
             cx--; // a match with k arms adds k - 1 paths
-            break;
-        case "binary_expression":
-            const op = operator(n);
-            if (op == "&&" || op == "||") cx++;
             break;
         default:
             break;
         }
-        return true;
-    });
+    }
     return cx < 1 ? 1 : cast(uint) cx;
 }
 

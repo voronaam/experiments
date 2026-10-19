@@ -1,6 +1,6 @@
-//! Rust support (tree-sitter). Crates and modules are districts; structs, enums, unions and traits are buildings
-//! whose methods are collected from every `impl` block in the crate; each module's free functions and constants
-//! form a "module" building. `use` paths are resolved so dependencies connect across files.
+//! Rust support, on the in-house parser [`rust_parse`]. Crates and modules are districts; structs, enums, unions
+//! and traits are buildings whose methods are collected from every `impl` block in the crate; each module's free
+//! functions and constants form a "module" building. `use` paths are resolved so dependencies connect across files.
 //!
 //! # Identifiers
 //! Everything is named by its absolute module path starting with the crate name (from `Cargo.toml`, `-` replaced by
@@ -13,15 +13,14 @@
 //! every `impl` block; [`link`] then attaches each impl to the type it implements and resolves references
 //! module by module ([`Resolver`]).
 
-use super::syntax::{first_line, last_line, named_children, operator, walk, Src};
+use super::rust_parse::{self, NodeKind, TokKind, Tree, NONE};
 use super::text::{count_loc, lines};
-use super::{with_parser, Context as AnyContext, Linked, ParsedFile};
+use super::{Context as AnyContext, Linked, ParsedFile};
 use crate::model::{Language, MethodInfo, TypeInfo};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use tree_sitter::Node;
 
 /// Last segment of a module building's fqn. Braces cannot appear in a Rust identifier, so the id never clashes with
 /// a real type name.
@@ -87,9 +86,7 @@ struct Crate {
 /// Parses one `.rs` file. The file's module path is derived from where it sits in its crate (see [`module_path()`]),
 /// not from the `mod` declarations that include it, so every file can be parsed on its own.
 pub fn parse(root: &Path, file: &Path, code: &str) -> ParsedFile {
-    let Some(tree) = with_parser("rust", || tree_sitter_rust::LANGUAGE.into(), |p| p.parse(code, None)) else {
-        return ParsedFile { types: vec![], context: AnyContext::None, failed: true };
-    };
+    let tree = rust_parse::parse(code);
     let krate = crate_of(root, file.parent().unwrap_or(root));
     let in_crate = file.strip_prefix(&krate.dir).unwrap_or(file);
     let source_root = source_root(&krate.dir, file.parent().unwrap_or(root));
@@ -101,7 +98,8 @@ pub fn parse(root: &Path, file: &Path, code: &str) -> ParsedFile {
     absolute.extend(module_path);
 
     let mut st = FileState {
-        src: Src { code },
+        code,
+        tree: &tree,
         lines: lines(code),
         file,
         module: krate.name.clone(),
@@ -110,9 +108,8 @@ pub fn parse(root: &Path, file: &Path, code: &str) -> ParsedFile {
     };
     let scope = st.add_scope(Scope::new(absolute));
     let file_name = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let root_node = tree.root_node();
-    st.visit_items(root_node, scope, scope, &file_name, test);
-    ParsedFile { types: st.types, context: AnyContext::Rust(st.ctx), failed: root_node.has_error() }
+    st.visit_items(0, scope, scope, &file_name, test);
+    ParsedFile { types: st.types, context: AnyContext::Rust(st.ctx), failed: tree.errors }
 }
 
 /// The directory module paths are relative to: the nearest one (within the crate) holding `lib.rs` or `main.rs`.
@@ -203,7 +200,8 @@ pub fn read_crate_name(dir: &Path) -> Option<String> {
 
 /// Everything collected while walking one file.
 struct FileState<'a> {
-    src: Src<'a>,
+    code: &'a str,
+    tree: &'a Tree,
     lines: Vec<&'a str>,
     file: &'a Path,
     module: String,
@@ -226,19 +224,29 @@ impl<'a> FileState<'a> {
         format!("{}::{}", self.ctx.scopes[scope].path.join("::"), name)
     }
 
-    fn loc(&self, n: Node) -> u32 {
-        count_loc(&self.lines, first_line(n), last_line(n))
+    fn loc(&self, n: usize) -> u32 {
+        count_loc(&self.lines, self.tree.first_line(n), self.tree.last_line(n))
+    }
+
+    /// Text of a token ("" for [`NONE`]).
+    fn tok(&self, t: u32) -> &'a str {
+        self.tree.tok_text(self.code, t)
+    }
+
+    /// The item's name (its `name` token), "" if it has none.
+    fn name(&self, n: usize) -> String {
+        self.tok(self.tree.nodes[n].name).to_string()
     }
 
     /// `district`: scope whose module path decides the district; differs from `scope` inside `#[cfg(test)]`
     /// modules, which stay in their parent's district instead of adding one.
     ///
-    /// Visits the items of a file or inline module. Types become buildings, impls are recorded for linking, `use`
-    /// declarations fill the scope, inline modules recurse with a new scope. Free functions, consts and statics are
-    /// gathered into one module building named `label` (the file name, or `mod x` for an inline module). `mod x;`
-    /// without a body is skipped: that file is parsed on its own. `test` marks everything in this container as test
-    /// code.
-    fn visit_items(&mut self, container: Node<'a>, scope: usize, district: usize, label: &str, test: bool) {
+    /// Visits the items of a file or inline module (the children of a `File` or `DeclBody` node). Types become
+    /// buildings, impls are recorded for linking, `use` declarations fill the scope, inline modules recurse with a new
+    /// scope. Free functions, consts and statics are gathered into one module building named `label` (the file name,
+    /// or `mod x` for an inline module). `mod x;` without a body is skipped: that file is parsed on its own. `test`
+    /// marks everything in this container as test code.
+    fn visit_items(&mut self, container: usize, scope: usize, district: usize, label: &str, test: bool) {
         let mut functions = vec![];
         let mut function_refs = HashSet::new();
         let mut constants = 0;
@@ -247,55 +255,57 @@ impl<'a> FileState<'a> {
         let mut first = u32::MAX;
         let mut last = 0;
         let mut cfg_test = false;
-        for item in named_children(container) {
-            let kind = item.kind();
-            // Outer attributes are sibling nodes preceding the item they apply to, so remember `#[cfg(test)]` until
-            // the next item. Only the exact form `cfg(test)` (spaces removed) is recognised, not e.g.
-            // `cfg(all(test, …))`.
-            if kind == "attribute_item" {
-                let attr: String = self.src.text(item).chars().filter(|c| *c != ' ').collect();
+        for item in self.tree.children(container) {
+            let kind = self.tree.nodes[item].kind;
+            // Outer attributes precede the item they apply to, so remember `#[cfg(test)]` until the next item. Only
+            // the exact form `cfg(test)` (spaces removed) is recognised, not e.g. `cfg(all(test, …))`. Any other node
+            // in between, including a comment (the parser records one as a `Comment` node), ends the attribute's
+            // effect.
+            if kind == NodeKind::Attr {
+                let attr: String = self.tree.node_text(self.code, item).chars().filter(|c| *c != ' ').collect();
                 cfg_test |= attr.contains("cfg(test)");
                 continue;
             }
             let is_test = test || cfg_test;
             match kind {
-                "use_declaration" => {
-                    if let Some(arg) = item.child_by_field_name("argument") {
-                        self.expand_use(arg, &[], scope);
+                NodeKind::Use => {
+                    if let Some(&tree) = self.tree.children(item).last() {
+                        self.expand_use(tree, &[], scope);
                     }
                 }
-                "struct_item" | "union_item" => {
-                    let k = if kind == "union_item" { "union" } else { "struct" };
-                    let noa = field_count(item.child_by_field_name("body"));
+                NodeKind::Struct | NodeKind::Union => {
+                    let k = if kind == NodeKind::Union { "union" } else { "struct" };
+                    let noa = self.tree.nodes[item].value;
                     self.add_type(item, scope, district, k, noa, vec![], is_test);
                 }
-                "enum_item" => {
-                    let variants = item
-                        .child_by_field_name("body")
-                        .map(|b| named_children(b).filter(|v| v.kind() == "enum_variant").count())
-                        .unwrap_or(0) as u32;
+                NodeKind::Enum => {
+                    let variants = self.tree.nodes[item].value;
                     self.add_type(item, scope, district, "enum", variants, vec![], is_test);
                 }
-                "trait_item" => {
-                    let methods = self.functions_in(item.child_by_field_name("body"));
+                NodeKind::Trait => {
+                    let methods = self.functions_in(self.tree.child(item, NodeKind::DeclBody));
                     self.add_type(item, scope, district, "trait", 0, methods, is_test);
                 }
-                "impl_item" => self.add_impl(item, scope, district, label, is_test),
-                "function_item" | "const_item" | "static_item" => {
-                    if kind == "function_item" {
+                NodeKind::Impl => self.add_impl(item, scope, district, label, is_test),
+                // A function without a body is a signature, which does not belong here; valid code has none at module
+                // level.
+                NodeKind::Fn | NodeKind::Const | NodeKind::Static
+                    if kind != NodeKind::Fn || self.tree.child(item, NodeKind::Body).is_some() =>
+                {
+                    if kind == NodeKind::Fn {
                         functions.push(self.function(item));
                     } else {
                         constants += 1;
                     }
-                    collect_refs(&self.src, item, &mut function_refs);
+                    collect_refs(self.code, self.tree, item, &mut function_refs);
                     module_loc += self.loc(item);
-                    first = first.min(first_line(item));
-                    last = last.max(last_line(item));
+                    first = first.min(self.tree.first_line(item));
+                    last = last.max(self.tree.last_line(item));
                 }
-                "mod_item" => {
-                    if let Some(body) = item.child_by_field_name("body") {
+                NodeKind::Mod => {
+                    if let Some(body) = self.tree.child(item, NodeKind::DeclBody) {
                         let mut child = self.ctx.scopes[scope].path.clone();
-                        let name = self.src.field_text(item, "name").to_string();
+                        let name = self.name(item);
                         child.push(name.clone());
                         let child_scope = self.add_scope(Scope::new(child));
                         // The module always gets its own scope (its names are `parent::tests::…`), but a cfg(test)
@@ -335,11 +345,11 @@ impl<'a> FileState<'a> {
 
     #[allow(clippy::too_many_arguments)]
     /// Adds a struct, union, enum or trait building. Its methods (other than a trait's own) arrive in [`link`].
-    fn add_type(&mut self, item: Node, scope: usize, district: usize, kind: &'static str, noa: u32,
+    fn add_type(&mut self, item: usize, scope: usize, district: usize, kind: &'static str, noa: u32,
                 methods: Vec<MethodInfo>, test: bool) {
-        let name = self.src.field_text(item, "name").to_string();
+        let name = self.name(item);
         let mut refs = HashSet::new();
-        collect_refs(&self.src, item, &mut refs);
+        collect_refs(self.code, self.tree, item, &mut refs);
         let id = self.fqn(scope, &name);
         self.ctx.scope_of.insert(id.clone(), scope);
         self.types.push(TypeInfo {
@@ -350,8 +360,8 @@ impl<'a> FileState<'a> {
             module: self.module.clone(),
             kind,
             file: self.file.to_path_buf(),
-            line: first_line(item),
-            end_line: last_line(item),
+            line: self.tree.first_line(item),
+            end_line: self.tree.last_line(item),
             loc: self.loc(item),
             noa,
             test,
@@ -364,56 +374,53 @@ impl<'a> FileState<'a> {
 
     /// Records an `impl` block. References come from its body only (the header with type, trait and generics is not
     /// scanned); the trait is resolved separately in [`link`].
-    fn add_impl(&mut self, item: Node, scope: usize, district: usize, label: &str, test: bool) {
-        let body = item.child_by_field_name("body");
+    fn add_impl(&mut self, item: usize, scope: usize, district: usize, label: &str, test: bool) {
+        let body = self.tree.child(item, NodeKind::DeclBody);
         let mut refs = HashSet::new();
-        collect_refs(&self.src, body.unwrap_or(item), &mut refs);
+        collect_refs(self.code, self.tree, body.unwrap_or(item), &mut refs);
         let imp = Impl {
             scope,
             district,
             label: label.to_string(),
-            ty: self.type_name(item.child_by_field_name("type")),
-            tr: item.child_by_field_name("trait").map(|t| self.type_name(Some(t))),
+            ty: self.type_name(self.tree.child(item, NodeKind::ImplType)),
+            tr: self.tree.child(item, NodeKind::ImplTrait).map(|t| self.type_name(Some(t))),
             methods: self.functions_in(body),
             refs,
             loc: self.loc(item),
             file: self.file.to_path_buf(),
-            line: first_line(item),
+            line: self.tree.first_line(item),
             test,
         };
         self.ctx.impls.push(imp);
     }
 
-    /// `S<T>` → `S`; `crate::m::Other` stays a path; references are unwrapped.
-    fn type_name(&self, n: Option<Node>) -> String {
+    /// `S<T>` → `S`; `crate::m::Other` stays a path; references and pointers are unwrapped. The parser has
+    /// already found this "core" of the `ImplType`/`ImplTrait` node's type (its `name` to `value` tokens).
+    fn type_name(&self, n: Option<usize>) -> String {
         let Some(n) = n else { return String::new() };
-        match n.kind() {
-            "generic_type" | "reference_type" | "pointer_type" => self.type_name(n.child_by_field_name("type")),
-            _ => self.src.text(n).to_string(),
-        }
+        let node = self.tree.nodes[n];
+        self.tree.range_text(self.code, node.name, node.value).to_string()
     }
 
-    /// Functions of an impl or trait body; `function_signature_item` is a trait method without a default body.
-    fn functions_in(&self, body: Option<Node>) -> Vec<MethodInfo> {
+    /// Functions of an impl or trait body, with or without a body (a trait method without a default).
+    fn functions_in(&self, body: Option<usize>) -> Vec<MethodInfo> {
         let Some(body) = body else { return vec![] };
-        named_children(body)
-            .filter(|m| matches!(m.kind(), "function_item" | "function_signature_item"))
+        self.tree
+            .children(body)
+            .into_iter()
+            .filter(|&m| self.tree.nodes[m].kind == NodeKind::Fn)
             .map(|m| self.function(m))
             .collect()
     }
 
-    /// Metrics of one function. `self` is a `self_parameter` node and is not counted as a parameter.
-    fn function(&self, f: Node) -> MethodInfo {
-        let parameters = f
-            .child_by_field_name("parameters")
-            .map(|p| named_children(p).filter(|c| c.kind() == "parameter").count())
-            .unwrap_or(0) as u32;
+    /// Metrics of one function. The parser counted its parameters (`self` is not counted).
+    fn function(&self, f: usize) -> MethodInfo {
         MethodInfo {
-            name: self.src.field_text(f, "name").to_string(),
-            line: first_line(f),
+            name: self.name(f),
+            line: self.tree.first_line(f),
             loc: self.loc(f),
-            complexity: f.child_by_field_name("body").map(complexity).unwrap_or(1),
-            parameters,
+            complexity: self.tree.child(f, NodeKind::Body).map(|b| complexity(self.tree, b)).unwrap_or(1),
+            parameters: self.tree.nodes[f].value,
         }
     }
 
@@ -422,11 +429,12 @@ impl<'a> FileState<'a> {
     /// `prefix` is the path accumulated from enclosing `a::b::{…}` groups. For example
     /// `use crate::net::{self, http::Client as C, tls::*};` yields `net → [crate, net]`,
     /// `C → [crate, net, http, Client]` and the glob `[crate, net, tls]`.
-    fn expand_use(&mut self, n: Node, prefix: &[String], scope: usize) {
-        match n.kind() {
-            // A single name, at the top level or inside a `{…}` list. `metavariable` is `$crate` in macro_rules.
-            "identifier" | "crate" | "self" | "super" | "metavariable" => {
-                let name = self.src.text(n).to_string();
+    fn expand_use(&mut self, n: usize, prefix: &[String], scope: usize) {
+        let node = self.tree.nodes[n];
+        match node.kind {
+            NodeKind::UsePath if node.first == node.last => {
+                // A single name, at the top level or inside a `{…}` list.
+                let name = self.tok(node.first).to_string();
                 if name == "self" && !prefix.is_empty() {
                     self.ctx.scopes[scope].uses.insert(prefix.last().unwrap().clone(), prefix.to_vec()); // a::{self}
                 } else {
@@ -435,7 +443,7 @@ impl<'a> FileState<'a> {
                     self.ctx.scopes[scope].uses.insert(name, path);
                 }
             }
-            "scoped_identifier" => {
+            NodeKind::UsePath => {
                 let mut path = prefix.to_vec();
                 path.extend(self.segments(Some(n)));
                 let mut alias = path.last().cloned().unwrap_or_default();
@@ -445,104 +453,95 @@ impl<'a> FileState<'a> {
                 }
                 self.ctx.scopes[scope].uses.insert(alias, path);
             }
-            "use_as_clause" => {
-                let alias = self.src.field_text(n, "alias").to_string();
+            NodeKind::UseAs => {
+                let alias = self.tok(node.name).to_string();
                 // `use Trait as _` only brings trait methods into scope; there is no name to resolve.
                 if alias != "_" {
                     let mut path = prefix.to_vec();
-                    path.extend(self.segments(n.child_by_field_name("path")));
+                    path.extend(self.segments(self.tree.child(n, NodeKind::UsePath)));
                     self.ctx.scopes[scope].uses.insert(alias, path);
                 }
             }
-            "scoped_use_list" => {
+            NodeKind::UseGroup => {
                 let mut p = prefix.to_vec();
-                p.extend(self.segments(n.child_by_field_name("path")));
-                if let Some(list) = n.child_by_field_name("list") {
-                    self.expand_use(list, &p, scope);
+                p.extend(self.segments(self.tree.child(n, NodeKind::UsePrefix)));
+                for c in self.tree.children(n) {
+                    if self.tree.nodes[c].kind != NodeKind::UsePrefix {
+                        self.expand_use(c, &p, scope);
+                    }
                 }
             }
-            "use_list" => {
-                for c in named_children(n) {
-                    self.expand_use(c, prefix, scope);
-                }
-            }
-            "use_wildcard" => {
+            NodeKind::UseGlob => {
                 let mut path = prefix.to_vec();
-                path.extend(self.segments(n.named_child(0)));
+                path.extend(self.segments(self.tree.child(n, NodeKind::UsePrefix)));
                 self.ctx.scopes[scope].globs.push(path);
             }
             _ => {}
         }
     }
 
-    /// Splits a (possibly scoped) path node into its segments: `a::b::c` → [a, b, c].
-    fn segments(&self, n: Option<Node>) -> Vec<String> {
+    /// The segments of a use path: `a::b::c` → [a, b, c] (a leading `::` adds none).
+    fn segments(&self, n: Option<usize>) -> Vec<String> {
         let Some(n) = n else { return vec![] };
-        if matches!(n.kind(), "scoped_identifier" | "scoped_type_identifier") {
-            let mut s = self.segments(n.child_by_field_name("path"));
-            s.push(self.src.field_text(n, "name").to_string());
-            s
-        } else {
-            vec![self.src.text(n).to_string()]
-        }
+        let node = self.tree.nodes[n];
+        (node.first..=node.last)
+            .filter(|&t| self.tree.tokens[t as usize].kind == TokKind::Ident)
+            .map(|t| self.tok(t).to_string())
+            .collect()
     }
 }
 
-/// Attributes of a struct or union: named fields, or the fields of a tuple struct. Unit structs have no body.
-fn field_count(body: Option<Node>) -> u32 {
-    let Some(body) = body else { return 0 };
-    if body.kind() == "field_declaration_list" {
-        return named_children(body).filter(|f| f.kind() == "field_declaration").count() as u32;
-    }
-    // tuple struct (ordered_field_declaration_list): the field types are children under the field name "type",
-    // mixed with commas and visibility modifiers, so count by field name
-    (0..body.child_count() as u32).filter(|&i| body.field_name_for_child(i) == Some("type")).count() as u32
-}
-
-/// Names under `node` that may refer to project items: type identifiers, whole paths (`net::http::get`,
+/// Names under node `node` that may refer to project items: type identifiers, whole paths (`net::http::get`,
 /// `Order::new`; whitespace removed, not descended into) and capitalised identifiers (e.g. a tuple-struct constructor
 /// call `Price(3)`). Lower-case single identifiers are skipped as they are almost always locals. For a qualified path
-/// (`<T as Trait>::Item`) the text names nothing resolvable, so the types inside the brackets are collected instead.
-fn collect_refs(src: &Src, node: Node, refs: &mut HashSet<String>) {
-    walk(node, |n| match n.kind() {
-        "type_identifier" => {
-            refs.insert(src.text(n).to_string());
-            true
-        }
-        "scoped_type_identifier" | "scoped_identifier" => {
-            match n.child_by_field_name("path") {
-                Some(p) if p.kind() == "bracketed_type" => collect_refs(src, p, refs),
-                _ => {
-                    refs.insert(src.text(n).chars().filter(|c| !c.is_whitespace()).collect());
-                }
+/// (`<T as Trait>::Item`) the text names nothing resolvable, so the parser emitted the types inside the brackets
+/// instead (see `rust_parse`, "Reference leaves"). Paths of `use` declarations inside items count like paths, a single
+/// name or an `as` alias like an identifier.
+fn collect_refs(code: &str, tree: &Tree, node: usize, refs: &mut HashSet<String>) {
+    let mut i = node + 1;
+    let end = tree.nodes[node].end as usize;
+    while i < end {
+        let n = tree.nodes[i];
+        match n.kind {
+            NodeKind::TypeIdent => {
+                refs.insert(tree.tok_text(code, n.first).to_string());
             }
-            false
-        }
-        "identifier" => {
-            let s = src.text(n);
-            if s.chars().next().is_some_and(char::is_uppercase) {
-                refs.insert(s.to_string());
+            NodeKind::Ident => add_identifier(tree.tok_text(code, n.first), refs),
+            NodeKind::UseAs if n.name != NONE => add_identifier(tree.tok_text(code, n.name), refs),
+            NodeKind::UsePath | NodeKind::UsePrefix if n.first == n.last => {
+                add_identifier(tree.tok_text(code, n.first), refs)
             }
-            true
+            NodeKind::Path | NodeKind::UsePath | NodeKind::UsePrefix => {
+                refs.insert(tree.range_text(code, n.first, n.last).chars().filter(|c| !c.is_whitespace()).collect());
+                i = n.end as usize; // nothing inside a path is a separate reference
+                continue;
+            }
+            _ => {}
         }
-        _ => true,
-    });
+        i += 1;
+    }
+}
+
+/// An identifier is a reference if capitalised. Lifetimes and labels (`'a`) are identifiers without their quote.
+fn add_identifier(s: &str, refs: &mut HashSet<String>) {
+    let s = s.strip_prefix('\'').unwrap_or(s);
+    if s.chars().next().is_some_and(char::is_uppercase) {
+        refs.insert(s.to_string());
+    }
 }
 
 /// McCabe cyclomatic complexity of a function body: 1 + `if`, `while`, `loop`, `for`, each `&&`/`||`, and k - 1 per
-/// `match` with k arms. `else if` is a nested if_expression and counts; `?` does not. Closures count towards the
-/// enclosing function. Clamped to at least 1 because an empty `match` would make the sum go down.
-pub fn complexity(body: Node) -> u32 {
+/// `match` with k arms. `else if` counts as another `if`; `?` does not. Closures and nested functions count towards
+/// the enclosing function. Clamped to at least 1 because an empty `match` would make the sum go down.
+pub fn complexity(tree: &Tree, body: usize) -> u32 {
     let mut cx: i32 = 1;
-    walk(body, |n| {
-        match n.kind() {
-            "if_expression" | "while_expression" | "loop_expression" | "for_expression" | "match_arm" => cx += 1,
-            "match_expression" => cx -= 1, // a match with k arms adds k - 1 paths
-            "binary_expression" if matches!(operator(n), "&&" | "||") => cx += 1,
+    for n in &tree.nodes[body + 1..tree.nodes[body].end as usize] {
+        match n.kind {
+            NodeKind::If | NodeKind::While | NodeKind::Loop | NodeKind::For | NodeKind::Arm | NodeKind::AndOr => cx += 1,
+            NodeKind::Match => cx -= 1, // a match with k arms adds k - 1 paths
             _ => {}
         }
-        true
-    });
+    }
     cx.max(1) as u32
 }
 

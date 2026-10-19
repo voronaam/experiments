@@ -22,14 +22,14 @@ An interactive 3D "software city" for **Java, TypeScript and Rust** code bases. 
   * Footprint = number of attributes.
   * Colour = git churn, recency, author count, open pull requests, complexity, complexity per method, LOC, or type kind.
 
-It is a Java 21 application. It parses Java, TypeScript and Rust with tree-sitter, mines `git log`, and lays the city out with a
-skyline bin-packer. You can view the result in two ways:
+It is a Java 21 application. It parses Java, TypeScript and Rust with its own parsers (no third-party parsing library),
+mines `git log`, and lays the city out with a skyline bin-packer. You can view the result in two ways:
 
 * **Desktop window** (`--gui`): a native JavaFX 3D application. It needs no browser and no internet connection.
 * **Browser viewer** (default): a WebGL page (Three.js) served on localhost, or exported as a single HTML file.
 
 > **Native editions:** [`rust/`](rust/README.md) and [`d/`](d/README.md) are ports with the same CLI, the same
-> output and the same viewers. They are 3–6× faster and use 7–11× less memory.
+> output and the same viewers. They are 3–10× faster and use a fraction of the memory.
 
 ## Run
 
@@ -61,7 +61,7 @@ city. The header shows the language mix.
 
 | | Java | TypeScript (`.ts`, `.tsx`, `.mts`, `.cts`) | Rust (`.rs`) |
 |---|---|---|---|
-| Parser | tree-sitter (Java grammar) | tree-sitter (TypeScript / TSX grammars) | tree-sitter |
+| Parser | in-house (`JavaParse`) | in-house (`TypeScriptParse`, JSX/TSX included) | in-house (`RustParse`) |
 | Districts | packages; build modules (`…/src/main/java`) | directories; one module per `package.json` project | modules; one module per crate (`Cargo.toml`) |
 | Buildings | classes, interfaces, enums, records, annotations | classes, interfaces, enums, type aliases + one **module** building per file | structs, enums, unions, traits + one **module** building per module |
 | Methods | methods and constructors | methods, arrow-function fields, signatures | everything in `impl` blocks anywhere in the crate (trait impls included), trait methods |
@@ -180,9 +180,9 @@ viewers (browser, and the Java, Rust and D desktop windows) behave the same way.
 | | |
 |---|---|
 | `analysis/SourceAnalyzer` | Walks the tree, parses files in parallel with the right `LanguageSupport` (cached by modification time, so watch-mode rebuilds re-parse only what changed), then links each language. |
-| `analysis/JavaAnalyzer` | tree-sitter-java. Computes NOM, NOA, LOC, WMC and dependencies resolved with Java's own name-lookup rules (no classpath needed). |
-| `analysis/TypeScriptAnalyzer`, `RustAnalyzer` | tree-sitter grammars (natives for Linux, macOS and Windows on x86-64 and ARM are bundled in the jar). They resolve imports and `use` paths, and Rust merges `impl` blocks into their types. |
-| `analysis/NativeLibraries` | Loads CodeCity's own `-O2` build of the tree-sitter core library (with the binding's JNI glue patched to cache class and field lookups) instead of the binding's unoptimised one, which made parsing 3-5x slower. `native/build-tree-sitter.sh` rebuilds it for all five platforms with Zig; the results live in `src/main/resources/native/tree-sitter/lib`. |
+| `analysis/JavaParse`, `TypeScriptParse`, `RustParse` | One hand-written parser per language: a lexer plus an error-tolerant structural parser that keeps only what the analysers need (declarations, their spans, member counts, referenced names, decision points) in flat arrays rather than a full syntax tree. A syntax error never stops a file: the parser flags it, skips the tokens it cannot use and carries on, so the file still yields every declaration it could recognise and is counted as failed. Nesting depth is capped, so hostile input cannot overflow the stack. No dependencies, so there is no native code and nothing third-party in the parsing path. |
+| `analysis/JavaAnalyzer` | Computes NOM, NOA, LOC, WMC and dependencies resolved with Java's own name-lookup rules (no classpath needed). |
+| `analysis/TypeScriptAnalyzer`, `RustAnalyzer` | They resolve imports and `use` paths, and Rust merges `impl` blocks into their types. |
 | `github/*` | URL parsing, clone cache, remote detection and the pull-request client (GraphQL with a token, REST without). |
 | `analysis/GitHistory` | One `git log --name-only` pass that collects commits, authors and first/last change per file. |
 | `layout/CityLayout` | Recursive skyline packing that tries several strip widths and keeps the most compact, square result. |

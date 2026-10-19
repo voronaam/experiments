@@ -3,7 +3,7 @@
 ///
 /// This is deliberately not a parser: it is a single left-to-right scan that only has to look right in the source
 /// window, using one keyword list per language and a few lexical rules shared by Java, TypeScript and Rust. It does
-/// not use tree-sitter, so it also copes with files that failed to parse. The output is one `Line` per source line,
+/// not use the analysis parsers, so it also copes with files that failed to parse. The output is one `Line` per source line,
 /// each a list of styled tokens that together reproduce the line's text (a carriage return is dropped when it would
 /// start a token), so the viewer can draw the tokens side by side and number the lines.
 module codecity.gui.source;

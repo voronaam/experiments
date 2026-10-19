@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Fetches pinned sources of the native libraries CodeCity-D links against and builds them into static libraries:
-#   third_party/build/libcodecity_parsers.a  tree-sitter + Java/TypeScript/TSX/Rust grammars (always)
-#   third_party/build/libcodecity_gui.a      GLFW 3.4 (X11) + Dear ImGui 1.92.9 via cimgui (desktop window)
-# Re-running is cheap: sources are downloaded once and libraries are rebuilt only when missing.
+# Fetches pinned sources of the native libraries the desktop window links against and builds them into a static
+# library, plus the fonts it embeds:
+#   third_party/build/libcodecity_gui.a  GLFW 3.4 (X11) + Dear ImGui 1.92.9 via cimgui
+#   third_party/fonts/                   Inter and JetBrains Mono
+# Re-running is cheap: sources are downloaded once and the library is rebuilt only when missing.
 #
-# Environment: NATIVE_CC / NATIVE_CXX (default cc / c++), AR (default ar), X11_INCLUDE (extra header dir for GLFW),
-#              CODECITY_NO_GUI=1 to skip the GUI libraries.
+# Environment: NATIVE_CC / NATIVE_CXX (default cc / c++), AR (default ar), X11_INCLUDE (extra header dir for GLFW).
 #
-# dub runs this as a pre-build command (see dub.json); the `cli` and `unittest` configurations set CODECITY_NO_GUI=1.
-# A library is rebuilt only when its .a file is missing, so delete third_party/build to force a rebuild.
+# dub runs this as a pre-build command of the default `gui` configuration only (see dub.json); the `cli` and
+# `unittest` configurations are pure D and need no native step. Delete third_party/build to force a rebuild.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -31,35 +31,8 @@ fetch() { # name url [strip]
   fi
 }
 
-parsers="$build/libcodecity_parsers.a"
-if [ ! -f "$parsers" ]; then
-  echo "Building tree-sitter parsers…"
-  fetch tree-sitter            https://github.com/tree-sitter/tree-sitter/archive/refs/tags/v0.27.0.tar.gz
-  fetch tree-sitter-java       https://github.com/tree-sitter/tree-sitter-java/archive/refs/tags/v0.23.5.tar.gz
-  fetch tree-sitter-typescript https://github.com/tree-sitter/tree-sitter-typescript/archive/refs/tags/v0.23.2.tar.gz
-  fetch tree-sitter-rust       https://github.com/tree-sitter/tree-sitter-rust/archive/refs/tags/v0.24.2.tar.gz
-  obj="$build/obj-parsers"; mkdir -p "$obj"
-  ts="$third/tree-sitter/lib"
-  # -w silences warnings in the third-party sources; -fPIC allows linking into a position-independent executable.
-  c() { "$cc" -O2 -std=gnu11 -fPIC -w "$@"; }
-  # lib.c is tree-sitter's single-file amalgamation of the runtime.
-  c -I"$ts/include" -I"$ts/src" -c "$ts/src/lib.c" -o "$obj/tree_sitter.o"
-  c -I"$third/tree-sitter-java/src" -c "$third/tree-sitter-java/src/parser.c" -o "$obj/java_parser.o"
-  # The TypeScript repository holds two grammars (TypeScript and TSX), each with a generated parser and a
-  # hand-written external scanner; the Rust grammar has a scanner too, Java has none.
-  for g in typescript tsx; do
-    d="$third/tree-sitter-typescript/$g/src"
-    c -I"$d" -c "$d/parser.c" -o "$obj/${g}_parser.o"
-    c -I"$d" -c "$d/scanner.c" -o "$obj/${g}_scanner.o"
-  done
-  d="$third/tree-sitter-rust/src"
-  c -I"$d" -c "$d/parser.c" -o "$obj/rust_parser.o"
-  c -I"$d" -c "$d/scanner.c" -o "$obj/rust_scanner.o"
-  rm -f "$parsers"; $ar rcs "$parsers" "$obj"/*.o
-fi
-
 gui="$build/libcodecity_gui.a"
-if [ "${CODECITY_NO_GUI:-0}" != "1" ] && [ ! -f "$gui" ]; then
+if [ ! -f "$gui" ]; then
   echo "Building GLFW and Dear ImGui…"
   fetch glfw   https://github.com/glfw/glfw/archive/refs/tags/3.4.tar.gz
   fetch cimgui https://github.com/cimgui/cimgui/archive/refs/tags/1.92.9.tar.gz
@@ -92,7 +65,7 @@ if [ "${CODECITY_NO_GUI:-0}" != "1" ] && [ ! -f "$gui" ]; then
 fi
 
 fonts="$third/fonts"
-if [ "${CODECITY_NO_GUI:-0}" != "1" ] && [ ! -f "$fonts/JetBrainsMono-Regular.ttf" ]; then
+if [ ! -f "$fonts/JetBrainsMono-Regular.ttf" ]; then
   echo "Fetching fonts (Inter, JetBrains Mono — SIL Open Font License)…"
   mkdir -p "$fonts"
   curl -fsSL -o "$fonts/Inter.ttf" https://raw.githubusercontent.com/rsms/inter/v4.1/docs/font-files/InterVariable.ttf

@@ -3,7 +3,7 @@
 //! The pipeline, and the module for each step:
 //!
 //! ```text
-//!   walk + parse/analyse ─ analysis   (tree-sitter, in parallel, cached per file)
+//!   walk + parse/analyse ─ analysis   (in-house parsers, in parallel, cached per file)
 //!   link dependencies    ─ analysis::{java,typescript,rust_lang}::link
 //!   git history          ─ git        (runs on its own thread while the sources are parsed)
 //!   history replay       ─ history    (optional: the city at sampled commits, --history)

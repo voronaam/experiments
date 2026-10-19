@@ -160,13 +160,6 @@ class JavaAnalyzerTest {
     }
 
     @Test
-    void usesTheOptimisedTreeSitterLibrary() {
-        Syntax.parser(org.treesitter.TreeSitterJava::new);
-        String dir = System.getProperty("tree-sitter-lib");
-        assertTrue(dir != null && Files.isDirectory(Path.of(dir, "lib")), "tree-sitter-lib = " + dir);
-    }
-
-    @Test
     void resolvesProjectDependenciesOnly() throws IOException {
         write("src/main/java/a/A.java", """
                 package a;
@@ -216,7 +209,7 @@ class JavaAnalyzerTest {
     }
 
     @Test
-    void linesFollowTreeSitterRowsAndTrailingBlockComments() throws IOException {
+    void linesBreakAtNewlinesOnlyAndTrailingBlockCommentsCount() throws IOException {
         // A lone \r is not a line break; the comment opened after `int x;` hides the next line.
         write("src/main/java/a/A.java", "package a;\rclass A {\n  int x; /* start\n  comment\n  end */\n  int y;\n}\n");
         TypeInfo t = analyze().types().getFirst();

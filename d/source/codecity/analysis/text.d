@@ -12,7 +12,7 @@ immutable string[] testDirs = ["test", "tests", "it", "androidTest", "testFixtur
 /// Splits on `\n` only, keeping trailing empty lines.
 ///
 /// Element `i` of the result is source line `i + 1`, so `countLoc` can index it with the 1-based line numbers from
-/// `firstLine`/`lastLine`. tree-sitter starts a new row only at `\n`, so a lone `\r` (classic Mac line ending) does
+/// `firstLine`/`lastLine`. The parsers start a new line only at `\n`, so a lone `\r` (classic Mac line ending) does
 /// not break the line, and the `\r` of a `\r\n` stays at the end of its line, where `countLoc`'s `strip` drops it.
 /// The lines are slices of `code`, not copies.
 string[] lines(string code) pure nothrow @safe
@@ -125,7 +125,7 @@ unittest
     assert(countLoc(lines("a\n\n// c\n/* x\n y */ b\n/* z */\nc /* d */"), 1, 7) == 3);
     // A block comment opened after code hides the following lines; "/*" inside literals opens nothing.
     assert(countLoc(lines("int x; /* start\n still comment\nend */\ny = \"/*\" + '\"'; /* a */ z;\nw;"), 1, 5) == 3);
-    // Only \n starts a new row, as in tree-sitter (and in JavaParser, which the Java edition feeds lone \r as spaces).
+    // Only \n starts a new line, as in the parsers.
     assert(lines("a\r\nb\rc\n") == ["a\r", "b\rc", ""]);
     assert(lines("") == [""]);
     assert(inTestDirectory("src/test/java/A.java") && !inTestDirectory("A.java"));

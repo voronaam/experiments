@@ -1,5 +1,6 @@
-/// TypeScript support (tree-sitter). Directories are districts; classes, interfaces, enums and type aliases are
-/// buildings; each file's top-level functions and constants form one "module" building named after the file.
+/// TypeScript support, parsed with the in-house `codecity.analysis.typescript_parse` (a port of the Rust edition's
+/// parser, so both report the same metrics). Directories are districts; classes, interfaces, enums and type aliases
+/// are buildings; each file's top-level functions and constants form one "module" building named after the file.
 ///
 /// Naming: a type's fqn is `<path relative to root>:<name>` (`src/ui/App.tsx:App`), a module building's fqn is the
 /// bare path (`src/ui/App.tsx`). The district (`pkg`) is the file's directory relative to the nearest `package.json`,
@@ -13,9 +14,9 @@ module codecity.analysis.typescript;
 
 import codecity.analysis : Context, Linked, ParsedFile;
 import codecity.analysis.java : relativeTo;
-import codecity.analysis.syntax;
 import codecity.analysis.text;
-import codecity.c.treesitter;
+import codecity.analysis.typescript_parse : DECISION, Field, none, NodeKind, REF, Tree;
+import tsparse = codecity.analysis.typescript_parse;
 import codecity.model;
 import core.sync.mutex : Mutex;
 import std.algorithm : canFind, endsWith, startsWith;
@@ -25,14 +26,9 @@ import std.path : baseName, buildPath, dirName;
 import std.string : lastIndexOf;
 import std.utf : count;
 
-/// Node kinds of a function used as a value (`const f = () => …`, `x = function () {}`, `function*` generators).
-private immutable string[] functionValues = ["arrow_function", "function_expression", "function", "generator_function"];
-/// Node kinds that are one decision point each. `for_in_statement` covers `for…in` and `for…of`; `switch_case` is a
-/// `case` clause only (`default:` is a separate switch_default node and does not count).
-private immutable string[] decisions = [
-    "if_statement", "for_statement", "for_in_statement", "while_statement", "do_statement", "switch_case",
-    "catch_clause", "ternary_expression",
-];
+/// Node kinds of function values: a `const f = () => …` declarator or a class field holding one is treated as a
+/// function / method rather than an attribute.
+private immutable NodeKind[] functionValues = [NodeKind.arrow, NodeKind.functionExpr, NodeKind.generatorExpr];
 private immutable string[] sourceExts = [".ts", ".tsx", ".mts", ".cts"];
 
 /// Whether a file name is a TypeScript source file. Declaration files (`.d.ts` etc.) only describe code that lives
@@ -81,37 +77,32 @@ final class TsContext : Context
     string defaultExport;
 }
 
-/// Analyses one TypeScript file. `.tsx` files need the TSX grammar (JSX syntax), every other extension uses the
-/// plain TypeScript grammar; each has its own cached parser.
+/// Analyses one TypeScript file. `.tsx` enables JSX: in plain TypeScript `<T>x` is a type assertion, in TSX it is
+/// JSX.
 ParsedFile parse(string root, string file, string code)
 {
-    const tsx = file.endsWith(".tsx");
-    auto tree = tsx ? codecity.analysis.syntax.parse("tsx", &tree_sitter_tsx, code)
-        : codecity.analysis.syntax.parse("typescript", &tree_sitter_typescript, code);
-    if (tree is null) return ParsedFile(null, null, true);
-    scope (exit) ts_tree_delete(tree);
+    auto tree = tsparse.parse(code, file.endsWith(".tsx"));
     auto relative = relativeTo(file, root);
     const project = projectOf(root, file.dirName);
     const pkg = packageOf(project, relative);
     const fileName = file.baseName;
-    auto st = new FileState(Src(code), lines(code), file, relative, pkg, project,
+    auto st = new FileState(tree, lines(code), file, relative, pkg, project,
         inTestDirectory(relative) || isTestFile(fileName));
-    auto rootNode = ts_tree_root_node(tree);
-    st.visitStatements(rootNode, "");
+    st.visitStatements(tree.root, "");
     st.finishModule(fileName);
     auto ctx = new TsContext;
     ctx.path = st.path;
     ctx.imports = st.imports;
     ctx.names = st.names;
     ctx.defaultExport = st.defaultExport;
-    return ParsedFile(st.types, ctx, ts_node_has_error(rootNode));
+    return ParsedFile(st.types, ctx, tree.hasError);
 }
 
 /// Everything collected while walking one file. A class rather than a struct so that the nested methods can all
 /// add to the same lists.
 private final class FileState
 {
-    Src src;
+    Tree tree;
     string[] lines;
     string file, path, pkg, module_;
     bool test;
@@ -127,9 +118,9 @@ private final class FileState
     string[] moduleNames;
     uint moduleAttributes, moduleLoc;
 
-    this(Src src, string[] lines, string file, string path, string pkg, string module_, bool test)
+    this(Tree tree, string[] lines, string file, string path, string pkg, string module_, bool test)
     {
-        this.src = src;
+        this.tree = tree;
         this.lines = lines;
         this.file = file;
         this.path = path;
@@ -138,50 +129,57 @@ private final class FileState
         this.test = test;
     }
 
-    uint loc(TSNode n) { return countLoc(lines, firstLine(n), lastLine(n)); }
+    uint loc(uint n) { return countLoc(lines, tree.firstLine(n), tree.lastLine(n)); }
+
+    /// Text of the child of `n` with the given field, or "". Like every text kept in the results, it is a copy,
+    /// so the parse cache does not keep whole source files alive.
+    string fieldText(uint n, Field f)
+    {
+        const c = tree.field(n, f);
+        return c == none ? "" : tree.text(c).idup;
+    }
 
     /// Handles the statements of the program or of a namespace body. `prefix` is the enclosing namespace path
     /// (`NS.Inner.`), prepended to every declared name.
     ///
     /// Statements are unwrapped to the declaration they contain:
     ///   import …                  → recorded for linking
-    ///   export [default] <decl>   → the declaration (remembered as default export when `default` is present)
-    ///   export default <expr>     → see exportDefaultExpression; `export { a }` and re-exports are ignored
-    ///   declare <decl>            → ambient_declaration; its first named child is the declaration
-    ///   namespace X { … }         → the grammar wraps it in an expression_statement around an internal_module
-    ///   any other expression      → top-level code of the module building (addStatement)
-    void visitStatements(TSNode container, string prefix)
+    ///   export [default] <decl>   → the declaration (field `decl`; remembered as default export for `default`)
+    ///   export default <expr>     → see exportDefaultExpression (field `value`); `export { a }` and re-exports
+    ///                               have neither and are ignored, as is `export declare …` (an ambient declaration
+    ///                               inside an export, which is not unwrapped)
+    ///   declare <decl>            → `ambient`; its first child is the declaration
+    ///   any expression statement  → top-level code of the module building (addStatement)
+    void visitStatements(uint container, string prefix)
     {
-        foreach (c; namedChildren(container))
+        foreach (c; tree.children(container))
         {
-            TSNode decl = c;
+            uint decl = c;
             bool isDefault;
-            switch (kind(c))
+            switch (tree.kind(c))
             {
-            case "import_statement":
+            case NodeKind.import_:
                 addImport(c);
                 continue;
-            case "export_statement":
-                // `default` is an anonymous keyword token, so look at all children, not just named ones.
-                foreach (x; children(c)) if (kind(x) == "default") isDefault = true;
-                auto d = child(c, "declaration");
-                if (isNull(d))
+            case NodeKind.export_, NodeKind.exportDefault:
+                isDefault = tree.kind(c) == NodeKind.exportDefault;
+                const d = tree.field(c, Field.decl);
+                if (d == none)
                 {
-                    auto value = child(c, "value");
-                    if (!isNull(value) && isDefault) exportDefaultExpression(value);
+                    const value = tree.field(c, Field.value);
+                    if (value != none && isDefault) exportDefaultExpression(value);
                     continue;
                 }
                 decl = d;
                 break;
-            case "ambient_declaration", "expression_statement":
-                if (ts_node_named_child_count(c) == 0) continue;
-                decl = ts_node_named_child(c, 0);
-                if (kind(c) == "expression_statement" && kind(decl) != "internal_module")
-                {
-                    addStatement(c, decl);
-                    continue;
-                }
+            case NodeKind.ambient:
+                if (tree.children(c).length == 0) continue;
+                decl = tree.children(c)[0];
                 break;
+            case NodeKind.exprStmt:
+                if (tree.children(c).length == 0) continue;
+                addStatement(c, tree.children(c)[0]);
+                continue;
             default:
                 break;
             }
@@ -195,73 +193,73 @@ private final class FileState
     /// Classes, interfaces, enums and type aliases become buildings. Functions and `const`/`let`/`var` declarations
     /// go into the file's module building: a variable holding a function counts as a function (method), one
     /// holding a class expression as a class, any other variable as an attribute of the module. Namespaces
-    /// (`internal_module`, and `module` for `declare module "x"`) are not buildings: their contents are visited
+    /// (`namespace X {}`, `module X {}`, `declare module "x" {}`) are not buildings: their contents are visited
     /// with the namespace name as prefix. Returns null when nothing nameable was declared.
-    string declaration(TSNode decl, string prefix)
+    string declaration(uint decl, string prefix)
     {
-        switch (kind(decl))
+        switch (tree.kind(decl))
         {
-        // "class" is a class expression; addClass skips it (returns null) when it has no name.
-        case "class_declaration", "abstract_class_declaration", "class":
+        // A class expression without a name is skipped by addClass (it returns null).
+        case NodeKind.classDecl, NodeKind.abstractClassDecl, NodeKind.classExpr:
             return addClass(decl, prefix, null);
-        case "interface_declaration":
-            const name = prefix ~ src.fieldText(decl, "name");
+        case NodeKind.interface_:
+            const name = prefix ~ fieldText(decl, Field.name);
             MethodInfo[] methods;
-            const attributes = countMembers(child(decl, "body"), methods);
+            const attributes = countMembers(tree.field(decl, Field.body_), methods);
             addType(name, "interface", decl, attributes, methods);
             return name;
-        case "enum_declaration":
-            const name = prefix ~ src.fieldText(decl, "name");
-            auto b = child(decl, "body");
-            // Every enum member is an attribute; comment nodes in the body are not members.
-            addType(name, "enum", decl, isNull(b) ? 0 : countNamed(b), null);
+        case NodeKind.enum_:
+            const name = prefix ~ fieldText(decl, Field.name);
+            const b = tree.field(decl, Field.body_);
+            // Every enum member is an attribute.
+            addType(name, "enum", decl, b == none ? 0 : cast(uint) tree.children(b).length, null);
             return name;
-        case "type_alias_declaration":
-            const name = prefix ~ src.fieldText(decl, "name");
+        case NodeKind.typeAlias:
+            const name = prefix ~ fieldText(decl, Field.name);
             MethodInfo[] methods;
-            auto v = child(decl, "value");
+            const v = tree.field(decl, Field.value);
             // Only an object type literal (`type P = { x: number }`) has members; unions, mapped types etc. have none.
-            const attributes = !isNull(v) && kind(v) == "object_type" ? countMembers(v, methods) : 0;
+            const attributes = v != none && tree.kind(v) == NodeKind.objectType ? countMembers(v, methods) : 0;
             addType(name, "type", decl, attributes, methods);
             return name;
-        case "function_declaration", "generator_function_declaration":
-            const name = prefix ~ src.fieldText(decl, "name");
+        case NodeKind.functionDecl, NodeKind.generatorDecl:
+            const name = prefix ~ fieldText(decl, Field.name);
             addFunction(name, decl, decl);
             moduleLoc += loc(decl);
             return name;
-        case "lexical_declaration", "variable_declaration":
+        case NodeKind.varDecl:
             // The statement's lines count once for the module building, however many declarators it has.
             string last;
             bool free;
-            foreach (d; namedChildren(decl))
+            foreach (d; tree.children(decl))
             {
-                if (kind(d) != "variable_declarator") continue;
-                const simple = src.fieldText(d, "name").idup;
+                if (tree.kind(d) != NodeKind.declarator) continue;
+                const simple = fieldText(d, Field.name);
                 const name = prefix ~ simple;
-                auto v = child(d, "value");
-                if (!isNull(v) && functionValues.canFind(kind(v)))
+                const v = tree.field(d, Field.value);
+                if (v != none && functionValues.canFind(tree.kind(v)))
                 {
                     addFunction(name, v, decl);
                     free = true;
                 }
                 // `const Foo = class {}`: an anonymous class takes the variable's name.
-                else if (!isNull(v) && kind(v) == "class") addClass(v, prefix, simple);
+                else if (v != none && tree.kind(v) == NodeKind.classExpr) addClass(v, prefix, simple);
                 else
                 {
                     moduleAttributes++;
                     moduleNames ~= name;
-                    collectRefs(src, decl, moduleRefs);
+                    collectRefs(tree, decl, moduleRefs);
                     free = true;
                 }
                 last = name;
             }
             if (free) moduleLoc += loc(decl);
             return last;
-        case "internal_module", "module":
+        case NodeKind.module_:
             // `declare module "lib"` has a string literal as its name; drop the quotes.
-            const name = src.fieldText(decl, "name").replace("'", "").replace("\"", "");
-            auto body_ = child(decl, "body");
-            if (!isNull(body_)) visitStatements(body_, prefix ~ name ~ ".");
+            const name = fieldText(decl, Field.name).replace("'", "").replace("\"", "");
+            const body_ = tree.field(decl, Field.body_);
+            if (body_ != none) visitStatements(body_, prefix ~ name ~ ".");
             return null;
         default:
             return null;
@@ -269,20 +267,21 @@ private final class FileState
     }
 
     /// `export default <expression>`: an identifier names an existing declaration; an anonymous function or class
-    /// is recorded under the name "default" so that `import X from "./file"` can still find it.
-    void exportDefaultExpression(TSNode value)
+    /// is recorded under the name "default" so that `import X from "./file"` can still find it. Other expressions
+    /// are not tracked.
+    void exportDefaultExpression(uint value)
     {
-        switch (kind(value))
+        switch (tree.kind(value))
         {
-        case "identifier":
-            defaultExport = src.text(value).idup;
+        case NodeKind.ident:
+            defaultExport = tree.text(value).idup;
             break;
-        case "arrow_function", "function_expression", "function":
+        case NodeKind.arrow, NodeKind.functionExpr:
             addFunction("default", value, value);
             moduleLoc += loc(value);
             defaultExport = "default";
             break;
-        case "class":
+        case NodeKind.classExpr:
             defaultExport = addClass(value, "", "default");
             break;
         default:
@@ -294,40 +293,33 @@ private final class FileState
     ///   import A from "m"              → Import("A", "m", "default")
     ///   import * as NS from "m"        → Import("NS", "m", "*")
     ///   import { a, b as c } from "m"  → Import("a", "m", "a"), Import("c", "m", "b")
-    /// Side-effect imports (`import "m"`) have no clause and bind nothing. Type-only imports are treated alike.
-    void addImport(TSNode stmt)
+    /// Side-effect imports (`import "m"`) bind nothing, and `import x = require("m")` has no source. Type-only
+    /// imports are treated alike.
+    void addImport(uint stmt)
     {
-        auto source = child(stmt, "source");
-        if (isNull(source)) return;
+        const source = tree.field(stmt, Field.source);
+        if (source == none) return;
         // The source is a string literal; strip its quotes.
-        string from = src.text(source).idup;
+        string from = tree.text(source).idup;
         while (from.length && (from[0] == '\'' || from[0] == '"' || from[0] == '`')) from = from[1 .. $];
         while (from.length && (from[$ - 1] == '\'' || from[$ - 1] == '"' || from[$ - 1] == '`')) from = from[0 .. $ - 1];
-        foreach (clause; namedChildren(stmt))
+        foreach (part; tree.children(stmt))
         {
-            if (kind(clause) != "import_clause") continue;
-            foreach (part; namedChildren(clause))
+            switch (tree.kind(part))
             {
-                switch (kind(part))
-                {
-                case "identifier":
-                    imports ~= Import(src.text(part).idup, from, "default");
-                    break;
-                case "namespace_import":
-                    foreach (id; namedChildren(part)) imports ~= Import(src.text(id).idup, from, "*");
-                    break;
-                case "named_imports":
-                    foreach (spec; namedChildren(part))
-                    {
-                        if (kind(spec) != "import_specifier") continue;
-                        const name = src.fieldText(spec, "name").idup;
-                        auto alias_ = child(spec, "alias");
-                        imports ~= Import(isNull(alias_) ? name : src.text(alias_).idup, from, name);
-                    }
-                    break;
-                default:
-                    break;
-                }
+            case NodeKind.importDefault:
+                imports ~= Import(tree.text(part).idup, from, "default");
+                break;
+            case NodeKind.importNamespace:
+                foreach (id; tree.children(part)) imports ~= Import(tree.text(id).idup, from, "*");
+                break;
+            case NodeKind.importSpecifier:
+                const name = fieldText(part, Field.name);
+                const alias_ = tree.field(part, Field.alias_);
+                imports ~= Import(alias_ == none ? name : tree.text(alias_).idup, from, name);
+                break;
+            default:
+                break;
             }
         }
     }
@@ -349,11 +341,11 @@ private final class FileState
         return id;
     }
 
-    void addType(string name, string kind_, TSNode decl, uint noa, MethodInfo[] methods)
+    void addType(string name, string kind_, uint decl, uint noa, MethodInfo[] methods)
     {
         bool[string] refs;
-        collectRefs(src, decl, refs);
-        const begin = firstLine(decl), end = lastLine(decl);
+        collectRefs(tree, decl, refs);
+        const begin = tree.firstLine(decl), end = tree.lastLine(decl);
         TypeDecl t;
         t.language = Language.typescript;
         t.fqn = id(name, kind_);
@@ -377,34 +369,34 @@ private final class FileState
     ///
     /// Methods: method definitions, abstract/overload signatures (complexity 1, no body) and fields holding
     /// functions (`onClick = () => …`). Attributes: all other fields plus constructor parameter properties.
-    string addClass(TSNode decl, string prefix, string fallback)
+    string addClass(uint decl, string prefix, string fallback)
     {
-        auto nameNode = child(decl, "name");
+        const nameNode = tree.field(decl, Field.name);
         string simple;
-        if (!isNull(nameNode)) simple = src.text(nameNode).idup;
+        if (nameNode != none) simple = tree.text(nameNode).idup;
         else if (fallback !is null) simple = fallback;
         else return null;
         const name = prefix ~ simple;
         MethodInfo[] methods;
         uint attributes;
-        auto body_ = child(decl, "body");
-        if (!isNull(body_))
+        const body_ = tree.field(decl, Field.body_);
+        if (body_ != none)
         {
-            foreach (member; namedChildren(body_))
+            foreach (member; tree.children(body_))
             {
-                switch (kind(member))
+                switch (tree.kind(member))
                 {
-                case "method_definition":
-                    methods ~= method(member, child(member, "name"), member, true);
-                    if (src.fieldText(member, "name") == "constructor") attributes += parameterProperties(member);
+                case NodeKind.methodDef:
+                    methods ~= method(member, tree.field(member, Field.name), member);
+                    if (fieldText(member, Field.name) == "constructor") attributes += parameterProperties(tree, member);
                     break;
-                case "abstract_method_signature", "method_signature":
-                    methods ~= method(member, child(member, "name"), member, false);
+                case NodeKind.methodSig:
+                    methods ~= method(member, tree.field(member, Field.name), none);
                     break;
-                case "public_field_definition":
-                    auto v = child(member, "value");
-                    if (!isNull(v) && functionValues.canFind(kind(v)))
-                        methods ~= method(v, child(member, "name"), member, true);
+                case NodeKind.fieldDef:
+                    const v = tree.field(member, Field.value);
+                    if (v != none && functionValues.canFind(tree.kind(v)))
+                        methods ~= method(v, tree.field(member, Field.name), member);
                     else
                         attributes++;
                     break;
@@ -413,26 +405,26 @@ private final class FileState
                 }
             }
         }
-        addType(name, kind(decl) == "abstract_class_declaration" ? "abstract" : "class", decl, attributes, methods);
+        addType(name, tree.kind(decl) == NodeKind.abstractClassDecl ? "abstract" : "class", decl, attributes, methods);
         return name;
     }
 
     /// Members of an interface body or object type literal: property signatures are attributes; method, call
     /// (`(x: T): U`) and construct (`new (x: T): U`) signatures are methods without a body. Returns the number of
-    /// attributes and appends the methods.
-    uint countMembers(TSNode body_, ref MethodInfo[] methods)
+    /// attributes and appends the methods. `body_` may be `none`.
+    uint countMembers(uint body_, ref MethodInfo[] methods)
     {
-        if (isNull(body_)) return 0;
+        if (body_ == none) return 0;
         uint attributes;
-        foreach (m; namedChildren(body_))
+        foreach (m; tree.children(body_))
         {
-            switch (kind(m))
+            switch (tree.kind(m))
             {
-            case "property_signature":
+            case NodeKind.propertySig:
                 attributes++;
                 break;
-            case "method_signature", "call_signature", "construct_signature":
-                methods ~= method(m, child(m, "name"), m, false);
+            case NodeKind.methodSig, NodeKind.callSig, NodeKind.constructSig:
+                methods ~= method(m, tree.field(m, Field.name), none);
                 break;
             default:
                 break;
@@ -441,56 +433,57 @@ private final class FileState
         return attributes;
     }
 
-    /// `measured`: whether `body_` is measured for complexity (signatures have no body: complexity 1).
-    ///
-    /// `node` is the function-like node (its LOC and parameters are measured); `nameNode` may be null, giving
-    /// "(anonymous)". Parameters come from the `parameters` field; a single unparenthesised arrow parameter
-    /// (`x => …`) is the `parameter` field instead. Comment nodes inside the list are not parameters.
-    MethodInfo method(TSNode node, TSNode nameNode, TSNode body_, bool measured)
+    /// `node` is the function-like node (its LOC and parameters are measured); `nameNode` may be `none`, giving
+    /// "(anonymous)"; `body_` is the node whose complexity is measured (`none` for signatures without a body:
+    /// complexity 1). Parameters are the entries of the node's parameter list (an arrow function's single
+    /// unparenthesised parameter counts as one).
+    MethodInfo method(uint node, uint nameNode, uint body_)
     {
-        const name = isNull(nameNode) ? "(anonymous)" : src.text(nameNode).idup;
-        auto params = child(node, "parameters");
-        const parameters = !isNull(params) ? countNamed(params) : (isNull(child(node, "parameter")) ? 0 : 1);
-        return MethodInfo(name, firstLine(node), loc(node), measured ? complexity(body_) : 1, parameters);
+        const name = nameNode == none ? "(anonymous)" : tree.text(nameNode).idup;
+        const params = tree.field(node, Field.params);
+        const parameters = params == none ? 0 : cast(uint) tree.children(params).length;
+        return MethodInfo(name, tree.firstLine(node), loc(node), body_ == none ? 1 : complexity(tree, body_),
+            parameters);
     }
 
     /// Adds a top-level function to the module building. The method's LOC is the function's; the module's
     /// references are collected from the whole declaring statement. The caller adds the statement's lines to the
     /// module's LOC, once per statement.
-    void addFunction(string name, TSNode fn, TSNode statement)
+    void addFunction(string name, uint fn, uint statement)
     {
-        auto m = method(fn, TSNode.init, fn, true);
+        auto m = method(fn, none, fn);
         m.name = name;
         functions ~= m;
         moduleNames ~= name;
-        collectRefs(src, statement, moduleRefs);
+        collectRefs(tree, statement, moduleRefs);
     }
 
     /// Top-level code: `describe("cart", () => …)` or `app.get("/", handler)` becomes a method named after the
     /// call, so test suites and route tables show up; anything else just adds lines and references.
-    void addStatement(TSNode statement, TSNode expression)
+    void addStatement(uint statement, uint expression)
     {
         moduleLoc += loc(statement);
-        collectRefs(src, statement, moduleRefs);
-        if (kind(expression) != "call_expression") return;
-        auto args = child(expression, "arguments");
-        if (isNull(args)) return;
+        collectRefs(tree, statement, moduleRefs);
+        if (tree.kind(expression) != NodeKind.call) return;
+        const args = tree.field(expression, Field.args);
+        if (args == none || tree.kind(args) != NodeKind.args) return; // no arguments, or a tagged template
         bool hasCallback;
         string label;
         bool hasLabel;
-        foreach (arg; namedChildren(args))
+        foreach (arg; tree.children(args))
         {
-            if (functionValues.canFind(kind(arg))) hasCallback = true;
-            if (!hasLabel && (kind(arg) == "string" || kind(arg) == "template_string"))
+            if (functionValues.canFind(tree.kind(arg))) hasCallback = true;
+            if (!hasLabel && (tree.kind(arg) == NodeKind.str || tree.kind(arg) == NodeKind.template_))
             {
-                label = src.text(arg).idup;
+                label = tree.text(arg);
                 hasLabel = true;
             }
         }
         if (!hasCallback) return;
         // The method name is e.g. `describe("cart")`, using the first string argument verbatim (with its quotes),
         // shortened to 47 code points plus an ellipsis when longer than 48 so names stay readable in the viewer.
-        const callee = src.fieldText(expression, "function");
+        const kids = tree.children(expression);
+        const callee = kids.length ? tree.text(kids[0]) : "";
         if (label.count > 48)
         {
             import std.range : take;
@@ -498,13 +491,14 @@ private final class FileState
             label = label.take(47).to!string ~ "…";
         }
         // Complexity covers all arguments, so it includes the callback bodies.
-        functions ~= MethodInfo(callee ~ "(" ~ label ~ ")", firstLine(statement), loc(statement), complexity(args), 0);
+        functions ~= MethodInfo(callee ~ "(" ~ label ~ ")", tree.firstLine(statement), loc(statement),
+            complexity(tree, args), 0);
     }
 
     /// Emits the module building, unless the file has no top-level functions, variables or expression statements.
     /// It spans the whole file, but its LOC counts only those (other statements such as a top-level `if` are not
     /// visited at all). Module names not already claimed by a type are registered in `names`, pointing at the
-    /// module building.
+    /// module building, only now, so a type and a function with the same name resolve to the type.
     void finishModule(string fileName)
     {
         if (functions.length == 0 && moduleAttributes == 0 && moduleLoc == 0) return;
@@ -529,57 +523,38 @@ private final class FileState
     }
 }
 
-/// Constructor parameters with an accessibility modifier (`private x: T`) declare fields. A `readonly` child node is
-/// accepted as well; a parameter counts once however many of them it has.
-private uint parameterProperties(TSNode constructor)
+/// Constructor parameters with an accessibility modifier (`private x: T`) declare fields. (`readonly` alone does
+/// too in TypeScript, but is not counted, to keep the metric stable across CodeCity versions.)
+private uint parameterProperties(ref const Tree tree, uint constructor)
 {
-    auto params = child(constructor, "parameters");
-    if (isNull(params)) return 0;
+    const params = tree.field(constructor, Field.params);
+    if (params == none) return 0;
     uint n;
-    foreach (p; namedChildren(params))
-        foreach (c; namedChildren(p))
-            if (kind(c) == "accessibility_modifier" || kind(c) == "readonly")
-            {
-                n++;
-                break;
-            }
+    foreach (p; tree.children(params))
+        if (tree.kind(p) == NodeKind.paramProperty) n++;
     return n;
 }
 
-/// Named children except comments, which tree-sitter allows between the members of a list.
-private uint countNamed(TSNode n)
+/// Every identifier the parser flagged as a possible reference (`REF`) under `node`, values and types alike:
+/// `new Cart()` and `items: Cart[]` both name `Cart`. Most are locals or members; `link` keeps only names declared
+/// at the top level of the file or imported. Property names (`obj.x`) are not flagged.
+private void collectRefs(ref const Tree tree, uint node, ref bool[string] refs)
 {
-    uint count;
-    foreach (c; namedChildren(n)) if (kind(c) != "comment") count++;
-    return count;
+    foreach (t; tree.tokenStart(node) .. tree.tokenEnd(node))
+        if (tree.tokens[t].flags & REF)
+        {
+            const text = tree.tokenText(t);
+            if (text !in refs) refs[text.idup] = true;
+        }
 }
 
-/// Every identifier in `node`, values and types alike: `new Cart()` and `items: Cart[]` both name `Cart`. Most are
-/// locals or parameters; `link` keeps only names declared at the top level of the file or imported.
-private void collectRefs(ref Src src, TSNode node, ref bool[string] refs)
-{
-    walk(node, (TSNode n) {
-        const k = kind(n);
-        if (k == "type_identifier" || k == "identifier") refs[src.text(n).idup] = true;
-        return true;
-    });
-}
-
-/// Cyclomatic complexity: 1 + the `decisions` nodes + every `&&`, `||` and `??`. Nested functions in `body_`
-/// count towards it too.
-uint complexity(TSNode body_)
+/// McCabe cyclomatic complexity: 1 + decision points (`if`, loops, `case`, `catch`, `?:`, `&&`, `||`, `??`, as
+/// flagged `DECISION` by the parser). Nested functions inside `node` count towards it.
+uint complexity(ref const Tree tree, uint node)
 {
     uint cx = 1;
-    walk(body_, (TSNode n) {
-        const k = kind(n);
-        if (decisions.canFind(k)) cx++;
-        else if (k == "binary_expression")
-        {
-            const op = operator(n);
-            if (op == "&&" || op == "||" || op == "??") cx++;
-        }
-        return true;
-    });
+    foreach (t; tree.tokenStart(node) .. tree.tokenEnd(node))
+        if (tree.tokens[t].flags & DECISION) cx++;
     return cx;
 }
 

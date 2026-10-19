@@ -15,9 +15,8 @@
 ///    qualified names of project types, producing the dependency edges. It always reruns, because a change in one
 ///    file can change what names in other files resolve to.
 ///
-/// The Java and Rust editions have the same structure. All analysers here use tree-sitter (see
-/// `codecity.analysis.syntax`), like the Rust edition; the Java edition parses Java with JavaParser instead, and the
-/// D Java analyser reproduces its metrics.
+/// The Java and Rust editions have the same structure. Each language has its own dependency-free parser
+/// (`codecity.analysis.java_parse`, `typescript_parse`, `rust_parse`), ported from the Rust edition's.
 module codecity.analysis;
 
 import codecity.model;
@@ -166,8 +165,8 @@ final class SourceAnalyzer
             else
                 todo ~= i;
         }
-        // Work units of 4 files. Each worker writes only results[i] for its own i, so no locking is needed; tree-sitter
-        // parsers are per thread (see codecity.analysis.syntax.parse). The cache is updated afterwards, on this thread.
+        // Work units of 4 files. Each worker writes only results[i] for its own i, so no locking is needed; the parsers
+        // keep no shared state. The cache is updated afterwards, on this thread.
         foreach (i; taskPool.parallel(todo, 4))
             results[i] = parseFile(langs[i], root, files[i]);
         foreach (i; todo)

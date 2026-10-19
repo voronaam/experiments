@@ -17,12 +17,14 @@
 //! Languages are linked independently: there are no cross-language dependencies.
 
 pub mod java;
+pub mod java_parse;
 #[cfg(test)]
 mod tests;
 pub mod rust_lang;
-pub mod syntax;
+pub mod rust_parse;
 pub mod text;
 pub mod typescript;
+pub mod typescript_parse;
 
 use crate::model::{Analysis, Language, TypeInfo};
 use rayon::prelude::*;
@@ -314,30 +316,4 @@ fn find_sources(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut manifests = manifests.into_inner().unwrap();
     manifests.sort();
     (files, manifests)
-}
-
-/// Thread-local tree-sitter parser per grammar (parsers are not `Sync`), keyed by grammar name.
-///
-/// Creating a parser and loading a grammar is not free, so each rayon worker keeps one parser per grammar for the life
-/// of the thread and reuses it for every file. `language` is only called the first time a thread needs that grammar.
-/// The TypeScript analyser uses two keys ("typescript" and "tsx"), as `.tsx` files need a different grammar.
-pub fn with_parser<R>(
-    grammar: &'static str,
-    language: impl FnOnce() -> tree_sitter::Language,
-    f: impl FnOnce(&mut tree_sitter::Parser) -> R,
-) -> R {
-    thread_local! {
-        static PARSERS: std::cell::RefCell<HashMap<&'static str, tree_sitter::Parser>> =
-            std::cell::RefCell::new(HashMap::new());
-    }
-    PARSERS.with(|cell| {
-        let mut map = cell.borrow_mut();
-        let parser = map.entry(grammar).or_insert_with(|| {
-            let mut p = tree_sitter::Parser::new();
-            // Fails only if the grammar crate was generated for an incompatible tree-sitter ABI: a build problem.
-            p.set_language(&language()).expect("grammar version compatible with tree-sitter");
-            p
-        });
-        f(parser)
-    })
 }

@@ -3,4 +3,3 @@ target/
 !src/main/resources/web/*.html
 .idea/
 *.iml
-native/.build/

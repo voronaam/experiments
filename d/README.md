@@ -10,7 +10,7 @@ editions:
 
 ```bash
 dub build -b release              # → bin/codecity  (desktop window included)
-dub build -b release -c cli       # CLI + browser viewer only; needs no X11/GL headers
+dub build -b release -c cli       # CLI + browser viewer only; pure D, no native libraries
 ./bin/codecity ~/src/project
 ./bin/codecity --gui --watch ~/src/project
 ./bin/codecity https://github.com/google/gson --export gson.html
@@ -20,17 +20,18 @@ dub test                          # unit tests
 ## Requirements
 
 * **Compiler:** [LDC](https://github.com/ldc-developers/ldc/releases) ≥ 1.43, which includes `dub`.
-* **Build tools:** a C/C++ compiler, `curl` and `tar` (`sudo apt install build-essential curl` on Debian/Ubuntu).
-* **For the desktop window only:** the X11 development headers.
-  `sudo apt install libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev`.
+* **Build tools:** a C toolchain for linking (`sudo apt install build-essential` on Debian/Ubuntu).
+* **For the desktop window only:** a C++ compiler, `curl`, `tar` and the X11 development headers.
+  `sudo apt install curl libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev`.
   At runtime GLFW loads X11 and OpenGL dynamically.
 
-The first build runs `scripts/build-native.sh`. It downloads pinned sources into `third_party/` (git-ignored) and
-builds two static libraries:
+Parsing needs no native code: Java, TypeScript and Rust are read by hand-written D parsers (a lexer plus an
+error-tolerant structural parser per language, ported from the Rust edition's). The `cli` and `unittest`
+configurations are therefore pure D. The default (desktop) configuration first runs `scripts/build-native.sh`, which
+downloads pinned sources into `third_party/` (git-ignored) and builds one static library:
 
 | Library | Contents |
 |---|---|
-| `libcodecity_parsers.a` | tree-sitter 0.27.0, plus the Java 0.23.5, TypeScript/TSX 0.23.2 and Rust 0.24.2 grammars (the same versions the Rust edition uses). |
 | `libcodecity_gui.a` | GLFW 3.4 (X11), and Dear ImGui 1.92.9 via cimgui. The script also fetches the Inter and JetBrains Mono fonts (SIL Open Font License), which are embedded in the binary. |
 
 You can override the tools with `NATIVE_CC`, `NATIVE_CXX`, `AR` and `X11_INCLUDE`; `CC` sets the linker LDC uses.
@@ -41,13 +42,13 @@ Best of three runs, analysing and exporting the whole city with git history:
 
 | Code base | Java | Rust | D |
 |---|---|---|---|
-| google/gson — 721 Java types | 0.92 s · 180 MB | 0.35 s · 17 MB | 0.36 s · 23 MB |
-| colinhacks/zod — 1,761 TypeScript types | 2.07 s · 204 MB | 0.69 s · 31 MB | 0.69 s · 45 MB |
-| BurntSushi/ripgrep — 500 Rust types | 1.28 s · 191 MB | 0.27 s · 23 MB | 0.31 s · 27 MB |
+| google/gson — 721 Java types | 0.63 s · 120 MB | 0.20 s · 15 MB | 0.20 s · 21 MB |
+| colinhacks/zod — 1,761 TypeScript types | 1.51 s · 167 MB | 0.25 s · 22 MB | 0.30 s · 52 MB |
+| BurntSushi/ripgrep — 500 Rust types | 0.88 s · 111 MB | 0.09 s · 13 MB | 0.09 s · 23 MB |
 
 How the D edition gets there:
-* **Parsing:** files are parsed in parallel (`std.parallelism`), with tree-sitter called directly through C bindings
-  and trees walked with a cursor.
+* **Parsing:** files are parsed in parallel (`std.parallelism`) by the in-house parsers, which keep each file's
+  tokens and nodes in flat arrays.
 * **Git:** `git log` runs on its own thread while the parsing happens.
 * **Watch mode:** only files that changed are re-parsed, and changes are picked up via inotify on Linux (with a
   polling fallback elsewhere).
@@ -78,9 +79,8 @@ them. Snapshots go to `~/Pictures` (or the current directory if that doesn't exi
 | | |
 |---|---|
 | `source/app.d` | Command line. |
-| `source/codecity/analysis/` | Source walker and cache (`package.d`), and the analysers `java.d`, `typescript.d`, `rustlang.d`. |
+| `source/codecity/analysis/` | Source walker and cache (`package.d`), and per language a parser (`java_parse.d`, `typescript_parse.d`, `rust_parse.d`) and an analyser (`java.d`, `typescript.d`, `rustlang.d`). |
 | `source/codecity/{layout,city,json}.d` | Skyline layout, the resolved city model, and its JSON form. |
 | `source/codecity/{git,github}.d` | Git history; GitHub URLs, clone cache, permalinks and pull requests (via libcurl). |
 | `source/codecity/{server,htmlexport,watch}.d` | Small HTTP/1.1 server with live-reload events, HTML export, and the file watcher. |
 | `source/codecity/gui/` | GLFW/GL/ImGui bindings, renderer, interface, source highlighter, PNG writer. |
-| `source/codecity/c/treesitter.d` | tree-sitter C API bindings. |

@@ -1,6 +1,6 @@
 # CodeCity — Rust edition
 
-A native port of CodeCity with the same features and the same output, but 3–6× faster and using 7–11× less
+A native port of CodeCity with the same features and the same output, but 3–10× faster and using about 8× less
 memory.
 
 * **Same CLI:** the flags are identical to the Java version.
@@ -16,8 +16,8 @@ cargo build --release                       # → target/release/codecity (one s
 ./target/release/codecity --export city.html .
 ```
 
-The build needs a C compiler, because the tree-sitter grammars are C (on Debian/Ubuntu:
-`sudo apt install build-essential`). For a CLI-only build without the desktop window, which is smaller and quicker to
+The build needs a C compiler, because the TLS library behind the HTTPS client (`ring`) has C and assembly parts (on
+Debian/Ubuntu: `sudo apt install build-essential`). For a CLI-only build without the desktop window, which is smaller and quicker to
 compile, use `cargo build --release --no-default-features`.
 
 ## Performance
@@ -26,19 +26,17 @@ Wall time and peak memory, analysing and exporting the whole city with git histo
 
 | Code base | Java edition | Rust edition |
 |---|---|---|
-| google/gson — 721 Java types | 0.92 s · 180 MB | **0.26 s · 16 MB** |
-| colinhacks/zod — 1,761 TypeScript types | 2.07 s · 204 MB | **0.65 s · 29 MB** |
-| BurntSushi/ripgrep — 500 Rust types | 1.28 s · 191 MB | **0.22 s · 23 MB** |
+| google/gson — 721 Java types | 0.63 s · 120 MB | **0.20 s · 15 MB** |
+| colinhacks/zod — 1,761 TypeScript types | 1.51 s · 167 MB | **0.25 s · 22 MB** |
+| BurntSushi/ripgrep — 500 Rust types | 0.88 s · 111 MB | **0.09 s · 13 MB** |
 
 Where the time goes in the Java edition:
-* **JVM startup and JIT warm-up.**
-* **The JNI tree-sitter bindings:** one native call per syntax-tree node. The Java edition ships its own optimised
-  build of the binding's native library (see [`native/`](../native/build-tree-sitter.sh)), which makes these calls
-  about 10× cheaper than the stock build, but they still cost more than walking the tree natively.
+* **JVM startup and JIT warm-up:** the parsers and analysers run as interpreted bytecode for much of a short run.
+* **Memory:** the JVM's heap and object headers, where the Rust edition keeps tokens and nodes in compact arrays.
 
 The Rust edition instead:
-* parses with native tree-sitter,
-* walks the tree with a cursor (no allocation per node),
+* parses with the same in-house parsers, compiled ahead of time,
+* keeps each file's tokens and nodes in flat arrays (no allocation per node),
 * parses files in parallel (rayon),
 * mines `git log` concurrently with parsing.
 
@@ -47,8 +45,9 @@ Watch-mode rebuilds re-parse only the files that changed.
 ## Parity
 
 Both editions produce identical cities, checked field by field on the code bases above: every building, metric,
-position, district and dependency edge. All editions parse with tree-sitter and the same grammar versions, and the
-analysers are ports of each other. The layout is a line-by-line port, so floating-point results match exactly.
+position, district and dependency edge. All editions parse with their own hand-written parsers (a lexer plus an
+error-tolerant structural parser per language, no third-party parsing library), which, like the analysers, are
+line-by-line ports of each other. The layout is a line-by-line port, so floating-point results match exactly.
 
 ## Desktop mode
 
@@ -73,7 +72,7 @@ Snapshots go to `~/Pictures` (or the current directory if that doesn't exist), a
 
 | | |
 |---|---|
-| `src/analysis/` | Source walker and cache (`mod.rs`), and one tree-sitter analyser per language: `java.rs`, `typescript.rs`, `rust_lang.rs`. |
+| `src/analysis/` | Source walker and cache (`mod.rs`), and per language a parser (`java_parse.rs`, `typescript_parse.rs`, `rust_parse.rs`) and an analyser (`java.rs`, `typescript.rs`, `rust_lang.rs`). |
 | `src/layout.rs` | Skyline bin-packing of districts and buildings. |
 | `src/city.rs`, `src/json.rs` | The resolved city model and its JSON form. |
 | `src/git.rs`, `src/github.rs` | Churn/authors/recency mining; GitHub URLs, clone cache, permalinks and open pull requests. |
