@@ -14,10 +14,9 @@
 //! module by module ([`Resolver`]).
 
 use super::rust_parse::{self, NodeKind, TokKind, Tree, NONE};
-use super::text::{count_loc, lines};
+use super::text::{count_loc, lines, Lines, MAX_FQN_BYTES};
 use super::{Context as AnyContext, Linked, ParsedFile};
 use crate::model::{Language, MethodInfo, TypeInfo};
-use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -25,6 +24,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// Last segment of a module building's fqn. Braces cannot appear in a Rust identifier, so the id never clashes with
 /// a real type name.
 pub const FUNCTIONS: &str = "{fn}";
+
+/// Glob imports (`use a::b::*;`) beyond this many in one module are ignored. A name is tried in each of them, so the
+/// cap keeps a crafted file with very many from making the analysis quadratic; real modules have a handful. The Java
+/// and D editions use the same limit.
+pub const MAX_GLOB_IMPORTS: usize = 64;
 
 /// Name-resolution scope of one module (a file, or an inline `mod x { … }` in it). Scopes do not inherit `use`
 /// declarations from their parent module, just as in Rust.
@@ -105,11 +109,14 @@ pub fn parse(root: &Path, file: &Path, code: &str) -> ParsedFile {
         module: krate.name.clone(),
         types: vec![],
         ctx: Context::default(),
+        skipped: false,
     };
-    let scope = st.add_scope(Scope::new(absolute));
-    let file_name = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    st.visit_items(0, scope, scope, &file_name, test);
-    ParsedFile { types: st.types, context: AnyContext::Rust(st.ctx), failed: tree.errors }
+    if st.fits(&absolute) {
+        let scope = st.add_scope(Scope::new(absolute));
+        let file_name = file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        st.visit_items(0, scope, scope, &file_name, test);
+    }
+    ParsedFile { types: st.types, context: AnyContext::Rust(st.ctx), failed: tree.errors || st.skipped }
 }
 
 /// The directory module paths are relative to: the nearest one (within the crate) holding `lib.rs` or `main.rs`.
@@ -184,32 +191,126 @@ fn crate_cache() -> &'static Mutex<HashMap<PathBuf, Option<String>>> {
     CRATES.get_or_init(Default::default)
 }
 
-/// The `name` in the `[package]` table of `dir/Cargo.toml`, with `-` replaced by `_`.
-///
-/// A regex instead of a TOML parser: from a line starting with `[package]`, match lazily up to the first line that
-/// sets `name`, skipping only lines that do not start with `[` (after indentation), so the match stays inside the
-/// table. A `[` elsewhere on a line (e.g. `authors = ["…"]` listed first) does not stop it.
+/// Largest `Cargo.toml` that is read; a bigger one counts as having no package name. Real manifests are a few KiB;
+/// the cap keeps a crafted one from exhausting memory. The Java and D editions use the same limit.
+pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// The `name` in the `[package]` table of `dir/Cargo.toml`, with `-` replaced by `_`; `None` when the manifest is
+/// missing, unreadable, not valid UTF-8, larger than [`MAX_MANIFEST_BYTES`] or has no package name. Only a regular
+/// file is read: a symbolic link (which could point outside the analysed tree, or at a device such as `/dev/zero`)
+/// counts as missing.
 pub fn read_crate_name(dir: &Path) -> Option<String> {
-    static PACKAGE_NAME: OnceLock<Regex> = OnceLock::new();
-    let re = PACKAGE_NAME.get_or_init(|| {
-        Regex::new(r#"(?m)^\[package\][^\n]*\n(?:[ \t\r]*(?:[^\[\s][^\n]*)?\n)*?[ \t]*name\s*=\s*"([^"]+)""#).unwrap()
-    });
-    let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).ok()?;
-    re.captures(&manifest).map(|c| c[1].replace('-', "_"))
+    let path = dir.join("Cargo.toml");
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_MANIFEST_BYTES {
+        return None;
+    }
+    let manifest = std::fs::read_to_string(&path).ok()?;
+    package_name(&manifest).map(|n| n.replace('-', "_"))
+}
+
+/// The `name = "…"` of the `[package]` table of a `Cargo.toml`. Not a TOML parser, and hand-written rather than a
+/// regular expression so that all three editions run the same scan in time linear in the manifest's size (the Java
+/// edition's backtracking regex recursed once per skipped line).
+///
+/// Starting at each line that begins with `[package]`, the following lines are scanned: the first one of the form
+/// `[ \t]* name \s* = \s* "value"` gives the name (the value may not be empty and ends at the next `"`, even on a later
+/// line). Lines skipped on the way must end with a newline and must not start with `[` after indentation
+/// (`[ \t\r]`), which keeps the search inside the table, as the next table header starts with `[`; a `[` elsewhere on
+/// a line (`authors = ["…"]`) does not stop it. When a `[package]` line yields nothing, the search goes on at the next
+/// one. `\s` is ASCII whitespace and lines end at `\n` only.
+pub fn package_name(toml: &str) -> Option<&str> {
+    let b = toml.as_bytes();
+    let n = b.len();
+    let next_line = |i: usize| b[i..].iter().position(|&c| c == b'\n').map_or(n, |p| i + p + 1);
+    let mut start = 0;
+    while start < n {
+        if b[start..].starts_with(b"[package]") {
+            let mut line = next_line(start);
+            while line < n {
+                if let Some(name) = name_value(toml, line) {
+                    return Some(name);
+                }
+                // Skip the line, unless it would leave the table.
+                let mut i = line;
+                while i < n && matches!(b[i], b' ' | b'\t' | b'\r') {
+                    i += 1;
+                }
+                if i == n || b[i] == b'[' || (b[i] != b'\n' && is_toml_space(b[i])) {
+                    break;
+                }
+                match b[i..].iter().position(|&c| c == b'\n') {
+                    Some(p) => line = i + p + 1,
+                    None => break,
+                }
+            }
+        }
+        start = next_line(start);
+    }
+    None
+}
+
+/// The value of a `[ \t]* name \s* = \s* "value"` at byte `i`, or `None` when there is none.
+fn name_value(s: &str, mut i: usize) -> Option<&str> {
+    let b = s.as_bytes();
+    let n = b.len();
+    while i < n && matches!(b[i], b' ' | b'\t') {
+        i += 1;
+    }
+    if !b[i..].starts_with(b"name") {
+        return None;
+    }
+    i += 4;
+    while i < n && is_toml_space(b[i]) {
+        i += 1;
+    }
+    if i == n || b[i] != b'=' {
+        return None;
+    }
+    i += 1;
+    while i < n && is_toml_space(b[i]) {
+        i += 1;
+    }
+    if i == n || b[i] != b'"' {
+        return None;
+    }
+    let close = i + 1 + b[i + 1..].iter().position(|&c| c == b'"')?;
+    (close > i + 1).then(|| &s[i + 1..close])
+}
+
+/// ASCII whitespace, as `\s` in a Java regular expression: space, `\t \n \x0B \x0C \r`.
+fn is_toml_space(c: u8) -> bool {
+    c == b' ' || (b'\t'..=b'\r').contains(&c)
 }
 
 /// Everything collected while walking one file.
 struct FileState<'a> {
     code: &'a str,
     tree: &'a Tree,
-    lines: Vec<&'a str>,
+    lines: Lines,
     file: &'a Path,
     module: String,
     types: Vec<TypeInfo>,
     ctx: Context,
+    /// Set when a module or building was skipped for the length of its fqn (see [`FileState::fits`]).
+    skipped: bool,
+}
+
+/// The length in bytes of a module path joined with `::`.
+fn path_bytes(path: &[String]) -> usize {
+    path.iter().map(String::len).sum::<usize>() + 2 * path.len().saturating_sub(1)
 }
 
 impl<'a> FileState<'a> {
+    /// Whether the module with this path gets a module building fqn (`path::{fn}`) within [`MAX_FQN_BYTES`]. If not,
+    /// the module and everything in it are skipped, and the file counts as failed; so no fqn of a building inside it
+    /// can be too long either, apart from a single over-long name, which [`FileState::add_type`] checks.
+    fn fits(&mut self, path: &[String]) -> bool {
+        let fits = path_bytes(path) + 2 + FUNCTIONS.len() <= MAX_FQN_BYTES;
+        self.skipped |= !fits;
+        fits
+    }
+
     fn add_scope(&mut self, s: Scope) -> usize {
         self.ctx.scopes.push(s);
         self.ctx.scopes.len() - 1
@@ -307,6 +408,10 @@ impl<'a> FileState<'a> {
                         let mut child = self.ctx.scopes[scope].path.clone();
                         let name = self.name(item);
                         child.push(name.clone());
+                        if !self.fits(&child) {
+                            cfg_test = false;
+                            continue;
+                        }
                         let child_scope = self.add_scope(Scope::new(child));
                         // The module always gets its own scope (its names are `parent::tests::…`), but a cfg(test)
                         // module does not get its own district.
@@ -337,8 +442,8 @@ impl<'a> FileState<'a> {
                 test,
                 methods: functions,
                 references: function_refs,
-                explicit_imports: vec![],
-                wildcard_imports: vec![],
+                explicit_imports: Default::default(),
+                wildcard_imports: Default::default(),
             });
         }
     }
@@ -348,6 +453,10 @@ impl<'a> FileState<'a> {
     fn add_type(&mut self, item: usize, scope: usize, district: usize, kind: &'static str, noa: u32,
                 methods: Vec<MethodInfo>, test: bool) {
         let name = self.name(item);
+        if path_bytes(&self.ctx.scopes[scope].path) + 2 + name.len() > MAX_FQN_BYTES {
+            self.skipped = true;
+            return;
+        }
         let mut refs = HashSet::new();
         collect_refs(self.code, self.tree, item, &mut refs);
         let id = self.fqn(scope, &name);
@@ -367,8 +476,8 @@ impl<'a> FileState<'a> {
             test,
             methods,
             references: refs,
-            explicit_imports: vec![],
-            wildcard_imports: vec![],
+            explicit_imports: Default::default(),
+            wildcard_imports: Default::default(),
         });
     }
 
@@ -436,11 +545,11 @@ impl<'a> FileState<'a> {
                 // A single name, at the top level or inside a `{…}` list.
                 let name = self.tok(node.first).to_string();
                 if name == "self" && !prefix.is_empty() {
-                    self.ctx.scopes[scope].uses.insert(prefix.last().unwrap().clone(), prefix.to_vec()); // a::{self}
+                    self.add_use(scope, prefix.last().unwrap().clone(), prefix.to_vec()); // a::{self}
                 } else {
                     let mut path = prefix.to_vec();
                     path.push(name.clone());
-                    self.ctx.scopes[scope].uses.insert(name, path);
+                    self.add_use(scope, name, path);
                 }
             }
             NodeKind::UsePath => {
@@ -451,7 +560,7 @@ impl<'a> FileState<'a> {
                     path.pop();
                     alias = path.last().cloned().unwrap_or_else(|| "self".into());
                 }
-                self.ctx.scopes[scope].uses.insert(alias, path);
+                self.add_use(scope, alias, path);
             }
             NodeKind::UseAs => {
                 let alias = self.tok(node.name).to_string();
@@ -459,12 +568,16 @@ impl<'a> FileState<'a> {
                 if alias != "_" {
                     let mut path = prefix.to_vec();
                     path.extend(self.segments(self.tree.child(n, NodeKind::UsePath)));
-                    self.ctx.scopes[scope].uses.insert(alias, path);
+                    self.add_use(scope, alias, path);
                 }
             }
             NodeKind::UseGroup => {
                 let mut p = prefix.to_vec();
                 p.extend(self.segments(self.tree.child(n, NodeKind::UsePrefix)));
+                // A group under an over-long prefix only holds over-long paths (see add_use).
+                if path_bytes(&p) > MAX_FQN_BYTES {
+                    return;
+                }
                 for c in self.tree.children(n) {
                     if self.tree.nodes[c].kind != NodeKind::UsePrefix {
                         self.expand_use(c, &p, scope);
@@ -474,9 +587,21 @@ impl<'a> FileState<'a> {
             NodeKind::UseGlob => {
                 let mut path = prefix.to_vec();
                 path.extend(self.segments(self.tree.child(n, NodeKind::UsePrefix)));
-                self.ctx.scopes[scope].globs.push(path);
+                let globs = &mut self.ctx.scopes[scope].globs;
+                if globs.len() < MAX_GLOB_IMPORTS && path_bytes(&path) <= MAX_FQN_BYTES {
+                    globs.push(path);
+                }
             }
             _ => {}
+        }
+    }
+
+    /// Records `use path as alias`, unless the path is longer than [`MAX_FQN_BYTES`]: it is copied into a candidate
+    /// for every reference to the alias, and a group of many names under one long prefix would make that quadratic.
+    /// (Only a path of mostly `super` could still name a building.)
+    fn add_use(&mut self, scope: usize, alias: String, path: Vec<String>) {
+        if path_bytes(&path) <= MAX_FQN_BYTES {
+            self.ctx.scopes[scope].uses.insert(alias, path);
         }
     }
 
@@ -504,7 +629,7 @@ fn collect_refs(code: &str, tree: &Tree, node: usize, refs: &mut HashSet<String>
         let n = tree.nodes[i];
         match n.kind {
             NodeKind::TypeIdent => {
-                refs.insert(tree.tok_text(code, n.first).to_string());
+                add_reference(tree.tok_text(code, n.first).to_string(), refs);
             }
             NodeKind::Ident => add_identifier(tree.tok_text(code, n.first), refs),
             NodeKind::UseAs if n.name != NONE => add_identifier(tree.tok_text(code, n.name), refs),
@@ -512,7 +637,7 @@ fn collect_refs(code: &str, tree: &Tree, node: usize, refs: &mut HashSet<String>
                 add_identifier(tree.tok_text(code, n.first), refs)
             }
             NodeKind::Path | NodeKind::UsePath | NodeKind::UsePrefix => {
-                refs.insert(tree.range_text(code, n.first, n.last).chars().filter(|c| !c.is_whitespace()).collect());
+                add_reference(tree.range_text(code, n.first, n.last).chars().filter(|c| !c.is_whitespace()).collect(), refs);
                 i = n.end as usize; // nothing inside a path is a separate reference
                 continue;
             }
@@ -526,7 +651,15 @@ fn collect_refs(code: &str, tree: &Tree, node: usize, refs: &mut HashSet<String>
 fn add_identifier(s: &str, refs: &mut HashSet<String>) {
     let s = s.strip_prefix('\'').unwrap_or(s);
     if s.chars().next().is_some_and(char::is_uppercase) {
-        refs.insert(s.to_string());
+        add_reference(s.to_string(), refs);
+    }
+}
+
+/// Adds a reference unless it is longer than [`MAX_FQN_BYTES`]: no building's fqn is that long, so it could not
+/// resolve, and resolving it would copy it into every candidate tried.
+fn add_reference(name: String, refs: &mut HashSet<String>) {
+    if name.len() <= MAX_FQN_BYTES {
+        refs.insert(name);
     }
 }
 
@@ -553,9 +686,9 @@ pub fn complexity(tree: &Tree, body: usize) -> u32 {
 ///    every crate name seen.
 /// 2. Attach each impl to the type its `Self` resolves to. Impls of types that are not project types (`impl Display
 ///    for Vec<Foo>`, `impl ForeignTrait for u32`) go to the module building of the module they are written in, which
-///    is created if that module has no free functions. The impl's methods and LOC are added to the target; its trait
-///    and body references become the target's dependencies.
-/// 3. Resolve each type's own references in its scope.
+///    is created if that module has no free functions. The impl's methods and LOC are added to the target.
+/// 3. Resolve, against all buildings including those created in step 2, each impl's trait and body references (they
+///    become its target's dependencies) and each type's own references in its scope.
 pub fn link(files: &[Arc<ParsedFile>]) -> Linked {
     // Every file of this analysis is parsed by now: the next analysis reads the manifests again.
     crate_cache().lock().unwrap().clear();
@@ -592,6 +725,10 @@ pub fn link(files: &[Arc<ParsedFile>]) -> Linked {
     let mut attached: HashMap<String, Vec<&Impl>> = HashMap::new();
     let mut extra_deps: HashMap<String, HashSet<String>> = HashMap::new();
     let mut new_buildings: Vec<(String, &Scope)> = vec![];
+    // impl → its target, in impl order
+    let mut targets: Vec<String> = Vec::with_capacity(impls.len());
+    // crate → build module of the module buildings created for impls
+    let mut module_of_crate: HashMap<String, String> = HashMap::new();
     for (imp, scope, district) in &impls {
         let mut target = resolver.resolve_type(&imp.ty, scope);
         // An impl never belongs to a module building, even if the name resolves to one.
@@ -605,11 +742,17 @@ pub fn link(files: &[Arc<ParsedFile>]) -> Linked {
                 if !by_fqn.contains_key(&id) {
                     // The build module (crate name) is copied from any existing type of the same crate. District and
                     // name are those `visit_items` would have given it (a cfg(test) module keeps its parent's district).
-                    let module = by_fqn
-                        .values()
-                        .find(|t| t.fqn.starts_with(&format!("{}::", scope.krate())))
-                        .map(|t| t.module.clone())
-                        .unwrap_or_default();
+                    // Looked up once per crate rather than once per new module building.
+                    let module = module_of_crate
+                        .entry(scope.krate().to_string())
+                        .or_insert_with(|| {
+                            by_fqn
+                                .values()
+                                .find(|t| t.fqn.starts_with(&format!("{}::", scope.krate())))
+                                .map(|t| t.module.clone())
+                                .unwrap_or_default()
+                        })
+                        .clone();
                     by_fqn.insert(id.clone(), TypeInfo {
                         language: Language::Rust,
                         fqn: id.clone(),
@@ -625,8 +768,8 @@ pub fn link(files: &[Arc<ParsedFile>]) -> Linked {
                         test: imp.test,
                         methods: vec![],
                         references: HashSet::new(),
-                        explicit_imports: vec![],
-                        wildcard_imports: vec![],
+                        explicit_imports: Default::default(),
+                        wildcard_imports: Default::default(),
                     });
                     order.push(id.clone());
                     new_buildings.push((id.clone(), scope));
@@ -635,6 +778,16 @@ pub fn link(files: &[Arc<ParsedFile>]) -> Linked {
             }
         };
         attached.entry(target.clone()).or_default().push(imp);
+        targets.push(target);
+    }
+    for (id, scope) in new_buildings {
+        scopes.insert(id, scope);
+    }
+    // References resolve only now, against every building including the module buildings just created, so that the
+    // result does not depend on the order of the impls (the editions used to differ here).
+    let known: HashSet<String> = by_fqn.keys().cloned().collect();
+    let resolver = Resolver { known: &known, crate_names: &crate_names };
+    for ((imp, scope, _), target) in impls.iter().zip(targets) {
         let deps = extra_deps.entry(target).or_default();
         if let Some(tr) = &imp.tr {
             if let Some(t) = resolver.resolve_type(tr, scope) {
@@ -646,9 +799,6 @@ pub fn link(files: &[Arc<ParsedFile>]) -> Linked {
                 deps.insert(t);
             }
         }
-    }
-    for (id, scope) in new_buildings {
-        scopes.insert(id, scope);
     }
 
     let mut types = Vec::with_capacity(order.len());
@@ -804,6 +954,20 @@ mod tests {
         write(r, "Cargo.toml", "[package]\nname = \"q\"\n");
         write(r, "src/lib.rs", "pub fn helper() {}\npub trait Tr { type Item; }\npub struct S;\nimpl S { fn f<T>(x: <T as Tr>::Item) {} }\n");
         assert!(depends(&analyze(r), "q::S", "q::Tr"));
+    }
+
+    /// Module buildings created for impls (module b has only an impl) are resolvable like any other building: from a
+    /// type declared before them, and from impls attached before or after them. The editions used to differ here.
+    #[test]
+    fn module_buildings_created_for_impls_are_resolvable() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = dir.path();
+        write(r, "Cargo.toml", "[package]\nname = \"k\"\n");
+        write(r, "src/lib.rs", "pub trait Tr {}\npub mod a { impl crate::Tr for u8 { fn f() { crate::b::g(); } } }\npub mod b { impl crate::Tr for u16 { fn f() { crate::b::g(); } } }\npub struct User { f: b::helper }\npub mod c { impl crate::Tr for u32 { fn f() { crate::b::g(); } } }\n");
+        let a = analyze(r);
+        assert!(depends(&a, "k::User", "k::b::{fn}"));
+        assert!(depends(&a, "k::c::{fn}", "k::b::{fn}"));
+        assert!(depends(&a, "k::a::{fn}", "k::b::{fn}"));
     }
 
     #[test]

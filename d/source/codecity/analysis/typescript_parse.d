@@ -942,6 +942,12 @@ private struct Parser
     bool tsx;
     /// Source offsets of `(`/`<` tokens where an arrow function was tried and failed.
     bool[uint] arrowFailed;
+    /// Set once `maxDepth` has been reached anywhere in the file. From then on the parser no longer speculates and
+    /// takes the plain reading of every ambiguity (a comparison rather than type arguments, a parenthesised expression
+    /// or type rather than an arrow function or function type). Input that nests past the cap at each of many
+    /// speculation points (`a < a < a < …`) would otherwise cost up to `maxDepth` steps per token, each re-lexed
+    /// after the rollback; real code never gets near the cap.
+    bool depthCapped;
     /// Offset of the first error outside speculation (see `Tree.firstError`), valid when `hasFirstError`.
     uint firstError;
     bool hasFirstError;
@@ -1187,6 +1193,7 @@ private struct Parser
     {
         if (depth >= maxDepth)
         {
+            depthCapped = true;
             error();
             return false;
         }
@@ -2574,6 +2581,7 @@ private struct Parser
     /// (TypeScript's `canFollowTypeArgumentsInExpression`).
     bool tryTypeArgumentsInExpression()
     {
+        if (depthCapped) return false;
         uint base;
         const s = beginSpec(base);
         typeArguments();
@@ -2828,7 +2836,7 @@ private struct Parser
             if (!generic) return none;
         }
         const start = t.start;
-        if (start in arrowFailed) return none;
+        if (depthCapped || start in arrowFailed) return none;
         uint base;
         const s = beginSpec(base);
         const m = mark();
@@ -3070,7 +3078,7 @@ private struct Parser
     bool tryFunctionType()
     {
         const start = cur().start;
-        if (start in arrowFailed) return false;
+        if (depthCapped || start in arrowFailed) return false;
         uint base;
         const s = beginSpec(base);
         parameters();
@@ -3138,7 +3146,7 @@ private struct Parser
         {
             bump();
             bumpRef();
-            if (atKw("extends") && !cur().nlBefore)
+            if (atKw("extends") && !cur().nlBefore && !depthCapped)
             {
                 // `infer U extends C` – unless the `extends` starts the conditional type around it (TypeScript's
                 // rule: inside the `extends` clause of a conditional type, it is always a constraint)

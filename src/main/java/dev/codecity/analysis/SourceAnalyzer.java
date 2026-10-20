@@ -2,6 +2,7 @@ package dev.codecity.analysis;
 
 import java.io.IOException;
 import java.nio.file.FileVisitResult;
+import java.nio.file.LinkOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
@@ -47,6 +48,13 @@ public final class SourceAnalyzer {
      * the nearest {@code Cargo.toml}, a {@code .ts} file's project from the nearest {@code package.json}.
      */
     private static final Set<String> MANIFESTS = Set.of("Cargo.toml", "package.json");
+
+    /**
+     * Larger source files are not parsed and count as failed (16 MiB, far beyond any hand-written file). Reading and
+     * parsing a file takes memory and time in proportion to its size, so a crafted multi-gigabyte file would otherwise
+     * exhaust the heap or stall the analysis.
+     */
+    public static final long MAX_FILE_BYTES = 16L * 1024 * 1024;
 
     /**
      * A parse result plus the file's modification time (ms) and size when it was parsed. Both must still match for
@@ -189,16 +197,19 @@ public final class SourceAnalyzer {
 
     /**
      * All supported files under {@code root}, sorted; the {@link #MANIFESTS} found on the way are added, sorted, to
-     * {@code manifests}. Symbolic links to directories are not followed (the default of
-     * {@link Files#walkFileTree}), which also rules out cycles; unreadable entries are skipped silently. The root
-     * itself is never treated as ignored, so pointing the tool at e.g. {@code build/} still works.
+     * {@code manifests}. Symbolic links are not followed (the default of {@link Files#walkFileTree}), neither to
+     * directories, which also rules out cycles, nor to files: a link's own attributes say it is not a regular file, so
+     * a link to a file outside the tree is never read. FIFOs, devices and sockets are not regular files either, so
+     * nothing is opened that could block. Unreadable entries are skipped silently, and so are entries whose name is
+     * not valid UTF-8 ({@link #isValidName}). The root itself is never treated as ignored, so pointing the tool at
+     * e.g. {@code build/} still works.
      */
     private List<Path> findSources(Path root, List<Path> manifests) throws IOException {
         List<Path> files = new ArrayList<>();
         Files.walkFileTree(root, new SimpleFileVisitor<>() {
             @Override
             public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
-                if (!dir.equals(root) && isIgnoredDir(dir)) {
+                if (!dir.equals(root) && (isIgnoredDir(dir) || !isValidName(dir))) {
                     return FileVisitResult.SKIP_SUBTREE;
                 }
                 return FileVisitResult.CONTINUE;
@@ -206,6 +217,9 @@ public final class SourceAnalyzer {
 
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                if (!isValidName(file)) {
+                    return FileVisitResult.CONTINUE;
+                }
                 if (attrs.isRegularFile() && supportFor(file) != null) {
                     files.add(file);
                 } else if (attrs.isRegularFile() && MANIFESTS.contains(file.getFileName().toString())) {
@@ -224,6 +238,16 @@ public final class SourceAnalyzer {
         return files;
     }
 
+    /**
+     * False for a file or directory name that is not valid UTF-8. The JDK decodes such a name with U+FFFD in place of
+     * the bad bytes, so the replacement character marks it; a name that really contains U+FFFD is skipped as well,
+     * which the Rust and D editions do too, so all three see the same files. Skipping these names keeps undecodable
+     * bytes out of paths, package names and the JSON.
+     */
+    static boolean isValidName(Path p) {
+        return p.getFileName() == null || p.getFileName().toString().indexOf('\uFFFD') < 0;
+    }
+
     /** True for {@link #IGNORED_DIRS} and hidden directories (but not "." itself); shared with the watcher. */
     public static boolean isIgnoredDir(Path dir) {
         String name = dir.getFileName() == null ? "" : dir.getFileName().toString();
@@ -235,14 +259,20 @@ public final class SourceAnalyzer {
      * common fork-join pool; concurrent calls for different files are safe because each touches only its own cache
      * entry.
      *
-     * <p>Never throws: an unreadable file and an analyser crash both yield an empty, failed result, so one bad file
-     * cannot abort the whole city. Those two outcomes are not cached and are retried on the next analysis, whereas
-     * a file that merely has syntax errors is cached like any other.
+     * <p>Never throws: an unreadable file, a file over {@link #MAX_FILE_BYTES}, a path that is no longer a regular
+     * file (replaced by a link or a FIFO since the walk; the attributes are read without following links) and an
+     * analyser crash all yield an empty, failed result, so one bad file cannot abort the whole city. Those outcomes
+     * are not cached and are retried on the next analysis, whereas a file that merely has syntax errors is cached like
+     * any other.
      */
     private LanguageSupport.ParsedFile parseCached(LanguageSupport lang, Path root, Path file) {
         try {
-            long modified = Files.getLastModifiedTime(file).toMillis();
-            long size = Files.size(file);
+            BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            long modified = attrs.lastModifiedTime().toMillis();
+            long size = attrs.size();
+            if (!attrs.isRegularFile() || size > MAX_FILE_BYTES) {
+                return new LanguageSupport.ParsedFile(file, List.of(), null, true);
+            }
             CacheEntry cached = cache.get(file);
             if (cached != null && cached.modified() == modified && cached.size() == size) {
                 return cached.result();
@@ -252,10 +282,12 @@ public final class SourceAnalyzer {
             return result;
         } catch (IOException e) {
             return new LanguageSupport.ParsedFile(file, List.of(), null, true);
-        } catch (RuntimeException e) {
-            // A bug in an analyser, not a syntax error in the file: report it (once) rather than hide it.
+        } catch (RuntimeException | StackOverflowError e) {
+            // A bug in an analyser, not a syntax error in the file: report it (once) rather than hide it. A stack
+            // overflow is caught too, as a safety net: the parsers cap their recursion, so none is expected, and the
+            // Rust and D editions could not recover from one. Like a panic there, it fails this file only.
             if (reportedFailure.compareAndSet(false, true)) {
-                System.err.println("warning: could not analyse " + file + ": " + e);
+                System.err.println(dev.codecity.CodeCity.printable("warning: could not analyse " + file + ": " + e));
             }
             return new LanguageSupport.ParsedFile(file, List.of(), null, true);
         }

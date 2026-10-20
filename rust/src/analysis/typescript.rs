@@ -15,7 +15,7 @@
 //! per file, the top-level names it declares ([`Context::names`]) and its imports, and [`link`] resolves each
 //! reference by looking in that order, following an import to the file it names (see [`resolve_source`]).
 
-use super::text::{count_loc, in_test_directory, lines};
+use super::text::{count_loc, in_test_directory, lines, Lines, MAX_FQN_BYTES};
 use super::typescript_parse::{self, Field, NodeKind, Tree, DECISION, REF};
 use super::{Context as AnyContext, Linked, ParsedFile};
 use crate::model::{slashes, Language, MethodInfo, TypeInfo};
@@ -86,23 +86,25 @@ pub fn parse(root: &Path, file: &Path, code: &str) -> ParsedFile {
         imports: vec![],
         names: HashMap::new(),
         used_ids: HashSet::new(),
+        next_suffix: HashMap::new(),
         default_export: None,
         functions: vec![],
         module_refs: HashSet::new(),
         module_names: vec![],
         module_attributes: 0,
         module_loc: 0,
+        skipped: false,
     };
     st.visit_statements(tree.root, "");
     st.finish_module(&file_name);
     let ctx = Context { path: st.path.clone(), imports: st.imports, names: st.names, default_export: st.default_export };
-    ParsedFile { types: st.types, context: AnyContext::TypeScript(ctx), failed: tree.has_error }
+    ParsedFile { types: st.types, context: AnyContext::TypeScript(ctx), failed: tree.has_error || st.skipped }
 }
 
 /// Everything collected while walking one file.
 struct FileState<'a> {
     tree: &'a Tree<'a>,
-    lines: Vec<&'a str>,
+    lines: Lines,
     file: &'a Path,
     path: String,
     package: String,
@@ -113,6 +115,8 @@ struct FileState<'a> {
     names: HashMap<String, String>,
     /// fqns handed out so far in this file, to detect duplicate names (see [`FileState::id`]).
     used_ids: HashSet<String>,
+    /// `path:name#kind` → the next suffix number [`FileState::id`] tries for it.
+    next_suffix: HashMap<String, u32>,
     default_export: Option<String>,
     // the file's "module" building: free functions and top-level constants
     functions: Vec<MethodInfo>,
@@ -120,6 +124,8 @@ struct FileState<'a> {
     module_names: Vec<String>,
     module_attributes: u32,
     module_loc: u32,
+    /// Set when a building or namespace was skipped for the length of its fqn (see [`FileState::fits`]).
+    skipped: bool,
 }
 
 impl<'a> FileState<'a> {
@@ -251,8 +257,11 @@ impl<'a> FileState<'a> {
             // `namespace X {}`, `module X {}` and `declare module "x" {}`. Quotes are stripped from string names.
             NodeKind::Module => {
                 let name = self.field_text(decl, Field::Name).replace(['\'', '"'], "");
-                if let Some(body) = tree.field(decl, Field::Body) {
-                    self.visit_statements(body, &format!("{prefix}{name}."));
+                // A namespace whose own name would make every fqn inside too long is skipped as a whole, so the long
+                // prefix is not copied into each name declared in it.
+                let inner = format!("{prefix}{name}.");
+                if let Some(body) = tree.field(decl, Field::Body).filter(|_| self.fits(&inner)) {
+                    self.visit_statements(body, &inner);
                 }
                 None
             }
@@ -316,16 +325,36 @@ impl<'a> FileState<'a> {
         let base = format!("{}:{}", self.path, name);
         let mut id = base.clone();
         // declaration merging: an interface and a class with the same name
-        let mut n = 1;
-        while !self.used_ids.insert(id.clone()) {
-            id = if n == 1 { format!("{base}#{kind}") } else { format!("{base}#{kind}{n}") };
-            n += 1;
+        if !self.used_ids.insert(id.clone()) {
+            let key = format!("{base}#{kind}");
+            // Resume after the last suffix handed out for this name and kind (all before it are taken): starting from
+            // the first every time made many repeated declarations quadratic.
+            let mut n = self.next_suffix.get(&key).copied().unwrap_or(1);
+            loop {
+                id = if n == 1 { key.clone() } else { format!("{key}{n}") };
+                n += 1;
+                if self.used_ids.insert(id.clone()) {
+                    break;
+                }
+            }
+            self.next_suffix.insert(key, n);
         }
         self.names.entry(name.to_string()).or_insert_with(|| id.clone());
         id
     }
 
+    /// Whether a building named `name` (namespace prefix included) gets an fqn (`path:name`, before any `#kind`
+    /// suffix) within [`MAX_FQN_BYTES`]. If not, it is skipped and the file counts as failed.
+    fn fits(&mut self, name: &str) -> bool {
+        let fits = self.path.len() + 1 + name.len() <= MAX_FQN_BYTES;
+        self.skipped |= !fits;
+        fits
+    }
+
     fn add_type(&mut self, name: &str, kind: &'static str, decl: u32, noa: u32, methods: Vec<MethodInfo>) {
+        if !self.fits(name) {
+            return;
+        }
         let mut refs = HashSet::new();
         collect_refs(self.tree, decl, &mut refs);
         let begin = self.tree.first_line(decl);
@@ -346,8 +375,8 @@ impl<'a> FileState<'a> {
             test: self.test,
             methods,
             references: refs,
-            explicit_imports: vec![],
-            wildcard_imports: vec![],
+            explicit_imports: Default::default(),
+            wildcard_imports: Default::default(),
         });
     }
 
@@ -480,6 +509,10 @@ impl<'a> FileState<'a> {
         if self.functions.is_empty() && self.module_attributes == 0 && self.module_loc == 0 {
             return;
         }
+        if self.path.len() > MAX_FQN_BYTES {
+            self.skipped = true;
+            return;
+        }
         let id = self.path.clone();
         self.used_ids.insert(id.clone());
         for n in std::mem::take(&mut self.module_names) {
@@ -500,8 +533,8 @@ impl<'a> FileState<'a> {
             test: self.test,
             methods: std::mem::take(&mut self.functions),
             references: std::mem::take(&mut self.module_refs),
-            explicit_imports: vec![],
-            wildcard_imports: vec![],
+            explicit_imports: Default::default(),
+            wildcard_imports: Default::default(),
         });
     }
 }
@@ -554,7 +587,8 @@ fn project_of(root: &Path, dir: Option<&Path>) -> String {
             break;
         }
         visited.push(cur.to_path_buf());
-        if cur.join("package.json").is_file() {
+        // Only a regular file counts, not a symbolic link (which could point outside the tree), as in the walk.
+        if std::fs::symlink_metadata(cur.join("package.json")).is_ok_and(|m| m.is_file()) {
             project = if cur == root { String::new() } else { slashes(cur.strip_prefix(root).unwrap()) };
             break;
         }
@@ -636,23 +670,26 @@ pub fn link(root: &Path, files: &[Arc<ParsedFile>]) -> Linked {
         paths.sort_by_key(|p| key_rank(key, p));
     }
     let mut dependencies = HashMap::new();
-    // (importing file, specifier) → resolved path, so each import is resolved once even if several types use it.
-    let mut resolved: HashMap<(String, String), String> = HashMap::new();
+    // Per importing file: its imports by local name (the last import of a name wins), each with the file it resolves
+    // to ("" if external), filled in when first needed. Kept per file rather than per building, so a file's imports
+    // are indexed and resolved once, however many buildings it has.
+    let mut imports_by_file: HashMap<&str, HashMap<&str, (&Import, Option<String>)>> = HashMap::new();
     for t in &types {
         let rel = slashes(t.file.strip_prefix(root).unwrap_or(&t.file));
-        let Some(ctx) = by_path.get(rel.as_str()) else { continue };
-        let imports: HashMap<&str, &Import> = ctx.imports.iter().map(|i| (i.local.as_str(), i)).collect();
+        let Some(&ctx) = by_path.get(rel.as_str()) else { continue };
+        let imports = imports_by_file
+            .entry(ctx.path.as_str())
+            .or_insert_with(|| ctx.imports.iter().map(|i| (i.local.as_str(), (i, None))).collect());
         let mut out = HashSet::new();
         for r in &t.references {
             if let Some(local) = ctx.names.get(r) {
                 out.insert(local.clone());
                 continue;
             }
-            let Some(imp) = imports.get(r.as_str()) else { continue };
-            let target = resolved
-                .entry((ctx.path.clone(), imp.source.clone()))
-                .or_insert_with(|| resolve_source(&ctx.path, &imp.source, &by_key, &keys_by_last))
-                .clone();
+            let Some((imp, resolved)) = imports.get_mut(r.as_str()) else { continue };
+            let imp: &Import = imp;
+            let target =
+                resolved.get_or_insert_with(|| resolve_source(&ctx.path, &imp.source, &by_key, &keys_by_last)).clone();
             if target.is_empty() {
                 continue;
             }

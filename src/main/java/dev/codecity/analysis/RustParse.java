@@ -664,7 +664,12 @@ public final class RustParse {
      * stay unpaired. Returns whether any delimiter stayed unpaired.
      */
     private static boolean matchDelimiters(byte[] b, Token[] toks) {
+        // The open delimiters, innermost last; for each, the stack index of the previous one of the same kind (-1 for
+        // none); and the innermost of each kind. A closer thus finds its opener without scanning the stack, which
+        // made a long run of unmatched closers quadratic.
         int[] stack = new int[16];
+        int[] prev = new int[16];
+        int[] top = {-1, -1, -1};
         int size = 0;
         boolean errors = false;
         for (int k = 0; k < toks.length; k++) {
@@ -672,32 +677,31 @@ public final class RustParse {
                 continue;
             }
             int c = b[toks[k].start];
-            int open;
-            if (c == ')') {
-                open = '(';
-            } else if (c == ']') {
-                open = '[';
-            } else if (c == '}') {
-                open = '{';
-            } else if (c == '(' || c == '[' || c == '{') {
+            int kind = delimiterKind(c);
+            if (kind < 0) {
+                continue;
+            }
+            if (c == '(' || c == '[' || c == '{') {
                 if (size == stack.length) {
                     stack = Arrays.copyOf(stack, size * 2);
+                    prev = Arrays.copyOf(prev, size * 2);
                 }
+                prev[size] = top[kind];
+                top[kind] = size;
                 stack[size++] = k;
                 continue;
-            } else {
-                continue;
             }
-            int at = size - 1;
-            while (at >= 0 && b[toks[stack[at]].start] != open) {
-                at--;
-            }
+            int at = top[kind];
             if (at >= 0) {
                 if (at + 1 != size) {
                     errors = true;
                 }
                 int o = stack[at];
-                size = at;
+                // Close it and everything opened after it.
+                while (size > at) {
+                    size--;
+                    top[delimiterKind(b[toks[stack[size]].start])] = prev[size];
+                }
                 toks[o].pair = k;
                 toks[k].pair = o;
             } else {
@@ -705,6 +709,16 @@ public final class RustParse {
             }
         }
         return errors || size > 0;
+    }
+
+    /** 0 for {@code (} and {@code )}, 1 for {@code [} and {@code ]}, 2 for braces, -1 for any other byte. */
+    private static int delimiterKind(int c) {
+        return switch (c) {
+            case '(', ')' -> 0;
+            case '[', ']' -> 1;
+            case '{', '}' -> 2;
+            default -> -1;
+        };
     }
 
     // ------------------------------------------------------------------ parser
@@ -2553,7 +2567,12 @@ public final class RustParse {
                     continue;
                 }
                 if (punct('(') || punct('[')) {
-                    parseExprList();
+                    // Calls and indexes nest without passing parsePrefix's depth guard (f(f(f(…)))), so they count a
+                    // level of their own.
+                    if (enter()) {
+                        parseExprList();
+                        leave();
+                    }
                     info = PLAIN;
                     continue;
                 }
@@ -2572,14 +2591,21 @@ public final class RustParse {
                 }
                 int opTok = pos;
                 bumpN(b.len());
+                // A right operand nests (a = b = c = …) without passing parsePrefix's depth guard either.
+                if (!enter()) {
+                    info = PLAIN;
+                    continue;
+                }
                 if (b.range()) {
                     if (canStartExpr(pos, ns)) {
                         parseExprBp(b.rbp(), ns, false);
                     }
+                    leave();
                     info = PLAIN;
                     continue;
                 }
                 int rhs = parseExprBp(b.rbp(), ns, cond);
+                leave();
                 boolean and = b.logic() && code[toks[opTok].start] == '&';
                 if (and && ((info | rhs) & IS_LET) != 0) {
                     info = IS_LET;

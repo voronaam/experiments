@@ -6,9 +6,16 @@
 /// requests once, for the PR overlay. Rebuilds in watch mode reuse that information and do not contact GitHub again.
 ///
 /// GitHub Enterprise hosts are supported; their APIs live under `/api/v3` and `/api/graphql` on the host itself.
+///
+/// The repository may come from the analysed tree's own (untrusted) git configuration, so the token is guarded: an
+/// environment token for github.com only ever goes to api.github.com, and a GitHub Enterprise host gets a token (or a
+/// request at all) only when the user opted in to that very host (see `token` and `fetchPulls`). libcurl does not send
+/// the Authorization header on to another host when it follows a redirect; responses are capped at
+/// `maxResponseBytes` and JSON at `maxJsonDepth` levels of nesting.
 module codecity.github;
 
-import codecity.git : output, realPath, run;
+import codecity.git : executable, output, realPath, run;
+import std.process : Config;
 import std.algorithm : canFind, endsWith, startsWith;
 import std.array : replace, split;
 import std.conv : to;
@@ -29,11 +36,15 @@ struct GitHubRepo
     string branch;
 
     /// Parses `https://github.com/o/r[/tree/b]`, `git@github.com:o/r.git`, `ssh://…` or `github:owner/repo[@branch]`.
-    /// Only hosts containing "github" match. Throws on `.`/`..` path segments.
+    /// Only hosts containing "github" match. Throws on `.`/`..` path segments and on an invalid branch name
+    /// (`badBranch`).
     static bool parse(string text, out GitHubRepo repo)
     {
         // One owner or repository name: letters, digits, `_`, `.` and `-` (no slashes).
         enum segment = `[A-Za-z0-9_.-]+`;
+        // A host name: letters, digits, `.` and `-`. The host becomes a directory of the clone cache and part of API
+        // and web URLs, so path and URL syntax (`\`, `?`, `#`, `%`, …) must not get in.
+        enum host = `([A-Za-z0-9.-]+)`;
         const s = text.strip;
         string stripGit(string n) { return n.endsWith(".git") ? n[0 .. $ - 4] : n; }
         bool ok;
@@ -50,11 +61,11 @@ struct GitHubRepo
             // part of it, but it may contain slashes itself (`/tree/release/2.x`).
             foreach (i, re; [
                 // https://[user@]host[:port]/owner/repo[/tree/branch][/]
-                ctRegex!(`^https?://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(` ~ segment ~ `)/(` ~ segment ~ `)(?:/tree/(.+?))?/?$`),
+                ctRegex!(`^https?://(?:[^@/]+@)?` ~ host ~ `(?::\d+)?/(` ~ segment ~ `)/(` ~ segment ~ `)(?:/tree/(.+?))?/?$`),
                 // scp-like SSH: user@host:owner/repo[.git]
-                ctRegex!(`^[^@\s]+@([^:/]+):(` ~ segment ~ `)/(` ~ segment ~ `)/?$`),
+                ctRegex!(`^[^@\s]+@` ~ host ~ `:(` ~ segment ~ `)/(` ~ segment ~ `)/?$`),
                 // ssh://[user@]host[:port]/owner/repo[.git]
-                ctRegex!(`^ssh://(?:[^@/]+@)?([^/:]+)(?::\d+)?/(` ~ segment ~ `)/(` ~ segment ~ `)/?$`),
+                ctRegex!(`^ssh://(?:[^@/]+@)?` ~ host ~ `(?::\d+)?/(` ~ segment ~ `)/(` ~ segment ~ `)/?$`),
             ])
             {
                 auto c = s.matchFirst(re);
@@ -69,7 +80,21 @@ struct GitHubRepo
         // The owner and name become directories of the clone cache (`cloneOrUpdate`), so `.` and `..` would escape it.
         if (ok && ([".", ".."].canFind(repo.owner) || [".", ".."].canFind(repo.name)))
             throw new Exception(format("invalid repository %s/%s", repo.owner, repo.name));
+        if (ok && repo.branch !is null && badBranch(repo.branch))
+        {
+            import std.regex : regex, replaceAll;
+            throw new Exception("invalid branch name " ~ repo.branch.replaceAll(regex(`\p{Cc}`), "?"));
+        }
         return ok;
+    }
+
+    /// Whether `branch` is a name git would not accept, or could read as an option: empty, starting with `-`,
+    /// containing a control character, a space, one of `~^:?*[\` or `..`. It is passed to `git fetch` and `git clone`.
+    static bool badBranch(string branch)
+    {
+        import std.algorithm : any;
+        return branch.length == 0 || branch.startsWith("-") || branch.canFind("..")
+            || branch.any!(c => c <= ' ' || c == '\x7f' || "~^:?*[\\".canFind(c));
     }
 
     string webUrl() const { return format("https://%s/%s/%s", host, owner, name); }
@@ -114,14 +139,20 @@ struct GitHubInfo
         if (top is null) return false;
         GitHubRepo repo;
         bool found;
+        // The URLs come from the analysed repository's configuration, so one that `parse` rejects must not end the run.
+        bool parseRemote(string url)
+        {
+            try return GitHubRepo.parse(url, repo);
+            catch (Exception) return false;
+        }
         if (auto url = run(root, "remote", "get-url", "origin"))
-            found = GitHubRepo.parse(url, repo);
+            found = parseRemote(url);
         if (!found)
             if (auto remotes = run(root, "remote", "-v"))
                 foreach (line; remotes.split("\n"))
                 {
                     auto parts = line.split;
-                    if (parts.length >= 2 && GitHubRepo.parse(parts[1], repo))
+                    if (parts.length >= 2 && parseRemote(parts[1]))
                     {
                         found = true;
                         break;
@@ -153,6 +184,17 @@ string cacheRoot()
     return buildPath(base, "codecity", "repos");
 }
 
+/// Whether `dir` lies in the clone cache. Such a repository was cloned by CodeCity, so its configuration is git's own
+/// and the user's, not the analysed project's: only there may the history replay fetch missing objects
+/// (`codecity.git.gitArgs`). Both sides are compared as real paths.
+bool isCached(string dir)
+{
+    const cache = realPath(cacheRoot());
+    if (!cache.exists) return false;
+    const d = realPath(dir);
+    return d == cache || d.startsWith(cache ~ "/");
+}
+
 /// Clones blobless (full history, current files only) or fetches the latest state into an existing mirror.
 ///
 /// The clone lives at `<cacheRoot>/<host>/<owner>/<name>` and is reused on later runs. `--filter=blob:none`
@@ -165,13 +207,16 @@ string cloneOrUpdate(GitHubRepo repo)
     // visible to the user.
     void interactive(string[] args)
     {
-        auto status = wait(spawnProcess(["git"] ~ args));
+        auto git = executable("git");
+        if (git is null) throw new Exception("git not found on the PATH");
+        auto status = wait(spawnProcess([git] ~ args));
         if (status != 0) throw new Exception(format("git %-(%s %) failed (exit %d)", args, status));
     }
     if (buildPath(dir, ".git").exists)
     {
-        writefln("Updating %s in %s …", repo, dir);
-        auto fetch = ["-C", dir, "fetch", "--prune", "origin"];
+        { import app : printable; writefln("Updating %s in %s …", printable(repo.to!string), printable(dir)); }
+        // "--": a branch can never be taken for an option (and `parse` rejects one starting with '-' anyway).
+        auto fetch = ["-C", dir, "fetch", "--prune", "--", "origin"];
         if (repo.branch.length) fetch ~= repo.branch;
         interactive(fetch);
         // the mirror is ours alone, so a hard reset to what we just fetched is safe
@@ -179,7 +224,7 @@ string cloneOrUpdate(GitHubRepo repo)
     }
     else
     {
-        writefln("Cloning %s into %s …", repo.webUrl, dir);
+        { import app : printable; writefln("Cloning %s into %s …", printable(repo.webUrl), printable(dir)); }
         mkdirRecurse(dir.dirName);
         auto args = ["clone", "--filter=blob:none"];
         if (repo.branch.length) args ~= ["--branch", repo.branch];
@@ -195,18 +240,59 @@ string cloneOrUpdate(GitHubRepo repo)
 /// (one per PR and 100 files) are made at most, out of the 60 requests per hour GitHub allows unauthenticated
 /// clients.
 private enum pageSize = 50, maxPages = 6, anonymousFileLookups = 30;
+/// Largest response body read (a larger one fails the fetch), and deepest JSON nesting accepted: the limits of the
+/// Rust edition's HTTP client and JSON parser.
+private enum maxResponseBytes = 10 * 1024 * 1024, maxJsonDepth = 128;
+/// Environment variables that may hold a token; `gh` runs without them (see `token`).
+private immutable tokenVariables = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
 
-/// An API token for the repository's host, or null. Environment variables come first (the same ones the `gh` CLI
-/// reads, enterprise-specific ones for other hosts), then `gh auth token` for a logged-in `gh`.
+/// An API token for the repository's host, or null: the environment first (`envToken`), else `gh auth token` for the
+/// host: the token of a login the user made to exactly that host. `gh` runs without the token variables, since it
+/// would otherwise answer with `GH_ENTERPRISE_TOKEN` for any host; the host is passed as `--hostname=<host>`, so it
+/// can never be read as another option.
 private string token(ref const GitHubRepo repo)
 {
-    foreach (v; repo.isPublic ? ["GH_TOKEN", "GITHUB_TOKEN"] : ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_TOKEN"])
+    if (auto t = envToken(repo, (string v) => environment.get(v))) return t;
+    auto env = environment.toAA;
+    foreach (v; tokenVariables) env.remove(v);
+    auto gh = executable("gh");
+    if (gh is null) return null;
+    auto t = output([gh, "auth", "token", "--hostname=" ~ repo.host], env, Config.newEnv);
+    return t.length ? t : null;
+}
+
+/// The token from the environment variables the `gh` CLI reads: `GH_TOKEN` or `GITHUB_TOKEN` for github.com,
+/// `GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN` for any other host, but only when `GH_HOST` names that host
+/// (`optedIn`); null when there is none. Without that opt-in, a crafted remote URL such as
+/// `https://github.attacker.example/o/r` in an analysed repository would receive the user's token.
+private string envToken(ref const GitHubRepo repo, scope string delegate(string) env)
+{
+    const string[] vars = repo.isPublic ? ["GH_TOKEN", "GITHUB_TOKEN"]
+        : optedIn(repo, env) ? ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"] : [];
+    foreach (v; vars)
     {
-        auto t = environment.get(v, "").strip;
+        auto t = env(v).strip;
         if (t.length) return t;
     }
-    auto t = output(["gh", "auth", "token", "--hostname", repo.host]);
-    return t.length ? t : null;
+    return null;
+}
+
+/// Whether `GH_HOST` names the repository's host (case-insensitively): the opt-in for an Enterprise host.
+private bool optedIn(ref const GitHubRepo repo, scope string delegate(string) env)
+{
+    import std.uni : sicmp;
+    auto host = env("GH_HOST");
+    return host !is null && sicmp(host.strip, repo.host) == 0;
+}
+
+/// The link of PR `number`: `url` from the response when it is an https URL on the repository's host, otherwise the
+/// PR's page built from the repository. The URL ends up in the viewers' links and in the desktop viewers' browser
+/// launcher, which must only ever be handed a web page (not, say, a `file:` URL).
+private string pullUrl(ref const GitHubRepo repo, string url, long number)
+{
+    import std.algorithm : any;
+    if (url.startsWith("https://" ~ repo.host ~ "/") && !url.any!(c => c <= ' ')) return url;
+    return format("%s/pull/%d", repo.webUrl, number);
 }
 
 private struct Response
@@ -237,14 +323,27 @@ private Response request(string method, string url, string tok, string body_ = n
         if (key.toLower == "x-ratelimit-remaining")
         {
             remainingHeader = value.idup;
-            r.remaining = value.to!long;
+            // A malformed value counts as missing (an exception must not escape into libcurl's callback).
+            try r.remaining = value.to!long;
+            catch (Exception) r.remaining = -1;
         }
         if (key.toLower == "retry-after") retryAfter = true;
     };
-    http.onReceive = (ubyte[] chunk) { data.put(chunk); return chunk.length; };
-    http.perform();
+    bool tooLarge;
+    http.onReceive = (ubyte[] chunk) {
+        if (data.data.length + chunk.length > maxResponseBytes)
+        {
+            tooLarge = true;
+            return 0; // anything but chunk.length aborts the transfer
+        }
+        data.put(chunk);
+        return chunk.length;
+    };
+    try http.perform();
+    catch (Exception e)
+        throw new Exception(tooLarge ? format("response larger than %d bytes", maxResponseBytes) : e.msg);
     if (auto msg = failure(http.statusLine.code, remainingHeader, retryAfter)) throw new Exception(msg);
-    r.json = parseJSON(cast(string) data.data);
+    r.json = parseJSON(cast(string) data.data, maxJsonDepth);
     return r;
 }
 
@@ -289,19 +388,27 @@ private bool flag(JSONValue v, string key)
     return p && p.type == JSONType.true_;
 }
 
-/// Open PRs and how complete the list is. Never throws: problems are reported and yield false.
+/// Open PRs and how complete the list is. Never throws: problems are reported and yield false. A GitHub Enterprise
+/// host is not contacted at all unless there is a token for it or `GH_HOST` names it: the host may come from a
+/// hostile repository's remote URL, and CodeCity should not call out to it on its own.
 bool fetchPulls(ref const GitHubRepo repo, out PullRequest[] pulls, out string source)
 {
     try
     {
         auto tok = token(repo);
+        if (!tok.length && !repo.isPublic && !optedIn(repo, (string v) => environment.get(v)))
+        {
+            stderr.writefln("  GitHub: not contacting %1$s (for a GitHub Enterprise host, set GH_HOST=%1$s or log in with `gh auth login --hostname %1$s`)",
+                repo.host);
+            return false;
+        }
         if (tok.length) graphql(repo, tok, pulls, source);
         else rest(repo, pulls, source);
         return true;
     }
     catch (Exception e)
     {
-        stderr.writefln("  GitHub: could not fetch pull requests (%s)", e.msg);
+        { import app : printable; stderr.writefln("  GitHub: could not fetch pull requests (%s)", printable(e.msg)); }
         return false;
     }
 }
@@ -335,7 +442,7 @@ private void graphql(ref const GitHubRepo repo, string tok, out PullRequest[] pu
             PullRequest pr;
             pr.number = n["number"].integer;
             pr.title = str(n, "title");
-            pr.url = str(n, "url");
+            pr.url = pullUrl(repo, str(n, "url"), pr.number);
             auto author = "author" in n;
             // author is null for deleted ("ghost") accounts.
             pr.author = author && author.type == JSONType.object ? str(*author, "login") : null;
@@ -386,7 +493,7 @@ private void rest(ref const GitHubRepo repo, out PullRequest[] pulls, out string
         }
         if (!done) break;
         pr.title = str(n, "title");
-        pr.url = str(n, "html_url");
+        pr.url = pullUrl(repo, str(n, "html_url"), pr.number);
         auto user = "user" in n;
         pr.author = user && user.type == JSONType.object ? str(*user, "login") : null;
         pr.updatedAt = str(n, "updated_at");
@@ -417,6 +524,48 @@ unittest
     try GitHubRepo.parse("github:../..", r);
     catch (Exception) threw = true;
     assert(threw);
+}
+
+unittest
+{
+    // Path or URL syntax in the host does not match at all.
+    GitHubRepo r;
+    assert(!GitHubRepo.parse(`https://github.x\..\../o/r`, r));
+    assert(!GitHubRepo.parse("https://github.com%2f@evil/o/r", r));
+    assert(!GitHubRepo.parse("git@github.x?y:o/r", r));
+    // A branch that git could read as an option, or that is no valid ref name, is an error.
+    bool throws(string s)
+    {
+        try GitHubRepo.parse(s, r);
+        catch (Exception) return true;
+        return false;
+    }
+    foreach (b; ["--upload-pack=touch%20x", "-x", "a..b", "a b", "a~1", "a:b", `a\b`])
+        assert(throws("https://github.com/o/r/tree/" ~ b), b);
+    assert(throws("github:o/r@--upload-pack=x"));
+    assert(GitHubRepo.parse("github:o/r@feature/x-1", r) && r.branch == "feature/x-1");
+}
+
+unittest
+{
+    // Environment tokens only go where they belong.
+    GitHubRepo pub, ent;
+    GitHubRepo.parse("https://github.com/o/r", pub);
+    GitHubRepo.parse("https://github.acme.example/o/r", ent);
+    string delegate(string) env(string[string] vars) { return (string k) => vars.get(k, null); }
+    auto plain = env(["GH_TOKEN": "public", "GH_ENTERPRISE_TOKEN": "enterprise"]);
+    assert(envToken(pub, plain) == "public");
+    // A remote URL naming some other "github" host never gets GH_TOKEN, nor the Enterprise token without opt-in.
+    assert(envToken(ent, plain) is null && !optedIn(ent, plain));
+    auto optIn = env(["GH_TOKEN": "public", "GH_ENTERPRISE_TOKEN": "enterprise", "GH_HOST": "GitHub.Acme.Example"]);
+    assert(optedIn(ent, optIn) && envToken(ent, optIn) == "enterprise");
+    assert(envToken(ent, env(["GH_ENTERPRISE_TOKEN": "enterprise", "GH_HOST": "github.other.example"])) is null);
+
+    // Only web links on the repository's host are kept.
+    assert(pullUrl(pub, "https://github.com/o/r/pull/7", 7) == "https://github.com/o/r/pull/7");
+    foreach (bad; [null, "file:///etc/passwd", "javascript:alert(1)", "http://github.com/o/r/pull/7",
+            "https://github.com.evil.example/x", "https://github.com/o/r/pull/7 x", "https://github.com"])
+        assert(pullUrl(pub, bad, 7) == "https://github.com/o/r/pull/7", bad);
 }
 
 unittest

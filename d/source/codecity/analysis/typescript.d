@@ -21,7 +21,7 @@ import codecity.model;
 import core.sync.mutex : Mutex;
 import std.algorithm : canFind, endsWith, startsWith;
 import std.array : join, replace, split;
-import std.file : exists, isFile;
+import std.file : attrIsFile, exists, getLinkAttributes;
 import std.path : baseName, buildPath, dirName;
 import std.string : lastIndexOf;
 import std.utf : count;
@@ -95,7 +95,7 @@ ParsedFile parse(string root, string file, string code)
     ctx.imports = st.imports;
     ctx.names = st.names;
     ctx.defaultExport = st.defaultExport;
-    return ParsedFile(st.types, ctx, tree.hasError);
+    return ParsedFile(st.types, ctx, tree.hasError || st.skipped);
 }
 
 /// Everything collected while walking one file. A class rather than a struct so that the nested methods can all
@@ -103,7 +103,7 @@ ParsedFile parse(string root, string file, string code)
 private final class FileState
 {
     Tree tree;
-    string[] lines;
+    Lines lines;
     string file, path, pkg, module_;
     bool test;
     TypeDecl[] types;
@@ -111,14 +111,18 @@ private final class FileState
     string[string] names;
     /// Fqns handed out so far in this file, to disambiguate declaration merging (see `id`).
     bool[string] usedIds;
+    /// `path:name#kind` → the next suffix number `id` tries for it.
+    uint[string] nextSuffix;
     string defaultExport;
     // the file's "module" building: free functions and top-level constants
     MethodInfo[] functions;
     bool[string] moduleRefs;
     string[] moduleNames;
     uint moduleAttributes, moduleLoc;
+    /// Set when a building or namespace was skipped for the length of its fqn (see `fits`).
+    bool skipped;
 
-    this(Tree tree, string[] lines, string file, string path, string pkg, string module_, bool test)
+    this(Tree tree, Lines lines, string file, string path, string pkg, string module_, bool test)
     {
         this.tree = tree;
         this.lines = lines;
@@ -130,6 +134,15 @@ private final class FileState
     }
 
     uint loc(uint n) { return countLoc(lines, tree.firstLine(n), tree.lastLine(n)); }
+
+    /// Whether a building named `name` (namespace prefix included) gets an fqn (`path:name`, before any `#kind`
+    /// suffix) within `maxFqnBytes`. If not, it is skipped and the file counts as failed.
+    bool fits(string name)
+    {
+        const fits = path.length + 1 + name.length <= maxFqnBytes;
+        if (!fits) skipped = true;
+        return fits;
+    }
 
     /// Text of the child of `n` with the given field, or "". Like every text kept in the results, it is a copy,
     /// so the parse cache does not keep whole source files alive.
@@ -259,7 +272,10 @@ private final class FileState
             // `declare module "lib"` has a string literal as its name; drop the quotes.
             const name = fieldText(decl, Field.name).replace("'", "").replace("\"", "");
             const body_ = tree.field(decl, Field.body_);
-            if (body_ != none) visitStatements(body_, prefix ~ name ~ ".");
+            // A namespace whose own name would make every fqn inside too long is skipped as a whole, so the long
+            // prefix is not copied into each name declared in it.
+            const inner = prefix ~ name ~ ".";
+            if (body_ != none && fits(inner)) visitStatements(body_, inner);
             return null;
         default:
             return null;
@@ -335,7 +351,20 @@ private final class FileState
         const base = path ~ ":" ~ name;
         string id = base;
         // declaration merging: an interface and a class with the same name
-        for (uint n = 1; id in usedIds; n++) id = base ~ "#" ~ kind_ ~ (n == 1 ? "" : n.to!string);
+        if (id in usedIds)
+        {
+            const key = base ~ "#" ~ kind_;
+            // Resume after the last suffix handed out for this name and kind (all before it are taken): starting
+            // from the first every time made many repeated declarations quadratic.
+            uint n = nextSuffix.get(key, 1);
+            do
+            {
+                id = n == 1 ? key : key ~ n.to!string;
+                n++;
+            }
+            while (id in usedIds);
+            nextSuffix[key] = n;
+        }
         usedIds[id] = true;
         if (name !in names) names[name] = id;
         return id;
@@ -343,6 +372,7 @@ private final class FileState
 
     void addType(string name, string kind_, uint decl, uint noa, MethodInfo[] methods)
     {
+        if (!fits(name)) return;
         bool[string] refs;
         collectRefs(tree, decl, refs);
         const begin = tree.firstLine(decl), end = tree.lastLine(decl);
@@ -502,6 +532,11 @@ private final class FileState
     void finishModule(string fileName)
     {
         if (functions.length == 0 && moduleAttributes == 0 && moduleLoc == 0) return;
+        if (path.length > maxFqnBytes)
+        {
+            skipped = true;
+            return;
+        }
         usedIds[path] = true;
         foreach (n; moduleNames) if (n !in names) names[n] = path;
         TypeDecl t;
@@ -594,8 +629,12 @@ private string projectOf(string root, string dir)
             }
         }
         visited ~= d;
+        // Only a regular file counts, not a symbolic link (which could point outside the tree), as in the walk.
         const manifest = buildPath(d, "package.json");
-        if (manifest.exists && manifest.isFile)
+        bool found;
+        try found = manifest.exists && attrIsFile(getLinkAttributes(manifest));
+        catch (Exception) {}
+        if (found)
         {
             project = d == root ? "" : relativeTo(d, root);
             break;
@@ -679,13 +718,30 @@ Linked link(string root, ParsedFile[] files)
         }
     }
     foreach (key, ref paths; byKey) paths.sort!((a, b) => keyRank(key, a) < keyRank(key, b));
-    string[string] resolved;
+    // Per importing file: its imports by local name (the last import of a name wins), and per import the file it
+    // resolves to ("" if external), filled in when first needed. Kept per file rather than per building, so a file's
+    // imports are indexed and resolved once, however many buildings it has.
+    static struct FileImports
+    {
+        size_t[string] byLocal; // local name → index into the context's imports
+        string[] targets;       // per import: the resolved file, valid once `done`
+        bool[] done;
+    }
+    FileImports[string] importsByFile;
     foreach (ref t; linked.types)
     {
         auto ctx = byPath.get(relativeTo(t.file, root), null);
         if (ctx is null) continue;
-        Import[string] imports;
-        foreach (i; ctx.imports) imports[i.local] = i;
+        auto fi = ctx.path in importsByFile;
+        if (fi is null)
+        {
+            FileImports created;
+            foreach (k, i; ctx.imports) created.byLocal[i.local] = k;
+            created.targets = new string[ctx.imports.length];
+            created.done = new bool[ctx.imports.length];
+            importsByFile[ctx.path] = created;
+            fi = ctx.path in importsByFile;
+        }
         bool[string] out_;
         foreach (r, _; t.references)
         {
@@ -694,12 +750,15 @@ Linked link(string root, ParsedFile[] files)
                 out_[*local] = true;
                 continue;
             }
-            auto imp = r in imports;
-            if (imp is null) continue;
-            const cacheKey = ctx.path ~ "|" ~ imp.source;
-            string target;
-            if (auto hit = cacheKey in resolved) target = *hit;
-            else resolved[cacheKey] = target = resolveSource(ctx.path, imp.source, byKey, keysByLast);
+            auto k = r in fi.byLocal;
+            if (k is null) continue;
+            const imp = &ctx.imports[*k];
+            if (!fi.done[*k])
+            {
+                fi.targets[*k] = resolveSource(ctx.path, imp.source, byKey, keysByLast);
+                fi.done[*k] = true;
+            }
+            const target = fi.targets[*k];
             if (target.length == 0) continue;
             auto other = byPath[target];
             string symbol = imp.imported == "default" ? other.defaultExport : imp.imported;

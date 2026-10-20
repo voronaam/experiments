@@ -815,13 +815,24 @@ private final class App
     }
 
     /// Opens the source window on type `i`'s file, scrolled to and highlighting the type's lines. The file is read
-    /// from disk now, so it shows the current contents (which may have changed since the analysis).
+    /// from disk now, so it shows the current contents (which may have changed since the analysis). The rules are
+    /// those of the browser viewer's `api/source`: only a regular file is read (a symbolic link or FIFO swapped in for
+    /// it is not followed or opened), files over 4 MiB are not loaded, invalid UTF-8 is replaced, and a read error is
+    /// shown as the window's only line.
     void openSource(size_t i)
     {
+        import std.encoding : sanitize;
+        import std.file : attrIsFile, getLinkAttributes, getSize, read;
         auto t = &model.analysis.types[i];
+        const unreadable = "// unable to read " ~ model.buildings[i].file;
         string code;
-        try code = readText(t.file);
-        catch (Exception e) code = "// unable to read: " ~ e.msg;
+        try
+        {
+            if (!attrIsFile(getLinkAttributes(t.file))) code = unreadable;
+            else if (getSize(t.file) > 4UL * 1024 * 1024) code = "// file too large to display";
+            else code = sanitize(cast(string) read(t.file));
+        }
+        catch (Exception) code = unreadable;
         source = SourceView(format("%s:%d", model.buildings[i].file, t.line), highlight(code, t.language), t.line, t.endLine);
         sourceShown = true;
     }
@@ -838,9 +849,11 @@ private final class App
         return kind == "commits" ? url : format("%s#L%d-L%d", url, t.line, t.endLine);
     }
 
-    /// Opens `url` in the default browser; failures become a toast.
+    /// Opens `url` in the default browser; failures become a toast. Only https:// links are opened (see
+    /// `isWebLink`): PR URLs come from the GitHub API.
     void openUrl(string url)
     {
+        if (!isWebLink(url)) return toast("Not opening a link that is not https://");
         try browse(url);
         catch (Exception e) toast("Could not open browser: " ~ e.msg);
     }
@@ -1470,7 +1483,11 @@ private final class App
     // ImGui wants C strings; the `_Unformatted` call takes a begin/end pair instead, so D slices need no NUL and no
     // copy, and `%` in the text is not interpreted.
     void text(string s) { igTextUnformatted(s.ptr, s.ptr + s.length); }
-    void mutedText(string s) { igPushStyleColor_Vec4(Col.Text, mutedColor); text(s); igPopStyleColor(1); }
+    /// The hover tooltip of the last item. `igSetItemTooltip` takes a printf format, so the text (file paths, PR URLs,
+    /// type names: all from the analysed repository) goes in as a `%s` argument, never as the format itself.
+    void itemTooltip(string s) { igSetItemTooltip("%s", s.toStringz); }
+    void coloredText(ImVec4 c, string s) { igPushStyleColor_Vec4(Col.Text, c); text(s); igPopStyleColor(1); }
+    void mutedText(string s) { coloredText(mutedColor, s); }
     /// Text at 12.5 px; `weak` (the default) in the muted colour. `igPushFont(null, size)` keeps the current font and
     /// only changes the size (ImGui 1.92 scales fonts dynamically).
     void small(string s, bool weak = true)
@@ -1711,7 +1728,7 @@ private final class App
             if (i == 0 && model.hasGithub)
             {
                 if (igSmallButton(c[0].toStringz)) openUrl(model.github.repo.webUrl);
-                igSetItemTooltip("Open on GitHub");
+                itemTooltip("Open on GitHub");
             }
             else chip(c[0], c[1]);
         }
@@ -1807,7 +1824,7 @@ private final class App
         if (igButton("Frame", ImVec2(w, 28))) frameAll(true);
         igSameLine(0, 6);
         if (igButton("Snapshot", ImVec2(w, 28))) snapshotRequested = true;
-        igSetItemTooltip("Save a PNG to ~/Pictures (or the current directory)");
+        itemTooltip("Save a PNG to ~/Pictures (or the current directory)");
         // the Walk button, highlighted (white on blue) while walk mode is on
         if (walking)
         {
@@ -1816,7 +1833,7 @@ private final class App
         }
         if (igButton(walking ? "Walking  ·  G / Esc to exit" : "Walk  (G)", ImVec2(igGetContentRegionAvail().x, 28))) toggleWalk();
         if (walking) igPopStyleColor(2);
-        igSetItemTooltip("Walk through the city in first person");
+        itemTooltip("Walk through the city in first person");
         // the Replay button (only with history), highlighted like Walk while the replay runs
         if (model.hasHistory)
         {
@@ -1828,7 +1845,7 @@ private final class App
             if (igButton(replaying ? "Replaying  ·  R / Esc to exit" : "Replay  (R)", ImVec2(igGetContentRegionAvail().x, 28)))
                 toggleReplay();
             if (replaying) igPopStyleColor(2);
-            igSetItemTooltip("Watch the city grow commit by commit");
+            itemTooltip("Watch the city grow commit by commit");
         }
         igEnd();
     }
@@ -1898,7 +1915,7 @@ private final class App
         igPopFont();
         igSameLine(igGetWindowWidth() - 40, -1);
         if (igSmallButton(" × ")) select(-1, false);
-        igSetItemTooltip("Close (Esc)");
+        itemTooltip("Close (Esc)");
         const pkg = t.pkg.length ? t.pkg : (t.language == Language.java ? "(default package)" : "(root)");
         igPushFont(mono, 12);
         mutedText(pkg ~ (t.module_.length ? " · " ~ t.module_ : ""));
@@ -1965,7 +1982,7 @@ private final class App
         igPushFont(mono, 12);
         mutedText(format("%s:%d", b.file, t.line));
         igPopFont();
-        igSetItemTooltip(b.file.toStringz);
+        itemTooltip(b.file);
         if (igButton("Source", ImVec2(0, 0))) openSource(i);
         if (model.hasGithub)
         {
@@ -1985,7 +2002,7 @@ private final class App
                     const label = format("#%d  %s\n%s · %s · %d files%s", pr.number, pr.title, pr.author.length ? pr.author : "ghost",
                         relTime(parseIso(pr.updatedAt)), pr.files.length, pr.draft ? " · draft" : "");
                     if (igSelectable_Bool(label.toStringz, false, 0, ImVec2(0, 0))) openUrl(pr.url);
-                    igSetItemTooltip(pr.url.toStringz);
+                    itemTooltip(pr.url);
                     igPopID();
                 }
                 if (b.prs.length == 0)
@@ -2005,7 +2022,7 @@ private final class App
                 igPushFont(mono, 12.5f);
                 text(m.name ~ (m.parameters ? "(…)" : "()"));
                 igPopFont();
-                igSetItemTooltip(format("line %d · %d LOC · %d params", m.line, m.loc, m.parameters).toStringz);
+                itemTooltip(format("line %d · %d LOC · %d params", m.line, m.loc, m.parameters));
                 const value = format("cx %d · %d loc", m.complexity, m.loc);
                 const vw = igCalcTextSize(value.ptr, value.ptr + value.length, false, -1).x * 12.5f / 16;
                 igSameLine(width - vw + 14, -1);
@@ -2040,7 +2057,7 @@ private final class App
                 igPushStyleColor_Vec4(Col.Border, color(accent.r, accent.g, accent.b));
                 if (igSmallButton(name.toStringz)) select(j, true);
                 igPopStyleColor(1);
-                igSetItemTooltip(model.analysis.types[j].fqn.toStringz);
+                itemTooltip(model.analysis.types[j].fqn);
                 igPopID();
             }
             if (list.length == 0) small(pass == 0 ? "nothing in this project" : "no project types");
@@ -2169,13 +2186,12 @@ private final class App
                 ImDrawList_AddRectFilled(dl, ImVec2(pos.x - 8, pos.y), ImVec2(pos.x - 6, pos.y + lineH), rgba(56, 139, 253), 0, 0);
             }
             const number = format("%*d   ", digits, row + 1);
-            // "%.*s" prints exactly the slice: D strings are not NUL-terminated and may contain `%`
-            igTextColored(color(110, 118, 129), "%.*s", cast(int) number.length, number.ptr);
+            coloredText(color(110, 118, 129), number);
             foreach (tok; source.lines[row])
             {
                 igSameLine(0, 0);
                 const c = styleColor(tok.style);
-                igTextColored(color(cast(ubyte)(c >> 16), cast(ubyte)(c >> 8), cast(ubyte) c), "%.*s", cast(int) tok.text.length, tok.text.ptr);
+                coloredText(color(cast(ubyte)(c >> 16), cast(ubyte)(c >> 8), cast(ubyte) c), tok.text);
             }
             igSetCursorPosY((row + 1) * lineH);
         }
@@ -2245,7 +2261,7 @@ private final class App
         igPushStyleVar_Float(StyleVar.WindowRounding, 12);
         igBegin("##timeline", null, fixedFlags | WindowFlags.AlwaysAutoResize | WindowFlags.NoScrollbar);
         if (igButton("##play", ImVec2(30, 26))) togglePlay();
-        igSetItemTooltip(replayPlaying ? "Pause (P)" : "Play (P)");
+        itemTooltip(replayPlaying ? "Pause (P)" : "Play (P)");
         {
             const lo = igGetItemRectMin(), hi = igGetItemRectMax();
             const cx = (lo.x + hi.x) / 2, cy = (lo.y + hi.y) / 2;
@@ -2272,10 +2288,10 @@ private final class App
         igSameLine(width - 14 - 46 - 6 - 46, -1);
         if (igButton(replaySpeedLabels[replaySpeed].toStringz, ImVec2(46, 26)))
             replaySpeed = (replaySpeed + 1) % replaySpeeds.length;
-        igSetItemTooltip("Playback speed");
+        itemTooltip("Playback speed");
         igSameLine(0, 6);
         if (igButton("Now", ImVec2(46, 26))) exitReplay();
-        igSetItemTooltip("Back to today's city (R / Esc)");
+        itemTooltip("Back to today's city (R / Esc)");
         igEnd();
         igPopStyleVar(1);
     }

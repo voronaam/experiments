@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -27,6 +28,7 @@ import static dev.codecity.analysis.JavaParse.NodeKind.TYPE_NAME;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -312,6 +314,17 @@ class JavaParseTest {
      * Pathological nesting must not overflow the stack and must finish. Runs on a thread with a 512 KiB stack, half
      * of the JVM's default, so there is headroom on the analyser's own (default-sized) parse threads.
      */
+    /**
+     * {@code a < a < a …}: each {@code <} was tried as type arguments down to the depth cap. Once the cap has been hit,
+     * the parser no longer speculates, so this stays linear (it took about ten times the limit before).
+     */
+    @Test
+    void comparisonChainPastTheDepthCapIsLinear() {
+        String code = "class C { void m() { x = " + "a < ".repeat(1_000_000) + "b; List" + "<List".repeat(400_000)
+                + " y; } }";
+        assertTimeoutPreemptively(Duration.ofSeconds(5), () -> assertTrue(JavaParse.parse(code).error()));
+    }
+
     @Test
     void survivesDeepNesting() throws InterruptedException {
         List<String> inputs = List.of(

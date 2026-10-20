@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -17,6 +18,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static dev.codecity.analysis.RustParse.NodeKind.*;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Tests of {@link RustParse}, ported from the Rust edition's {@code rust_parse.rs}. */
@@ -148,6 +150,11 @@ class RustParseTest {
                 assertTrue(RustParse.parse("mod a { ".repeat(5_000) + "}".repeat(5_000)).errors);
                 assertTrue(RustParse.parse("fn f() { " + "-".repeat(50_000) + "x; }").errors);
                 assertTrue(RustParse.parse("fn f() -> " + "&".repeat(50_000) + "T {}").errors);
+                // Calls, indexes and right operands nest without passing the operand's depth guard; they count too.
+                assertTrue(RustParse.parse("fn f() { " + "f(".repeat(100_000) + ")".repeat(100_000) + "; }").errors);
+                assertTrue(RustParse.parse("fn f() { " + "a[".repeat(100_000) + "]".repeat(100_000) + "; }").errors);
+                assertTrue(RustParse.parse("fn f() { " + "x = ".repeat(100_000) + "a; }").errors);
+                assertTrue(RustParse.parse("fn f() { " + "([".repeat(100_000) + ")".repeat(100_000) + "; }").errors);
                 assertFalse(RustParse.parse("fn f() { let y = " + "#[a] ".repeat(50_000) + "x; }").errors,
                         "attributes before an expression are consumed without recursion");
                 assertFalse(RustParse.parse("fn f() { if a {} " + "else if b {} ".repeat(50_000) + "}").errors,
@@ -167,6 +174,13 @@ class RustParseTest {
         if (failure.get() != null) {
             throw new AssertionError(failure.get());
         }
+    }
+
+    /** A long run of closers that match no opener is paired in linear time (it used to rescan the open ones). */
+    @Test
+    void unmatchedClosersAreLinear() {
+        assertTimeoutPreemptively(Duration.ofSeconds(10),
+                () -> assertTrue(RustParse.parse("fn f() { " + "(]".repeat(200_000) + " }").errors));
     }
 
     @Test

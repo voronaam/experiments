@@ -52,9 +52,12 @@ version (linux) private void inotifyLoop(string root, void delegate() onChange)
     // removed; a deleted directory's watch is simply never reported again.
     string[int] dirs;
     enum mask = IN_CREATE | IN_DELETE | IN_MODIFY | IN_MOVED_FROM | IN_MOVED_TO | IN_CLOSE_WRITE;
+    // Below the root, IN_DONT_FOLLOW and IN_ONLYDIR make the kernel refuse a path that has become a symbolic link (to
+    // a directory anywhere) or a file since it was seen as a directory, so the walk's no-links rule holds even then.
+    // The root itself may be reached through a link the user gave.
     void add(string dir)
     {
-        const wd = inotify_add_watch(fd, dir.toStringz, mask);
+        const wd = inotify_add_watch(fd, dir.toStringz, dir == root ? mask : mask | IN_DONT_FOLLOW | IN_ONLYDIR);
         if (wd >= 0) dirs[wd] = dir;
         try
         {
@@ -141,4 +144,29 @@ private void pollLoop(string root, void delegate() onChange)
             onChange();
         }
     }
+}
+
+/// A change behind a symbolic link to a directory outside the tree is not watched (the walker does not follow links
+/// either), while a change inside the tree is. The Rust edition has the same test.
+version (linux) unittest
+{
+    import core.atomic : atomicLoad, atomicOp;
+    import std.file : mkdirRecurse, rmdirRecurse, symlink, tempDir, write;
+    import std.uuid : randomUUID;
+
+    const tmp = buildPath(tempDir, "codecity-watch-test-" ~ randomUUID.toString);
+    scope (exit) rmdirRecurse(tmp);
+    const root = buildPath(tmp, "root"), outside = buildPath(tmp, "outside");
+    mkdirRecurse(root);
+    mkdirRecurse(outside);
+    symlink(outside, buildPath(root, "link"));
+    shared int calls;
+    watch(root, { atomicOp!"+="(calls, 1); });
+    Thread.sleep(200.msecs); // the watcher registers the tree on its own thread
+    write(buildPath(outside, "X.java"), "class X {}");
+    Thread.sleep(1200.msecs);
+    assert(atomicLoad(calls) == 0);
+    write(buildPath(root, "Y.java"), "class Y {}");
+    Thread.sleep(1200.msecs);
+    assert(atomicLoad(calls) == 1);
 }

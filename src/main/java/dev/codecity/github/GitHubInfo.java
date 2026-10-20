@@ -33,14 +33,14 @@ public record GitHubInfo(GitHubRepo repo, String ref, String prefix, List<PullRe
         if (top.isEmpty()) {
             return Optional.empty();
         }
-        Optional<GitHubRepo> repo = Git.run(root, "remote", "get-url", "origin").flatMap(GitHubRepo::parse);
+        Optional<GitHubRepo> repo = Git.run(root, "remote", "get-url", "origin").flatMap(GitHubInfo::parseRemote);
         if (repo.isEmpty()) {
             // "remote -v" prints "<name>\t<url> (fetch|push)" per line; the URL is the second field.
             repo = Git.run(root, "remote", "-v").stream()
                     .flatMap(String::lines)
                     .map(l -> l.split("\\s+"))
                     .filter(parts -> parts.length >= 2)
-                    .flatMap(parts -> GitHubRepo.parse(parts[1]).stream())
+                    .flatMap(parts -> parseRemote(parts[1]).stream())
                     .findFirst();
         }
         if (repo.isEmpty()) {
@@ -62,6 +62,18 @@ public record GitHubInfo(GitHubRepo repo, String ref, String prefix, List<PullRe
             prefix += "/";
         }
         return Optional.of(new GitHubInfo(repo.get(), pushed ? sha : branch, prefix, null, null));
+    }
+
+    /**
+     * A remote URL as a repository; empty for one that is not a GitHub URL or that {@link GitHubRepo} rejects. The
+     * URL comes from the analysed repository's configuration, so a rejected one must not end the run.
+     */
+    private static Optional<GitHubRepo> parseRemote(String url) {
+        try {
+            return GitHubRepo.parse(url);
+        } catch (IllegalArgumentException e) {
+            return Optional.empty();
+        }
     }
 
     public GitHubInfo withPulls(List<PullRequest> pulls, String source) {

@@ -738,6 +738,7 @@ pub fn parse(code: &str, tsx: bool) -> Tree<'_> {
         depth: 0,
         tsx,
         arrow_failed: HashSet::new(),
+        depth_capped: false,
         first_error: None,
     };
     let root = p.parse_program();
@@ -809,6 +810,12 @@ pub struct Parser<'a> {
     tsx: bool,
     /// Source offsets of `(`/`<` tokens where an arrow function was tried and failed.
     arrow_failed: HashSet<u32>,
+    /// Set once [`MAX_DEPTH`] has been reached anywhere in the file. From then on the parser no longer speculates and
+    /// takes the plain reading of every ambiguity (a comparison rather than type arguments, a parenthesised expression
+    /// or type rather than an arrow function or function type). Input that nests past the cap at each of many
+    /// speculation points (`a < a < a < …`) would otherwise cost up to `MAX_DEPTH` steps per token, each re-lexed
+    /// after the rollback; real code never gets near the cap.
+    depth_capped: bool,
     /// Offset of the first error outside speculation (see [`Tree::first_error`]).
     first_error: Option<u32>,
 }
@@ -1044,6 +1051,7 @@ impl<'a> Parser<'a> {
     /// Enters a nested construct; false (after recording an error) when [`MAX_DEPTH`] is reached.
     fn enter(&mut self) -> bool {
         if self.depth >= MAX_DEPTH {
+            self.depth_capped = true;
             self.error();
             return false;
         }
@@ -2502,6 +2510,9 @@ impl<'a> Parser<'a> {
     /// Speculatively parses `<T, U>` after an expression; keeps it only if what follows makes it type arguments
     /// (TypeScript's `canFollowTypeArgumentsInExpression`).
     fn try_type_arguments_in_expression(&mut self) -> bool {
+        if self.depth_capped {
+            return false;
+        }
         let (s, base) = self.begin_spec();
         self.type_arguments();
         let ok = !self.bail() && self.type_arguments_can_follow();
@@ -2781,7 +2792,7 @@ impl<'a> Parser<'a> {
             }
         }
         let start = t.start;
-        if self.arrow_failed.contains(&start) {
+        if self.depth_capped || self.arrow_failed.contains(&start) {
             return None;
         }
         let (s, base) = self.begin_spec();
@@ -3028,7 +3039,7 @@ impl<'a> Parser<'a> {
     /// Speculatively parses `(params) => R` at `(`. True if it was a function type (already consumed).
     fn try_function_type(&mut self) -> bool {
         let start = self.cur().start;
-        if self.arrow_failed.contains(&start) {
+        if self.depth_capped || self.arrow_failed.contains(&start) {
             return false;
         }
         let (s, base) = self.begin_spec();
@@ -3098,7 +3109,7 @@ impl<'a> Parser<'a> {
         } else if self.at_kw("infer") && self.nth_kind(1) == TokKind::Ident {
             self.bump();
             self.bump_ref();
-            if self.at_kw("extends") && !self.cur().nl_before {
+            if self.at_kw("extends") && !self.cur().nl_before && !self.depth_capped {
                 // `infer U extends C` – unless the `extends` starts the conditional type around it (TypeScript's
                 // rule: inside the `extends` clause of a conditional type, it is always a constraint)
                 let (s, base) = self.begin_spec();

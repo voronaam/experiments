@@ -175,6 +175,14 @@ viewers (browser, and the Java, Rust and D desktop windows) behave the same way.
   while walking, because they would show through walls.
 * `/` and `F` leave walk mode first, then search or frame the city. Losing focus also leaves it.
 
+## Security
+
+CodeCity is meant to be pointed at code you don't trust yet. It never executes, compiles or loads the code it
+inspects: it parses it with its own dependency-free parsers, runs git with every command-running setting neutralised,
+serves the viewer on localhost only (refusing other `Host` names), and treats every name, path, commit message and
+pull-request field as plain text. GitHub tokens are only sent to the API host they belong to. See the
+[threat model](docs/threat-model.md) for the details, the residual risks and the rules for changes.
+
 ## How it is built
 
 | | |

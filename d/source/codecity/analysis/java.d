@@ -22,6 +22,24 @@ import std.path : baseName;
 import std.string : indexOf, lastIndexOf;
 import std.uni : isWhite;
 
+/// A reference is tried against the file's on-demand imports (`import a.b.*;`) and against its single-type imports of
+/// the same simple name. Beyond this many of either kind, later ones are ignored, so a crafted file with very many
+/// cannot make the analysis quadratic; real files have a handful of on-demand imports and one single-type import per
+/// name. Imports longer than `maxFqnBytes` are ignored too: they cannot name a building. The Java and Rust editions
+/// use the same limits.
+enum size_t maxImportCandidates = 64;
+
+/// A qualified name (`a.b.C`) contributes its prefixes (`a`, `a.b`) as references too, but at most this many of them,
+/// the shortest; a crafted name of very many segments would otherwise cost time quadratic in its length. The Java
+/// and Rust editions use the same limit.
+enum size_t maxQualifiedPrefixes = 16;
+
+/// Member types nested deeper than this (a top-level type is at depth 1) are not buildings; their code still counts
+/// towards the enclosing types. Every type collects and resolves the references of its member types as well, so with
+/// deep nesting the work grew with the square of the depth; real code nests a few levels. The Java and Rust editions
+/// use the same limit.
+enum size_t maxTypeNesting = 16;
+
 /// Analyses one Java file. `root` is the analysed directory, used for the build module (`moduleOf`) and the
 /// test-directory check. The file counts as failed when it has syntax errors; whatever was recognised is still
 /// returned.
@@ -60,6 +78,7 @@ ParsedFile parse(string root, string file, string code)
             //   import static a.B.*;     → explicit "a.B" (all members of that type)
             // Static imports thus make the type they import from a dependency.
             auto text = stripWs(nodeText(tree, code, name));
+            if (text.length > maxFqnBytes) continue;
             if (isStatic && !asterisk)
             {
                 const dot = text.lastIndexOf('.');
@@ -68,7 +87,7 @@ ParsedFile parse(string root, string file, string code)
             else if (asterisk)
             {
                 if (isStatic) explicit ~= text;
-                else wildcard ~= text;
+                else if (wildcard.length < maxImportCandidates) wildcard ~= text;
             }
             else explicit ~= text;
         }
@@ -78,8 +97,8 @@ ParsedFile parse(string root, string file, string code)
     auto ctx = FileCtx(&tree, code, lines, file, pkg, module_, test, explicit, wildcard);
     TypeDecl[] types;
     foreach (n; top)
-        if (tree.nodes[n].kind == NodeKind.typeDecl) collectType(ctx, n, "", types);
-    return ParsedFile(types, null, tree.error);
+        if (tree.nodes[n].kind == NodeKind.typeDecl) collectType(ctx, n, "", 1, types);
+    return ParsedFile(types, null, tree.error || ctx.skipped);
 }
 
 /// The `NodeKind.name` child of a package or import node, or `jp.NONE`.
@@ -107,13 +126,15 @@ private struct FileCtx
 {
     const(Tree)* tree;
     string code;
-    string[] lines;
+    Lines lines;
     string file;
     string pkg;
     string module_;
     bool test;
     string[] explicit;
     string[] wildcard;
+    /// Set when a type was skipped for its nesting or the length of its fqn (see `collectType`).
+    bool skipped;
 }
 
 /// Adds a type and, recursively, the member types declared in its body (local classes are not types).
@@ -126,12 +147,20 @@ private struct FileCtx
 /// - `loc`: the whole declaration, including member types, so an outer type's LOC contains its inner types';
 /// - references: collected from the whole declaration, member types included.
 ///
-/// The outer type is emitted before its member types, so `output` is in pre-order.
-private void collectType(ref FileCtx ctx, size_t decl, string outer, ref TypeDecl[] output)
+/// The outer type is emitted before its member types, so `output` is in pre-order. A type nested deeper than
+/// `maxTypeNesting` or whose fqn would exceed `maxFqnBytes` is skipped with its member types (whose fqns are longer
+/// still), and the file counts as failed; the length is checked before the fqn is built.
+private void collectType(ref FileCtx ctx, size_t decl, string outer, size_t depth, ref TypeDecl[] output)
 {
     const tree = ctx.tree;
     const node = tree.nodes[decl];
     const simple = tokenText(*tree, ctx.code, node.name);
+    const fqnBytes = ctx.pkg.length + (ctx.pkg.length > 0) + outer.length + (outer.length > 0) + simple.length;
+    if (depth > maxTypeNesting || fqnBytes > maxFqnBytes)
+    {
+        ctx.skipped = true;
+        return;
+    }
     const name = outer.length ? outer ~ "." ~ simple : simple;
     const fqn = ctx.pkg.length ? ctx.pkg ~ "." ~ name : name;
 
@@ -170,7 +199,7 @@ private void collectType(ref FileCtx ctx, size_t decl, string outer, ref TypeDec
     t.explicitImports = ctx.explicit;
     t.wildcardImports = ctx.wildcard;
     output ~= t;
-    foreach (n; nested) collectType(ctx, n, name, output);
+    foreach (n; nested) collectType(ctx, n, name, depth + 1, output);
 }
 
 /// The building kind shown in the viewer. Classes are split into "abstract" and "class" by their `abstract`
@@ -211,6 +240,14 @@ uint complexity(ref const Tree tree, size_t node)
     return cx;
 }
 
+/// Adds a reference unless it is longer than `maxFqnBytes`: it could not name a building, only resolve through its
+/// first segment, which a qualified name contributes on its own (see `references`), and resolving it would copy it into
+/// every candidate tried.
+private void addReference(ref bool[string] refs, string name)
+{
+    if (name.length <= maxFqnBytes) refs[name] = true;
+}
+
 /// Type names used in a declaration: types, annotations, and upper-case call/field scopes (`Util.run()`).
 ///
 /// The names are raw source text (`List`, `Map.Entry`, `com.acme.Order`); `resolve` turns them into fqns later.
@@ -225,31 +262,33 @@ private bool[string] references(ref const Tree tree, string code, size_t decl)
         switch (n.kind)
         {
         case NodeKind.typeName:
-            refs[tree.text(code, n.first, n.last).idup] = true;
+            addReference(refs, tree.text(code, n.first, n.last).idup);
             break;
         case NodeKind.scopedTypeName:
         {
             // a qualified name: `Map.Entry` contributes "Map.Entry" and its scope "Map", but not "Entry" alone
             // (the parser does not report the parts of a qualified name separately)
+            // At most maxQualifiedPrefixes of them, the shortest, so a crafted name of many segments does not yield
+            // a quadratic amount of work.
             auto text = stripWs(tree.text(code, n.first, n.last));
-            string prefix = text;
-            while (true)
+            ptrdiff_t dot = text.indexOf('.');
+            // A prefix longer than maxFqnBytes would be dropped by addReference anyway.
+            for (size_t count = 0; dot >= 0 && count < maxQualifiedPrefixes && dot <= maxFqnBytes; count++)
             {
-                const dot = prefix.lastIndexOf('.');
-                if (dot < 0) break;
-                prefix = prefix[0 .. dot];
-                refs[prefix] = true;
+                addReference(refs, text[0 .. dot]);
+                const next = text[dot + 1 .. $].indexOf('.');
+                dot = next < 0 ? -1 : dot + 1 + next;
             }
-            refs[text] = true;
+            addReference(refs, text);
             break;
         }
         case NodeKind.annotationName:
-            refs[stripWs(tree.text(code, n.first, n.last))] = true;
+            addReference(refs, stripWs(tree.text(code, n.first, n.last)));
             break;
         case NodeKind.memberObject:
         {
             const s = tree.text(code, n.first, n.last);
-            if (isUpperStart(s)) refs[s.idup] = true;
+            if (isUpperStart(s)) addReference(refs, s.idup);
             break;
         }
         default:
@@ -324,19 +363,47 @@ Linked link(ParsedFile[] files)
                 order ~= t.fqn;
             }
     Linked linked;
+    // The single-type imports of each import list by simple name; the types of a file share one list, so each file's
+    // imports are indexed once.
+    string[][string][const(string)*] importIndex;
     foreach (fqn; order)
     {
         auto t = byFqn[fqn];
+        auto imports = t.explicitImports.ptr in importIndex;
+        if (imports is null)
+        {
+            importIndex[t.explicitImports.ptr] = bySimpleName(t.explicitImports);
+            imports = t.explicitImports.ptr in importIndex;
+        }
         bool[string] out_;
         foreach (r, _; t.references)
         {
-            auto target = resolve(r, t, byFqn);
+            auto target = resolve(r, t, *imports, byFqn);
             if (target !is null && target != t.fqn) out_[target] = true;
         }
         linked.dependencies[fqn] = out_;
         linked.types ~= t;
     }
     return linked;
+}
+
+/// Single-type imports by simple name (the last segment: `a.b.C` under "C"), each list in import order and at most
+/// `maxImportCandidates` long. An import without a dot names no package member and is left out. Lets `resolve` find the imports that match a name without
+/// scanning them all for every reference.
+private string[][string] bySimpleName(const string[] imports)
+{
+    string[][string] index;
+    foreach (imp; imports)
+    {
+        const dot = imp.lastIndexOf('.');
+        if (dot >= 0)
+        {
+            auto same = imp[dot + 1 .. $] in index;
+            if (same is null) index[imp[dot + 1 .. $]] = [imp];
+            else if (same.length < maxImportCandidates) *same ~= imp;
+        }
+    }
+    return index;
 }
 
 /// Java's own lookup order: enclosing types, single-type imports, same package, on-demand imports.
@@ -354,7 +421,8 @@ Linked link(ParsedFile[] files)
 ///   <explicit import ending in .Item>
 ///   com.acme.Item                                   (same package)
 ///   <wildcard>.Item for every `import x.*`
-private string resolve(string reference, ref const TypeDecl from, const TypeDecl[string] known)
+private string resolve(string reference, ref const TypeDecl from, const string[][string] imports,
+    const TypeDecl[string] known)
 {
     const dot = reference.indexOf('.');
     const first = dot < 0 ? reference : reference[0 .. dot];
@@ -369,8 +437,8 @@ private string resolve(string reference, ref const TypeDecl from, const TypeDecl
         if (i < 0) break;
         enclosing = enclosing[0 .. i];
     }
-    foreach (imp; from.explicitImports)
-        if (imp.endsWith("." ~ first)) candidates ~= imp;
+    // The single-type imports whose last segment is `first`.
+    if (auto matching = first in imports) candidates ~= *matching;
     candidates ~= prefix ~ first;
     foreach (w; from.wildcardImports) candidates ~= w ~ "." ~ first;
     foreach (c; candidates)

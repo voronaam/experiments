@@ -66,7 +66,7 @@ import java.util.Set;
  *       token; if not, it flags the error and skips one token, or a whole bracketed group if the token opens one
  *       (using the bracket pairs from the lexer), so it always makes progress;</li>
  *   <li>recursion is capped at {@link #MAX_DEPTH} nested constructs; deeper input is skipped group by group and
- *       flagged.</li>
+ *       flagged, and from then on the parser no longer speculates (see {@code Parser.depthCapped}).</li>
  * </ul>
  * So a file with errors still yields every declaration the parser could recognise, which is what the analyser reports
  * (with the file counted as failed).
@@ -821,6 +821,14 @@ public final class JavaParse {
         /** Current nesting of guarded constructs (see {@link #MAX_DEPTH}). */
         private int depth;
         /**
+         * Set once the depth cap has been reached anywhere in the file. From then on the parser no longer tries the
+         * speculative readings (a local variable, a cast, a type pattern, a record pattern, a type before :: or .class,
+         * a method outside a class) and takes the plain one. Input nested past the cap at each of many such points
+         * ({@code a < a < a < …}) would otherwise cost up to the cap's worth of steps per token; real code never gets
+         * near the cap. The TypeScript parser does the same.
+         */
+        private boolean depthCapped;
+        /**
          * Index of the {@code ->} that ends the {@code case} label being parsed (or {@link #NONE}): {@code case A -> x}
          * must not read {@code A -> x} as a lambda.
          */
@@ -976,6 +984,7 @@ public final class JavaParse {
          */
         private boolean enter() {
             if (depth >= MAX_DEPTH) {
+                depthCapped = true;
                 skip();
                 return false;
             }
@@ -1127,6 +1136,9 @@ public final class JavaParse {
 
         /** At the top level: {@code Type name (} (a method outside any class, which is accepted). */
         private boolean looksLikeMethod() {
+            if (depthCapped) {
+                return false;
+            }
             Mark m = mark();
             boolean ok = type() && kind() == Tok.IDENT && peekIs(1, "(");
             reset(m);
@@ -1907,6 +1919,9 @@ public final class JavaParse {
 
         /** At an identifier: {@code Type name} follows, so this is a local variable declaration. */
         private boolean isLocalVariable() {
+            if (depthCapped) {
+                return false;
+            }
             Mark m = mark();
             boolean ok = type() && kind() == Tok.IDENT;
             reset(m);
@@ -2190,12 +2205,14 @@ public final class JavaParse {
             if (tryRecordPattern(true)) {
                 return;
             }
-            Mark m = mark();
-            if (type() && kind() == Tok.IDENT && endsPattern(pos + 1)) {
-                bump();
-                return;
+            if (!depthCapped) {
+                Mark m = mark();
+                if (type() && kind() == Tok.IDENT && endsPattern(pos + 1)) {
+                    bump();
+                    return;
+                }
+                reset(m);
             }
-            reset(m);
             expression();
         }
 
@@ -2210,7 +2227,7 @@ public final class JavaParse {
          * (it is a plain identifier), a generic one is.
          */
         private boolean tryRecordPattern(boolean inLabel) {
-            if (kind() != Tok.IDENT || !(peekIs(1, "(") || peekIs(1, "<"))) {
+            if (depthCapped || kind() != Tok.IDENT || !(peekIs(1, "(") || peekIs(1, "<"))) {
                 return false;
             }
             Mark m = mark();
@@ -2362,6 +2379,9 @@ public final class JavaParse {
          * nothing.
          */
         private boolean tryCast() {
+            if (depthCapped) {
+                return false;
+            }
             Mark m = mark();
             bump(); // (
             boolean primitive = isPrimitiveAt(pos) && peekIs(1, ")");
@@ -2502,7 +2522,7 @@ public final class JavaParse {
             boolean classLiteral = isAt(k, ".") && isAt(k + 1, "class");
             boolean array = isAt(k, "[") && isAt(k + 1, "]");
             boolean generic = isAt(k, "<");
-            if (!(classLiteral || array || generic)) {
+            if (depthCapped || !(classLiteral || array || generic)) {
                 return false;
             }
             Mark m = mark();

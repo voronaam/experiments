@@ -307,6 +307,25 @@ unittest
     assert(fmt(12_345) == "12.3k");
 }
 
+/// Whether `url` may be handed to the system browser: an `https://` URL without spaces or control characters. Link
+/// targets come from the city data (pull request URLs from the GitHub API, the repository URL from the analysed tree's
+/// git remote), so anything else (`file:`, `javascript:`, custom URL schemes that start other applications,
+/// option-like strings) is refused.
+bool isWebLink(string url)
+{
+    import std.algorithm : any;
+    import std.uni : sicmp;
+    return url.length >= 8 && sicmp(url[0 .. 8], "https://") == 0 && !url.any!(c => c <= ' ' || c == 0x7f);
+}
+
+unittest
+{
+    assert(isWebLink("https://github.com/o/r/pull/1"));
+    assert(isWebLink("HTTPS://github.com/o/r"));
+    foreach (bad; ["javascript:alert(1)", "file:///etc/passwd", "http://x", "--help", "https://x y", "https://x\n", "ssh://h", "", "https:/"])
+        assert(!isWebLink(bad), bad);
+}
+
 /// "today", "5d ago", "3mo ago" or "1.2y ago" for a Unix timestamp (months are 30 days, years 365); "—" for 0 or less,
 /// which callers use for "unknown".
 string relTime(long epoch)

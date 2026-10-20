@@ -11,6 +11,12 @@
 //!   and so is held back by the anonymous rate limit (60 requests an hour on github.com).
 //!
 //! github.com and GitHub Enterprise hosts are both supported; they differ only in the API base URLs.
+//!
+//! The repository may come from the analysed tree's own (untrusted) git configuration, so the token is guarded: an
+//! environment token for github.com only ever goes to api.github.com, and a GitHub Enterprise host gets a token (or a
+//! request at all) only when the user opted in to that very host (see [`token`] and [`fetch_pulls`]). ureq does not
+//! send the Authorization header on to another host when it follows a redirect, reads at most 10 MB of a response,
+//! and serde_json refuses JSON nested more than 128 deep.
 
 use crate::git;
 use regex::Regex;
@@ -33,10 +39,23 @@ pub struct GitHubRepo {
 /// An owner or repository name: letters, digits, `_`, `.` and `-`. Since `/` is excluded, the names are also safe as
 /// single directory names in the clone cache (with `.`/`..` rejected separately in `parse`).
 const SEGMENT: &str = "[A-Za-z0-9_.-]+";
+/// A host name: letters, digits, `.` and `-`. The host becomes a directory of the clone cache and part of API and web
+/// URLs, so path and URL syntax (`\\`, `?`, `#`, `%`, …) must not get in.
+const HOST: &str = "[A-Za-z0-9.-]+";
+
+/// Whether `branch` is a name git would not accept, or could read as an option: empty, starting with `-`, containing
+/// a control character, a space, one of `~^:?*[\\` or `..`. It is passed to `git fetch` and `git clone`.
+fn bad_branch(branch: &str) -> bool {
+    branch.is_empty()
+        || branch.starts_with('-')
+        || branch.contains("..")
+        || branch.chars().any(|c| c <= ' ' || c == '\u{7f}' || "~^:?*[\\".contains(c))
+}
 
 impl GitHubRepo {
     /// Parses `https://github.com/o/r[/tree/b]`, `git@github.com:o/r.git`, `ssh://…` or `github:owner/repo[@branch]`.
-    /// Only hosts containing "github" match. Errors on `.`/`..` path segments.
+    /// Only hosts containing "github" match. Errors on `.`/`..` path segments and on an invalid branch name
+    /// ([`bad_branch`]).
     pub fn parse(text: &str) -> Result<Option<GitHubRepo>, String> {
         // Compiled once per process. In order: `github:o/r[@b]`; `http(s)://[user@]host[:port]/o/r[/tree/b]`, where
         // the branch may contain slashes (`release/2.x`); scp-like `user@host:o/r`; `ssh://[user@]host[:port]/o/r`.
@@ -44,9 +63,9 @@ impl GitHubRepo {
         let [shorthand, https, scp, ssh] = PATTERNS.get_or_init(|| {
             [
                 Regex::new(&format!(r"^github:({SEGMENT})/({SEGMENT})(?:@(.+))?$")).unwrap(),
-                Regex::new(&format!(r"^https?://(?:[^@/]+@)?([^/:]+)(?::\d+)?/({SEGMENT})/({SEGMENT})(?:/tree/(.+?))?/?$")).unwrap(),
-                Regex::new(&format!(r"^[^@\s]+@([^:/]+):({SEGMENT})/({SEGMENT})/?$")).unwrap(),
-                Regex::new(&format!(r"^ssh://(?:[^@/]+@)?([^/:]+)(?::\d+)?/({SEGMENT})/({SEGMENT})/?$")).unwrap(),
+                Regex::new(&format!(r"^https?://(?:[^@/]+@)?({HOST})(?::\d+)?/({SEGMENT})/({SEGMENT})(?:/tree/(.+?))?/?$")).unwrap(),
+                Regex::new(&format!(r"^[^@\s]+@({HOST}):({SEGMENT})/({SEGMENT})/?$")).unwrap(),
+                Regex::new(&format!(r"^ssh://(?:[^@/]+@)?({HOST})(?::\d+)?/({SEGMENT})/({SEGMENT})/?$")).unwrap(),
             ]
         });
         let s = text.trim();
@@ -71,6 +90,9 @@ impl GitHubRepo {
         if let Some(r) = &repo {
             if [".", ".."].contains(&r.owner.as_str()) || [".", ".."].contains(&r.name.as_str()) {
                 return Err(format!("invalid repository {}/{}", r.owner, r.name));
+            }
+            if r.branch.as_deref().is_some_and(bad_branch) {
+                return Err(format!("invalid branch name {}", r.branch.as_deref().unwrap_or("").replace(|c: char| c.is_control(), "?")));
             }
         }
         Ok(repo)
@@ -174,6 +196,16 @@ pub fn cache_root() -> PathBuf {
     base.join("codecity").join("repos")
 }
 
+/// Whether `dir` lies in the clone cache. Such a repository was cloned by CodeCity, so its configuration is git's own
+/// and the user's, not the analysed project's: only there may the history replay fetch missing objects
+/// ([`crate::git::command`]). Both sides are compared canonicalised.
+pub fn is_cached(dir: &Path) -> bool {
+    match (std::fs::canonicalize(dir), std::fs::canonicalize(cache_root())) {
+        (Ok(dir), Ok(cache)) => dir.starts_with(cache),
+        _ => false,
+    }
+}
+
 /// `HOME`, else `USERPROFILE` (Windows), else the current directory.
 fn home() -> PathBuf {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
@@ -188,13 +220,15 @@ fn home() -> PathBuf {
 pub fn clone_or_update(repo: &GitHubRepo) -> Result<PathBuf, String> {
     let dir = cache_root().join(&repo.host).join(&repo.owner).join(&repo.name);
     let interactive = |args: &[&str]| -> Result<(), String> {
-        let status = Command::new("git").args(args).status().map_err(|e| format!("git: {e}"))?;
+        let git = git::executable("git").ok_or("git: not found on the PATH")?;
+        let status = Command::new(git).args(args).status().map_err(|e| format!("git: {e}"))?;
         if status.success() { Ok(()) } else { Err(format!("git {} failed ({status})", args.join(" "))) }
     };
     let d = dir.to_string_lossy().to_string();
     if dir.join(".git").is_dir() {
-        println!("Updating {repo} in {d} …");
-        let mut fetch = vec!["-C", &d, "fetch", "--prune", "origin"];
+        println!("{}", crate::printable(&format!("Updating {repo} in {d} …")));
+        // "--": a branch can never be taken for an option (and `parse` rejects one starting with '-' anyway).
+        let mut fetch = vec!["-C", &d, "fetch", "--prune", "--", "origin"];
         if let Some(b) = &repo.branch {
             fetch.push(b);
         }
@@ -204,7 +238,7 @@ pub fn clone_or_update(repo: &GitHubRepo) -> Result<PathBuf, String> {
         let target = if repo.branch.is_some() { "FETCH_HEAD" } else { "origin/HEAD" };
         interactive(&["-C", &d, "reset", "--quiet", "--hard", target])?;
     } else {
-        println!("Cloning {} into {d} …", repo.web_url());
+        println!("{}", crate::printable(&format!("Cloning {} into {d} …", repo.web_url())));
         std::fs::create_dir_all(dir.parent().unwrap()).map_err(|e| e.to_string())?;
         // Always over HTTPS, whichever URL form was given.
         let url = format!("{}.git", repo.web_url());
@@ -228,23 +262,67 @@ const MAX_PAGES: usize = 6;
 /// REST without a token: at most this many file-list requests (one per PR and 100 files).
 const ANONYMOUS_FILE_LOOKUPS: usize = 30;
 
-/// An API token: the environment variables the `gh` CLI also reads (Enterprise ones first for an Enterprise host),
-/// else `gh auth token` for the host. None when there is none or `gh` is not installed.
+/// Environment variables that may hold a token; `gh` runs without them (see [`token`]).
+const TOKEN_VARIABLES: [&str; 4] = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
+
+/// An API token: the environment first ([`env_token`]), else `gh auth token` for the host: the token of a login the
+/// user made to exactly that host. `gh` runs without the token variables, since it would otherwise answer with
+/// `GH_ENTERPRISE_TOKEN` for any host; the host is passed as `--hostname=<host>`, so it can never be read as another
+/// option. `gh` is started by its absolute path ([`git::executable`]). None when there is none or `gh` is not
+/// installed.
 fn token(repo: &GitHubRepo) -> Option<String> {
-    let vars: &[&str] = if repo.is_public() { &["GH_TOKEN", "GITHUB_TOKEN"] } else { &["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_TOKEN"] };
-    for v in vars {
-        if let Ok(t) = std::env::var(v) {
-            if !t.trim().is_empty() {
-                return Some(t.trim().to_string());
-            }
-        }
-    }
-    git::output(Command::new("gh").args(["auth", "token", "--hostname", &repo.host])).filter(|t| !t.is_empty())
+    env_token(repo, |v| std::env::var(v).ok()).or_else(|| {
+        let mut gh = Command::new(git::executable("gh")?);
+        gh.args(["auth", "token", &format!("--hostname={}", repo.host)]);
+        TOKEN_VARIABLES.iter().for_each(|v| {
+            gh.env_remove(v);
+        });
+        git::output(&mut gh).filter(|t| !t.is_empty())
+    })
 }
 
-/// Open PRs and how complete the list is. Never fails: problems are reported and yield None.
+/// The token from the environment variables the `gh` CLI reads: `GH_TOKEN` or `GITHUB_TOKEN` for github.com,
+/// `GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN` for any other host, but only when `GH_HOST` names that host
+/// ([`opted_in`]). Without that opt-in, a crafted remote URL such as `https://github.attacker.example/o/r` in an
+/// analysed repository would receive the user's token.
+fn env_token(repo: &GitHubRepo, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let vars: &[&str] = if repo.is_public() {
+        &["GH_TOKEN", "GITHUB_TOKEN"]
+    } else if opted_in(repo, &env) {
+        &["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]
+    } else {
+        &[]
+    };
+    vars.iter().filter_map(|v| env(v)).map(|t| t.trim().to_string()).find(|t| !t.is_empty())
+}
+
+/// Whether `GH_HOST` names the repository's host (case-insensitively): the opt-in for an Enterprise host.
+fn opted_in(repo: &GitHubRepo, env: impl Fn(&str) -> Option<String>) -> bool {
+    env("GH_HOST").is_some_and(|h| h.trim().eq_ignore_ascii_case(&repo.host))
+}
+
+/// The link of PR `number`: `url` from the response when it is an https URL on the repository's host, otherwise the
+/// PR's page built from the repository. The URL ends up in the viewers' links and in the desktop viewers' browser
+/// launcher, which must only ever be handed a web page (not, say, a `file:` URL).
+fn pull_url(repo: &GitHubRepo, url: Option<&str>, number: i64) -> String {
+    match url {
+        Some(u) if u.starts_with(&format!("https://{}/", repo.host)) && !u.chars().any(|c| c <= ' ') => u.to_string(),
+        _ => format!("{}/pull/{number}", repo.web_url()),
+    }
+}
+
+/// Open PRs and how complete the list is. Never fails: problems are reported and yield None. A GitHub Enterprise
+/// host is not contacted at all unless there is a token for it or `GH_HOST` names it: the host may come from a
+/// hostile repository's remote URL, and CodeCity should not call out to it on its own.
 pub fn fetch_pulls(repo: &GitHubRepo) -> Option<(Vec<PullRequest>, String)> {
     let token = token(repo);
+    if token.is_none() && !repo.is_public() && !opted_in(repo, |v| std::env::var(v).ok()) {
+        eprintln!(
+            "  GitHub: not contacting {0} (for a GitHub Enterprise host, set GH_HOST={0} or log in with `gh auth login --hostname {0}`)",
+            repo.host
+        );
+        return None;
+    }
     // http_status_as_error(false): error statuses come back as responses, so `request` can turn 401/403/429 into
     // readable messages. 30 s bounds each whole request.
     let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -259,7 +337,7 @@ pub fn fetch_pulls(repo: &GitHubRepo) -> Option<(Vec<PullRequest>, String)> {
     match result {
         Ok(r) => Some(r),
         Err(e) => {
-            eprintln!("  GitHub: could not fetch pull requests ({e})");
+            eprintln!("  GitHub: could not fetch pull requests ({})", crate::printable(&e.to_string()));
             None
         }
     }
@@ -357,7 +435,7 @@ fn graphql(agent: &ureq::Agent, repo: &GitHubRepo, token: &str) -> Result<(Vec<P
             pulls.push(PullRequest {
                 number,
                 title: n["title"].as_str().unwrap_or("").into(),
-                url: n["url"].as_str().unwrap_or("").into(),
+                url: pull_url(repo, n["url"].as_str(), number),
                 author: n["author"]["login"].as_str().map(String::from),
                 updated_at: n["updatedAt"].as_str().unwrap_or("").into(),
                 draft: n["isDraft"].as_bool().unwrap_or(false),
@@ -401,7 +479,7 @@ fn rest(agent: &ureq::Agent, repo: &GitHubRepo) -> Result<(Vec<PullRequest>, Str
         pulls.push(PullRequest {
             number,
             title: n["title"].as_str().unwrap_or("").into(),
-            url: n["html_url"].as_str().unwrap_or("").into(),
+            url: pull_url(repo, n["html_url"].as_str(), number),
             author: n["user"]["login"].as_str().map(String::from),
             updated_at: n["updated_at"].as_str().unwrap_or("").into(),
             draft: n["draft"].as_bool().unwrap_or(false),
@@ -439,6 +517,47 @@ mod tests {
         assert_eq!(GitHubRepo::parse("https://github.com/o/r/tree/release/2.x").unwrap().unwrap().branch.as_deref(), Some("release/2.x"));
         assert_eq!(GitHubRepo::parse("https://gitlab.com/o/r").unwrap(), None);
         assert!(GitHubRepo::parse("github:../..").is_err());
+    }
+
+    #[test]
+    fn rejects_hosts_and_branches_that_could_inject_syntax() {
+        // Path or URL syntax in the host does not match at all.
+        assert_eq!(GitHubRepo::parse(r"https://github.x\..\../o/r").unwrap(), None);
+        assert_eq!(GitHubRepo::parse("https://github.com%2f@evil/o/r").unwrap(), None);
+        assert_eq!(GitHubRepo::parse("git@github.x?y:o/r").unwrap(), None);
+        // A branch that git could read as an option, or that is no valid ref name, is an error.
+        for b in ["--upload-pack=touch%20x", "-x", "a..b", "a b", "a~1", "a:b", r"a\b"] {
+            assert!(GitHubRepo::parse(&format!("https://github.com/o/r/tree/{b}")).is_err(), "{b}");
+        }
+        assert!(GitHubRepo::parse("github:o/r@--upload-pack=x").is_err());
+        assert_eq!(GitHubRepo::parse("github:o/r@feature/x-1").unwrap().unwrap().branch.as_deref(), Some("feature/x-1"));
+    }
+
+    #[test]
+    fn sends_environment_tokens_only_where_they_belong() {
+        let public = GitHubRepo::parse("https://github.com/o/r").unwrap().unwrap();
+        let enterprise = GitHubRepo::parse("https://github.acme.example/o/r").unwrap().unwrap();
+        let env = |vars: &'static [(&'static str, &'static str)]| move |k: &str| vars.iter().find(|v| v.0 == k).map(|v| v.1.to_string());
+        let plain = env(&[("GH_TOKEN", "public"), ("GH_ENTERPRISE_TOKEN", "enterprise")]);
+        assert_eq!(env_token(&public, &plain).as_deref(), Some("public"));
+        // A remote URL naming some other "github" host never gets GH_TOKEN, nor the Enterprise token without opt-in.
+        assert_eq!(env_token(&enterprise, &plain), None);
+        assert!(!opted_in(&enterprise, &plain));
+        let opt_in = env(&[("GH_TOKEN", "public"), ("GH_ENTERPRISE_TOKEN", "enterprise"), ("GH_HOST", "GitHub.Acme.Example")]);
+        assert!(opted_in(&enterprise, &opt_in));
+        assert_eq!(env_token(&enterprise, &opt_in).as_deref(), Some("enterprise"));
+        let other = env(&[("GH_ENTERPRISE_TOKEN", "enterprise"), ("GH_HOST", "github.other.example")]);
+        assert_eq!(env_token(&enterprise, &other), None);
+    }
+
+    #[test]
+    fn keeps_only_web_links_on_the_repository_host() {
+        let repo = GitHubRepo::parse("https://github.com/o/r").unwrap().unwrap();
+        assert_eq!(pull_url(&repo, Some("https://github.com/o/r/pull/7"), 7), "https://github.com/o/r/pull/7");
+        for bad in [None, Some("file:///etc/passwd"), Some("javascript:alert(1)"), Some("http://github.com/o/r/pull/7"),
+            Some("https://github.com.evil.example/x"), Some("https://github.com/o/r/pull/7 x"), Some("https://github.com")] {
+            assert_eq!(pull_url(&repo, bad, 7), "https://github.com/o/r/pull/7", "{bad:?}");
+        }
     }
 
     #[test]

@@ -4,13 +4,16 @@
 /// path so it can be matched against `TypeDecl.file`. Also hosts the small git helpers used by `codecity.github` and
 /// by the history replay (`codecity.history`): `bytes` for the output of long-running commands and `BlobReader` for
 /// reading file contents out of the object database.
+///
+/// The repository being analysed is untrusted: its `.git/config` can name programs for git to run. Every git command
+/// on it is therefore built by `gitArgs`/`gitEnv`, which override the keys that matter for the commands CodeCity runs.
 module codecity.git;
 
 import codecity.model : FileHistory;
 import core.time : seconds;
 import std.conv : to;
 import std.path : buildNormalizedPath;
-import std.process : kill, pipe, Pid, spawnProcess, tryWait, wait;
+import std.process : Config, kill, pipe, Pid, spawnProcess, tryWait, wait;
 import std.stdio : File;
 import std.string : strip;
 
@@ -25,17 +28,121 @@ struct Touch
 /// How long a short command (`run`, `gh auth token`) may take before `output` kills it.
 private enum timeout = 30.seconds;
 
-/// Output of `git -C dir args…`, or null if git fails, is unavailable or times out (see `output`).
+/// Largest blob `BlobReader` hands out: the analysers' file-size limit (16 MiB), above which they do not read a file.
+enum maxBlobBytes = 16L * 1024 * 1024;
+
+/// Configuration that every git command on an analysed repository gets on its command line. `-c` beats every
+/// configuration file (also files pulled in with include/includeIf), and git hands it on to the git processes it
+/// starts itself. Of the keys that make git run a program, these are the ones the read-only commands CodeCity runs
+/// could reach: the fsmonitor hook (any command that refreshes the index), hooks, and `log.showSignature`, with which
+/// `git log` runs `gpg.program` for every signed commit. The others (pager: stdout is never a terminal; external diff
+/// and textconv: no patch output is ever asked for; filters: nothing is checked out) are not reached. An empty
+/// core.fsmonitor means "off" in every git version.
+private immutable string[] hardening = ["-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "-c",
+    "log.showSignature=false"];
+
+/// No transport at all. A repository can claim to be a partial clone, and reading one of its "missing" objects would
+/// then make git fetch it from the remote: that runs the remote's upload-pack, ssh, proxy, askpass and
+/// credential-helper commands from the configuration. Each built-in transport is named, since a
+/// `protocol.<name>.allow` in the repository's configuration would beat `protocol.allow`. Only the clone cache, whose
+/// configuration CodeCity wrote itself, is allowed to fetch.
+private immutable string[] noTransport = ["-c", "protocol.allow=never", "-c", "protocol.file.allow=never", "-c",
+    "protocol.git.allow=never", "-c", "protocol.ssh.allow=never", "-c", "protocol.http.allow=never", "-c",
+    "protocol.https.allow=never", "-c", "protocol.ext.allow=never"];
+
+/// The absolute path of the program `name` ("git", "gh") on the `PATH`, looked up once (`findProgram`); null when it
+/// is not installed. Programs are always started by this path, never by bare name: a relative or empty `PATH` entry
+/// means the current directory, which may be the hostile checkout being analysed (and Windows would search the
+/// current directory anyway).
+string executable(string name)
+{
+    import std.array : split;
+    import std.process : environment;
+    __gshared string[string] found;
+    synchronized
+    {
+        if (auto p = name in found) return *p;
+        version (Windows)
+        {
+            auto pathext = environment.get("PATHEXT", "").strip;
+            const extensions = (pathext.length ? pathext : ".COM;.EXE;.BAT;.CMD").split(";");
+            enum windows = true;
+        }
+        else
+        {
+            const string[] extensions = [""];
+            enum windows = false;
+        }
+        auto p = findProgram(name, environment.get("PATH"), extensions, windows);
+        if (p !is null) found[name] = p;
+        return p;
+    }
+}
+
+/// The first `<dir>/<name><extension>` that is a regular file (and, unless `windows`, executable), for the entries
+/// `dir` of `path` (split at the system's path separator) in order and each of `extensions`; null when there is none.
+/// Empty and relative entries (".", "bin", "") are skipped, so the current directory is never searched. The other
+/// editions implement the same rules.
+string findProgram(string name, string path, const string[] extensions, bool windows)
+{
+    import std.array : split;
+    import std.file : exists, isFile;
+    import std.path : buildPath, isAbsolute, pathSeparator;
+    import std.string : toStringz;
+    if (path is null) return null;
+    foreach (dir; path.split(pathSeparator))
+    {
+        if (dir.length == 0 || !dir.isAbsolute) continue;
+        foreach (ext; extensions)
+        {
+            const candidate = buildPath(dir, name ~ ext);
+            bool runnable = windows;
+            version (Posix)
+            {
+                import core.sys.posix.unistd : access, X_OK;
+                runnable = runnable || access(candidate.toStringz, X_OK) == 0;
+            }
+            try
+                if (candidate.exists && candidate.isFile && runnable) return candidate;
+            catch (Exception) {}
+        }
+    }
+    return null;
+}
+
+/// The command line of a hardened `git -C dir args…`: `hardening`, plus `noTransport` unless `fetch`. `fetch` is only
+/// for repositories of the clone cache (`codecity.github.isCached`). git is started by its absolute path
+/// (`executable`); throws when it is not installed.
+string[] gitArgs(string dir, bool fetch, string[] args...)
+{
+    auto git = executable("git");
+    if (git is null) throw new Exception("git not found on the PATH");
+    return [git] ~ hardening ~ (fetch ? [] : noTransport) ~ ["-C", dir] ~ args;
+}
+
+/// The environment additions for `gitArgs`: git must not prompt for credentials and, from git 2.44 on, must not fetch
+/// missing objects lazily (unless `fetch`).
+string[string] gitEnv(bool fetch)
+{
+    string[string] env = ["GIT_TERMINAL_PROMPT": "0"];
+    if (!fetch) env["GIT_NO_LAZY_FETCH"] = "1";
+    return env;
+}
+
+/// Output of the hardened `git -C dir args…` (`gitArgs`), or null if git fails, is unavailable or times out (see
+/// `output`).
 string run(string dir, string[] args...)
 {
-    return output(["git", "-C", dir] ~ args);
+    try return output(gitArgs(dir, false, args), gitEnv(false));
+    catch (Exception) return null; // git is not installed
 }
 
 /// Output of a short command, with surrounding whitespace stripped and invalid UTF-8 replaced (`lossyUtf8`); null if
 /// it cannot be started, exits with an error or takes longer than `timeout`. stderr is discarded, so it can neither
 /// fill an unread pipe nor end up in the result. stdout is read with `poll` against the deadline, so the limit also
-/// covers a command that hangs while keeping stdout open: it is then killed.
-string output(string[] cmd)
+/// covers a command that hangs while keeping stdout open: it is then killed. `env` and `config` are passed on to
+/// `spawnProcess` (added variables, or with `Config.newEnv` the whole environment).
+string output(string[] cmd, const string[string] env = null, Config config = Config.none)
 {
     import core.stdc.errno : errno, EINTR;
     import core.sys.posix.poll : poll, pollfd, POLLIN;
@@ -46,7 +153,7 @@ string output(string[] cmd)
     try
     {
         auto p = pipe();
-        pid = spawn(cmd, p.writeEnd);
+        pid = spawn(cmd, p.writeEnd, env, config);
         const deadline = MonoTime.currTime + timeout;
         bool timedOut()
         {
@@ -86,9 +193,9 @@ string output(string[] cmd)
 
 /// Starts `cmd` with stdin and stderr on the null device and stdout on `stdout`. `spawnProcess` closes the
 /// parent's copies of these files, so the read end of a pipe sees end-of-file once the child is done.
-private Pid spawn(string[] cmd, File stdout)
+private Pid spawn(string[] cmd, File stdout, const string[string] env = null, Config config = Config.none)
 {
-    return spawnProcess(cmd, File("/dev/null"), stdout, File("/dev/null", "w"));
+    return spawnProcess(cmd, File("/dev/null"), stdout, File("/dev/null", "w"), env, config);
 }
 
 /// `s` with every ill-formed UTF-8 sequence replaced by U+FFFD, one per maximal subpart (the longest prefix of a
@@ -179,9 +286,10 @@ FileHistory[string] load(string root, Touch[][string]* touches = null)
         // root below the top level only sees its own files.
         // stderr goes to the null device: a pipe that is never read would block git once it is full.
         auto p = pipe();
-        auto pid = spawn(["git", "-C", root, "-c", "core.quotepath=off", "log", "--no-merges", "--no-renames",
-                "--format=%x1e%at%x1f%aE", "--name-only", "--", "*.java", "*.ts", "*.tsx", "*.mts", "*.cts", "*.rs"],
-                p.writeEnd);
+        // gitArgs hardens git against the repository's own configuration (no gpg for signed commits, ...).
+        auto pid = spawn(gitArgs(root, false, "-c", "core.quotepath=off", "log", "--no-merges", "--no-renames",
+                "--format=%x1e%at%x1f%aE", "--name-only", "--", "*.java", "*.ts", "*.tsx", "*.mts", "*.cts", "*.rs"),
+                p.writeEnd, gitEnv(false));
         long time;
         string author;
         // Each line is decoded lossily: a path or e-mail that is not valid UTF-8 gets U+FFFD in place of the bad
@@ -224,7 +332,8 @@ FileHistory[string] load(string root, Touch[][string]* touches = null)
     return result;
 }
 
-/// The raw standard output of `git -C dir args…`, or null when git cannot be started or exits with an error.
+/// The raw standard output of the hardened `git -C dir args…` (`gitArgs`), or null when git cannot be started or
+/// exits with an error.
 ///
 /// Unlike `run` there is no time limit and nothing is stripped or decoded, so it suits long-running commands and
 /// NUL-separated (`-z`) output, e.g. the history replay's `rev-list`, `ls-tree` and `diff-tree`. stderr is
@@ -234,7 +343,7 @@ ubyte[] bytes(string dir, string[] args...)
     try
     {
         auto p = pipe();
-        auto pid = spawn(["git", "-C", dir] ~ args, p.writeEnd);
+        auto pid = spawn(gitArgs(dir, false, args), p.writeEnd, gitEnv(false));
         ubyte[] data = [];
         ubyte[65536] buf;
         while (true)
@@ -256,6 +365,7 @@ ubyte[] bytes(string dir, string[] args...)
 /// `<sha> <type> <size>` followed by exactly `size` bytes of content and a newline, or with `<sha> missing`. Requests
 /// are sent in chunks of `chunk` names and all answers to a chunk are read before the next one is written: 512 names
 /// (about 21 KB) always fit into the pipe, so the writer never blocks while git waits for its answers to be read.
+/// Blobs larger than `maxBlobBytes`, which the analysis would not read anyway, are skipped unread.
 final class BlobReader
 {
     private enum chunk = 512;
@@ -263,42 +373,60 @@ final class BlobReader
     /// Our ends of the pipes: requests go to git's stdin, answers come from its stdout.
     private File requests, answers;
 
-    /// Starts `git cat-file --batch` in `dir`. Throws when git cannot be started.
-    this(string dir)
+    /// Starts the hardened `git cat-file --batch` in `dir`; `fetch`: whether git may fetch missing objects lazily
+    /// (only in the clone cache, see `gitArgs`). Throws when git cannot be started.
+    this(string dir, bool fetch)
     {
         auto input = pipe(), output = pipe();
-        pid = spawnProcess(["git", "-C", dir, "cat-file", "--batch"], input.readEnd, output.writeEnd,
-            File("/dev/null", "w"));
+        pid = spawnProcess(gitArgs(dir, fetch, "cat-file", "--batch"), input.readEnd, output.writeEnd,
+            File("/dev/null", "w"), gitEnv(fetch));
         requests = input.writeEnd;
         answers = output.readEnd;
     }
 
-    /// The contents of the blobs named by `shas` (40-hex object names), in the same order. Throws when an object is
-    /// missing or the process ended early.
-    ubyte[][] read(const string[] shas)
+    /// Calls `each` with the index and content of every blob named by `shas` (40-hex object names), in order, one at a
+    /// time (so only one is in memory); `present` is false for a blob that is missing or larger than `maxBlobBytes`.
+    /// Throws when the process ended early.
+    void each(const string[] shas, scope void delegate(size_t i, const(ubyte)[] data, bool present) each)
     {
         import std.array : split;
-        ubyte[][] result;
-        result.reserve(shas.length);
         for (size_t start = 0; start < shas.length; start += chunk)
         {
             const part = shas[start .. start + (shas.length - start < chunk ? shas.length - start : chunk)];
             foreach (sha; part) requests.write(sha, "\n");
             requests.flush();
-            foreach (sha; part)
+            foreach (j, sha; part)
             {
                 const header = answers.readln().strip.split(' ');
-                if (header.length != 3) throw new Exception("git cat-file: cannot read object " ~ sha);
-                auto data = new ubyte[header[2].to!size_t];
+                if (header.length != 3)
+                {
+                    if (header.length == 0) throw new Exception("git cat-file ended early");
+                    each(start + j, null, false); // "<sha> missing"
+                    continue;
+                }
+                const size = header[2].to!ulong;
+                if (size > maxBlobBytes)
+                {
+                    // Skip the content and the newline after it.
+                    ubyte[65536] buf;
+                    for (ulong left = size + 1; left > 0;)
+                    {
+                        const n = answers.rawRead(buf[0 .. left < buf.length ? cast(size_t) left : buf.length]).length;
+                        if (n == 0) throw new Exception("git cat-file: object " ~ sha ~ " cut short");
+                        left -= n;
+                    }
+                    each(start + j, null, false);
+                    continue;
+                }
+                auto data = new ubyte[cast(size_t) size];
                 // rawRead loops until the buffer is full (or end of file, which means git died)
                 if (data.length && answers.rawRead(data).length != data.length)
                     throw new Exception("git cat-file: object " ~ sha ~ " cut short");
                 ubyte[1] newline;
                 answers.rawRead(newline[]);
-                result ~= data;
+                each(start + j, data, true);
             }
         }
-        return result;
     }
 
     /// Closes git's stdin, which ends the process, and waits for it.
@@ -325,6 +453,44 @@ string realPath(string path)
     if (p is null) return path;
     scope (exit) free(p);
     return p.fromStringz.idup;
+}
+
+unittest
+{
+    // The PATH search that finds git and gh (the Java and Rust editions test the same cases).
+    import std.array : join;
+    import std.conv : octal;
+    import std.file : exists, getcwd, mkdirRecurse, remove, rmdirRecurse, setAttributes, tempDir, write;
+    import std.path : buildPath;
+    import std.uuid : randomUUID;
+    const dir = buildPath(tempDir, "codecity-path-" ~ randomUUID.toString);
+    scope (exit) rmdirRecurse(dir);
+    string program(string sub, uint mode)
+    {
+        const d = buildPath(dir, sub);
+        mkdirRecurse(d);
+        write(buildPath(d, "git"), "#!/bin/sh\n");
+        setAttributes(buildPath(d, "git"), mode);
+        return d;
+    }
+    const a = program("a", octal!755), b = program("b", octal!755), c = program("c", octal!644);
+    mkdirRecurse(buildPath(dir, "empty"));
+    // Relative and empty entries are skipped; the first absolute entry holding the program wins.
+    assert(findProgram("git", ["", ".", "a", buildPath(dir, "empty"), a, b].join(":"), [""], false) == buildPath(a, "git"));
+    // A non-executable file does not count, and nothing is found without a PATH.
+    assert(findProgram("git", c ~ ":" ~ b, [""], false) == buildPath(b, "git"));
+    assert(findProgram("git", null, [""], false) is null);
+    // Windows-style extensions are tried in order.
+    write(buildPath(c, "gh.EXE"), "");
+    assert(findProgram("gh", c, [".COM", ".EXE"], true) == buildPath(c, "gh.EXE"));
+    // A "git" in the current directory is not found through "." or an empty entry.
+    const planted = buildPath(getcwd, "git");
+    assert(!planted.exists);
+    write(planted, "");
+    setAttributes(planted, octal!755);
+    const found = findProgram("git", ".::git", [""], false);
+    remove(planted);
+    assert(found is null);
 }
 
 unittest

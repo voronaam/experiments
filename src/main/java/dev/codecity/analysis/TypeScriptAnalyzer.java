@@ -5,10 +5,12 @@ import dev.codecity.analysis.TypeScriptParse.NodeKind;
 import dev.codecity.analysis.TypeScriptParse.Tree;
 
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -102,13 +104,13 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
         st.visitStatements(tree.root, "");
         st.finishModule();
         Context ctx = new Context(st.path, st.imports, st.names, st.defaultExport);
-        return new ParsedFile(file, st.types, ctx, tree.hasError);
+        return new ParsedFile(file, st.types, ctx, tree.hasError || st.skipped);
     }
 
     /** Per-file extraction state. Created for one {@link #parse} call and used by one thread only. */
     private final class FileState {
         final Tree tree;
-        final String[] lines;
+        final SourceText.Lines lines;
         final Path file;
         final String path;
         final String packageName;
@@ -119,6 +121,8 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
         final Map<String, String> names = new LinkedHashMap<>();
         /** fqns already handed out in this file, to keep ids unique, see {@link #id}. */
         final Set<String> usedIds = new HashSet<>();
+        /** "path:name#kind" → the next suffix number {@link #id} tries for it. */
+        final Map<String, Integer> nextSuffix = new HashMap<>();
         String defaultExport;
         // the file's "module" building: free functions and top-level constants
         final List<MethodInfo> functions = new ArrayList<>();
@@ -129,13 +133,18 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
         int moduleAttributes;
         /** LOC of the free statements only; the module building's LOC is not the whole file's. */
         int moduleLoc;
+        /** Length of {@link #path} in UTF-8 bytes. */
+        final int pathBytes;
+        /** Set when a building or namespace was skipped for the length of its fqn (see {@link #fits}). */
+        boolean skipped;
 
-        FileState(Path root, Path file, Tree tree, String[] lines) {
+        FileState(Path root, Path file, Tree tree, SourceText.Lines lines) {
             this.tree = tree;
             this.lines = lines;
             this.file = file;
             Path rel = root.relativize(file);
             this.path = SourceText.slashes(rel);
+            this.pathBytes = SourceText.utf8Length(path);
             String project = projectOf(root, file.getParent());
             this.module = project;
             this.packageName = packageOf(project, rel);
@@ -144,6 +153,17 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
 
         String moduleId() {
             return path;
+        }
+
+        /**
+         * Whether a building named {@code name} (namespace prefix included) gets an fqn ({@code path:name}, before any
+         * {@code #kind} suffix) within {@link SourceText#MAX_FQN_BYTES}. If not, it is skipped and the file counts as
+         * failed.
+         */
+        boolean fits(String name) {
+            boolean fits = pathBytes + 1 + SourceText.utf8Length(name) <= SourceText.MAX_FQN_BYTES;
+            skipped |= !fits;
+            return fits;
         }
 
         /** Lines of code of a node. */
@@ -287,7 +307,9 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
                 case MODULE -> {
                     String name = fieldText(decl, Field.NAME).replace("'", "").replace("\"", "");
                     int body = tree.field(decl, Field.BODY);
-                    if (body >= 0) {
+                    // A namespace whose own name would make every fqn inside too long is skipped as a whole, so
+                    // the long prefix is not copied into each name declared in it.
+                    if (body >= 0 && fits(prefix + name + ".")) {
                         visitStatements(body, prefix + name + ".");
                     }
                     return null;
@@ -362,15 +384,29 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
             String base = path + ":" + name;
             String id = base;
             // e.g. declaration merging: an interface and a class with the same name
-            for (int n = 1; !usedIds.add(id); n++) {
-                id = base + "#" + kind + (n == 1 ? "" : n);
+            if (!usedIds.add(id)) {
+                String key = base + "#" + kind;
+                // Resume after the last suffix handed out for this name and kind (all before it are taken): starting
+                // from the first every time made many repeated declarations quadratic.
+                int n = nextSuffix.getOrDefault(key, 1);
+                do {
+                    id = n == 1 ? key : key + n;
+                    n++;
+                } while (!usedIds.add(id));
+                nextSuffix.put(key, n);
             }
             names.putIfAbsent(name, id);
             return id;
         }
 
-        /** Creates and records the building for a class, interface, enum or type alias spanning {@code decl}. */
+        /**
+         * Creates and records the building for a class, interface, enum or type alias spanning {@code decl}; null when
+         * its fqn would be too long (see {@link #fits}).
+         */
         TypeInfo type(String name, String kind, int decl, int noa, List<MethodInfo> methods) {
+            if (!fits(name)) {
+                return null;
+            }
             Set<String> refs = new HashSet<>();
             collectRefs(decl, refs);
             int begin = tree.firstLine(decl);
@@ -542,13 +578,17 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
             if (functions.isEmpty() && moduleAttributes == 0 && moduleLoc == 0) {
                 return;
             }
+            if (pathBytes > SourceText.MAX_FQN_BYTES) {
+                skipped = true;
+                return;
+            }
             String name = file.getFileName().toString();
             usedIds.add(moduleId());
             for (String n : moduleNames) {
                 names.putIfAbsent(n, moduleId());
             }
             types.add(new TypeInfo(Language.TYPESCRIPT, moduleId(), name, packageName, module, "module", file,
-                    1, lines.length, moduleLoc, moduleAttributes, test, List.copyOf(functions),
+                    1, lines.count(), moduleLoc, moduleAttributes, test, List.copyOf(functions),
                     Set.copyOf(moduleRefs), List.of(), List.of()));
         }
 
@@ -617,7 +657,8 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
                 break;
             }
             visited.add(d);
-            if (Files.isRegularFile(d.resolve("package.json"))) {
+            // Only a regular file counts, not a symbolic link (which could point outside the tree), as in the walk.
+            if (Files.isRegularFile(d.resolve("package.json"), LinkOption.NOFOLLOW_LINKS)) {
                 project = d.equals(root) ? "" : SourceText.slashes(root.relativize(d));
                 break;
             }
@@ -687,15 +728,21 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
         }
         byKey.forEach((key, paths) -> paths.sort(java.util.Comparator.comparingInt(p -> keyRank(key, p))));
         Map<String, Set<String>> deps = new HashMap<>();
-        // "<importing file>|<specifier>" → resolved path ("" if external); the buildings of a file share its imports
-        Map<String, String> resolvedSources = new HashMap<>();
+        // Per importing file: its imports by local name (the last import of a name wins), and per import the file it
+        // resolves to ("" if external), filled in when first needed. Both are kept per file rather than per building,
+        // so a file's imports are indexed and resolved once, however many buildings it has.
+        Map<Context, Map<String, Import>> importsByFile = new IdentityHashMap<>();
+        Map<Import, String> resolvedSources = new IdentityHashMap<>();
         for (TypeInfo t : types) {
             Context ctx = byPath.get(SourceText.slashes(root.relativize(t.file())));
             if (ctx == null) {
                 continue;
             }
-            Map<String, Import> importsByLocal = new HashMap<>();
-            ctx.imports().forEach(i -> importsByLocal.put(i.local(), i));
+            Map<String, Import> importsByLocal = importsByFile.computeIfAbsent(ctx, c -> {
+                Map<String, Import> byLocal = new HashMap<>();
+                c.imports().forEach(i -> byLocal.put(i.local(), i));
+                return byLocal;
+            });
             Set<String> out = new HashSet<>();
             for (String ref : t.references()) {
                 String local = ctx.names().get(ref);
@@ -707,8 +754,8 @@ public final class TypeScriptAnalyzer implements LanguageSupport {
                 if (imp == null) {
                     continue;
                 }
-                String target = resolvedSources.computeIfAbsent(ctx.path() + "|" + imp.source(),
-                        k -> resolveSource(ctx.path(), imp.source(), byKey, keysByLastSegment));
+                String target = resolvedSources.computeIfAbsent(imp,
+                        i -> resolveSource(ctx.path(), i.source(), byKey, keysByLastSegment));
                 if (target.isEmpty()) {
                     continue;
                 }

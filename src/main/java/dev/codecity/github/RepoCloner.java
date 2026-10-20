@@ -25,12 +25,26 @@ public final class RepoCloner {
     }
 
     /**
+     * Whether {@code dir} lies in the clone cache. Such a repository was cloned by CodeCity, so its configuration is
+     * git's own and the user's, not the analysed project's: only there may the history replay fetch missing objects
+     * ({@link Git#command}). Both sides are compared as real paths.
+     */
+    public static boolean isCached(Path dir) {
+        try {
+            return dir.toRealPath().startsWith(cacheRoot().toRealPath());
+        } catch (IOException e) {
+            return false; // no cache yet, or dir does not exist
+        }
+    }
+
+    /**
      * Clones the repository, or brings an existing mirror to the latest remote state. Returns its path.
      *
      * <p>Update path: {@code fetch --prune origin [branch]}, then a hard reset either to {@code FETCH_HEAD} (the branch
      * just fetched) or to {@code origin/HEAD} (the remote's default branch, as recorded when the mirror was cloned).
      * Clone path: a blobless clone of the requested branch, or of the default branch when none was given. The
-     * {@code --} stops a URL or path starting with '-' from being read as an option.
+     * {@code --} stops a URL, path or branch starting with '-' from being read as an option (and {@link GitHubRepo}
+     * rejects such branches anyway).
      *
      * @throws IOException if git fails, or the computed directory would lie outside the cache
      */
@@ -42,8 +56,8 @@ public final class RepoCloner {
             throw new IOException("refusing to clone outside the cache: " + dir);
         }
         if (Files.isDirectory(dir.resolve(".git"))) {
-            System.out.println("Updating " + repo + " in " + dir + " …");
-            List<String> fetch = new ArrayList<>(List.of("-C", dir.toString(), "fetch", "--prune", "origin"));
+            System.out.println(dev.codecity.CodeCity.printable("Updating " + repo + " in " + dir + " …"));
+            List<String> fetch = new ArrayList<>(List.of("-C", dir.toString(), "fetch", "--prune", "--", "origin"));
             if (repo.branch() != null) {
                 fetch.add(repo.branch());
             }
@@ -52,7 +66,7 @@ public final class RepoCloner {
             String target = repo.branch() != null ? "FETCH_HEAD" : "origin/HEAD";
             Git.interactive(List.of("-C", dir.toString(), "reset", "--quiet", "--hard", target));
         } else {
-            System.out.println("Cloning " + repo.webUrl() + " into " + dir + " …");
+            System.out.println(dev.codecity.CodeCity.printable("Cloning " + repo.webUrl() + " into " + dir + " …"));
             Files.createDirectories(dir.getParent());
             List<String> clone = new ArrayList<>(List.of("clone", "--filter=blob:none"));
             if (repo.branch() != null) {

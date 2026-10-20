@@ -21,33 +21,49 @@ public record GitHubRepo(String host, String owner, String name, String branch) 
      * ({@link RepoCloner}).
      */
     private static final String SEGMENT = "[A-Za-z0-9_.-]+";
+    /**
+     * Characters accepted in a host name (letters, digits, '.', '-'). The host becomes a directory of the clone cache
+     * and part of API and web URLs, so path and URL syntax ('\\', '?', '#', '%', ...) must not get in.
+     */
+    private static final String HOST = "[A-Za-z0-9.-]+";
     // HTTPS, SCP and SSH capture (1) host, (2) owner, (3) name and, for HTTPS only, (4) the branch of a /tree/ URL.
     // Credentials ("user@") and a port are accepted and dropped. Group 4 is lazy, so a trailing '/' is not part of
     // the branch name, but it may itself contain slashes (feature/x).
     private static final Pattern HTTPS = Pattern.compile(
-            "https?://(?:[^@/]+@)?([^/:]+)(?::\\d+)?/(" + SEGMENT + ")/(" + SEGMENT + ")(?:/tree/(.+?))?/?");
+            "https?://(?:[^@/]+@)?(" + HOST + ")(?::\\d+)?/(" + SEGMENT + ")/(" + SEGMENT + ")(?:/tree/(.+?))?/?");
     /** scp-like syntax as used by git: {@code git@github.com:owner/repo.git}. */
     private static final Pattern SCP = Pattern.compile(
-            "[^@\\s]+@([^:/]+):(" + SEGMENT + ")/(" + SEGMENT + ")/?");
+            "[^@\\s]+@(" + HOST + "):(" + SEGMENT + ")/(" + SEGMENT + ")/?");
     private static final Pattern SSH = Pattern.compile(
-            "ssh://(?:[^@/]+@)?([^/:]+)(?::\\d+)?/(" + SEGMENT + ")/(" + SEGMENT + ")/?");
+            "ssh://(?:[^@/]+@)?(" + HOST + ")(?::\\d+)?/(" + SEGMENT + ")/(" + SEGMENT + ")/?");
+    /**
+     * What a branch name may not contain: control characters, space and the characters git forbids in ref names
+     * ({@code ~^:?*[\}), or "..". A leading '-' is refused too, so the branch can never be read as an option of the
+     * {@code git fetch} it is passed to.
+     */
+    private static final Pattern BAD_BRANCH = Pattern.compile("^-|[\\x00-\\x20\\x7f~^:?*\\[\\\\]|\\.\\.");
     /** {@code github:owner/repo[@branch]}: (1) owner, (2) name, (3) optional branch; the host is always github.com. */
     private static final Pattern SHORTHAND = Pattern.compile(
             "github:(" + SEGMENT + ")/(" + SEGMENT + ")(?:@(.+))?");
 
     /**
      * Rejects {@code .} and {@code ..}: SEGMENT allows dots, and these two would let a crafted URL resolve the clone
-     * directory outside the cache.
+     * directory outside the cache. Also rejects a branch name git would not accept (see {@link #BAD_BRANCH}).
      */
     public GitHubRepo {
         if (owner.equals(".") || owner.equals("..") || name.equals(".") || name.equals("..")) {
             throw new IllegalArgumentException("invalid repository " + owner + "/" + name);
+        }
+        if (branch != null && (branch.isEmpty() || BAD_BRANCH.matcher(branch).find())) {
+            throw new IllegalArgumentException("invalid branch name " + branch.replaceAll("\\p{Cntrl}", "?"));
         }
     }
 
     /**
      * Parses a GitHub URL ({@code https://github.com/o/r}, {@code .../tree/branch}, {@code git@github.com:o/r.git},
      * {@code ssh://...}) or the shorthand {@code github:owner/repo[@branch]}. Only hosts containing "github" match.
+     *
+     * @throws IllegalArgumentException for "." or ".." as owner or name, or an invalid branch name
      */
     public static Optional<GitHubRepo> parse(String text) {
         String s = text.strip();

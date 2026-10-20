@@ -29,6 +29,7 @@ mod json;
 mod layout;
 mod model;
 mod server;
+mod sha256;
 mod watch;
 
 use analysis::SourceAnalyzer;
@@ -169,13 +170,13 @@ fn main() {
             return;
         }
         Err(e) => {
-            eprintln!("error: {e}\n");
+            eprintln!("error: {}\n", printable(&e));
             eprint!("{USAGE}");
             std::process::exit(2);
         }
     };
     if let Err(e) = run(opts) {
-        eprintln!("error: {e}");
+        eprintln!("error: {}", printable(&e));
         std::process::exit(1);
     }
 }
@@ -194,16 +195,16 @@ fn run(mut opts: Options) -> Result<(), String> {
     // Shared with the rebuild closure: the analyser's parse cache is what makes watch-mode rebuilds re-parse only the
     // files that changed.
     let analyzer = Arc::new(SourceAnalyzer::new());
-    println!("Analysing {} …", root.display());
+    println!("Analysing {} …", printable(&root.display().to_string()));
     let model = Arc::new(CityModel::build(&analyzer, &root, opts.include_tests, opts.git, github.clone(), opts.history));
     print_summary(&model);
     if model.buildings.is_empty() {
-        eprintln!("No Java, TypeScript or Rust types found under {}", root.display());
+        eprintln!("No Java, TypeScript or Rust types found under {}", printable(&root.display().to_string()));
     }
 
     if let Some(target) = &opts.export {
         export::export(&model, target).map_err(|e| format!("cannot write {}: {e}", target.display()))?;
-        println!("Wrote {}", std::path::absolute(target).unwrap_or(target.clone()).display());
+        println!("Wrote {}", printable(&std::path::absolute(target).unwrap_or(target.clone()).display().to_string()));
         return Ok(());
     }
 
@@ -255,7 +256,7 @@ fn run(mut opts: Options) -> Result<(), String> {
 /// GitHub context for `root`, or None when it has no GitHub remote. Pull requests are fetched here, once.
 fn load_github(root: &std::path::Path) -> Option<GitHubInfo> {
     let mut info = GitHubInfo::detect(root)?;
-    println!("GitHub: {} — fetching open pull requests …", info.repo.web_url());
+    println!("GitHub: {} — fetching open pull requests …", printable(&info.repo.web_url()));
     // A failed fetch should not look like "no open PRs": leave the PR features off instead.
     if let Some((pulls, source)) = github::fetch_pulls(&info.repo) {
         println!("  loaded {source}");
@@ -283,6 +284,14 @@ fn print_summary(model: &CityModel) {
     );
 }
 
+/// `s` with every control character (C0, DEL and C1) other than newline and tab replaced by '?', for printing text
+/// that can come from the analysed repository: file names, git output and API errors in error messages, the GitHub
+/// remote from its git config. An ESC or CSI there would otherwise reach the terminal as an escape sequence (colours,
+/// cursor moves, retitling the window, writing the clipboard), and a CR could overwrite a line.
+pub fn printable(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() && c != '\n' && c != '\t' { '?' } else { c }).collect()
+}
+
 /// Opens `url` in the default browser with the platform's opener. The child is spawned and not waited for; its
 /// output is discarded.
 fn open_browser(url: &str) -> std::io::Result<()> {
@@ -307,6 +316,13 @@ mod tests {
 
     fn args(a: &[&str]) -> Result<Option<Options>, String> {
         parse_args(a.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// Escape sequences from a hostile repository (file names, git remotes) must not reach the terminal.
+    #[test]
+    fn printable_replaces_control_characters() {
+        assert_eq!(printable("a\x1b[31mred\x1b]0;title\x07\rb\n\tc\u{9b}d"), "a?[31mred?]0;title??b\n\tc?d");
+        assert_eq!(printable("ünïcödé ✓ %s %n"), "ünïcödé ✓ %s %n");
     }
 
     /// `--history` takes its count only after `=` and within 2..500, and cannot be combined with `--watch`.

@@ -8,7 +8,7 @@ import java.nio.file.Path;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
-/** Command-line rules of {@code --history}. */
+/** Command-line rules of {@code --history}, and terminal-safe printing. */
 class CodeCityTest {
 
     @Test
@@ -34,5 +34,13 @@ class CodeCityTest {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                 () -> CodeCity.parse(new String[]{"--history", "--watch", dir.toString()}));
         assertEquals("--history cannot be combined with --watch", e.getMessage());
+    }
+
+    /** Escape sequences from a hostile repository (file names, git remotes) must not reach the terminal. */
+    @Test
+    void printableReplacesControlCharacters() {
+        assertEquals("a?[31mred?]0;title??b\n\tc?d", CodeCity.printable("a\u001b[31mred\u001b]0;title\u0007\rb\n\tc\u009bd"));
+        assertEquals("ünïcödé ✓ %s %n", CodeCity.printable("ünïcödé ✓ %s %n"));
+        assertEquals("null", CodeCity.printable(null));
     }
 }

@@ -24,11 +24,13 @@ import java = codecity.analysis.java;
 import typescript = codecity.analysis.typescript;
 import rustlang = codecity.analysis.rustlang;
 import core.atomic : cas;
+import core.exception : OutOfMemoryError;
 import std.algorithm : canFind, endsWith, sort, startsWith;
 import std.array : array;
 import std.conv : to;
 import std.datetime.systime : SysTime;
-import std.file : DirEntry, dirEntries, exists, getSize, isDir, isFile, read, SpanMode, timeLastModified;
+import std.file : attrIsFile, DirEntry, dirEntries, exists, getLinkAttributes, getSize, isDir, isFile, read, SpanMode,
+    timeLastModified;
 import std.parallelism : taskPool;
 import std.path : baseName;
 import std.stdio : stderr;
@@ -40,6 +42,21 @@ immutable string[] ignoredDirs = [
     ".git", ".hg", ".svn", ".idea", ".gradle", ".mvn", "target", "build", "out", "node_modules", "dist", "coverage",
     "bower_components",
 ];
+
+/// Larger source files are not parsed and count as failed (16 MiB, far beyond any hand-written file). Reading and
+/// parsing take memory and time in proportion to the size, so a crafted multi-gigabyte file would otherwise exhaust
+/// memory or stall the analysis.
+enum ulong maxFileBytes = 16UL * 1024 * 1024;
+
+/// False for a file or directory name that is not valid UTF-8, or that contains U+FFFD: the Java edition only sees
+/// such names with U+FFFD in place of the bad bytes, so all three editions skip both and see the same files. Skipping
+/// them keeps undecodable bytes out of paths, module names and the JSON (whose writer rejects invalid UTF-8).
+bool isValidName(string name)
+{
+    try validate(name);
+    catch (Exception) return false;
+    return !name.canFind('\uFFFD');
+}
 
 /// Language-specific data the linker needs (imports, impl blocks, …).
 abstract class Context
@@ -152,9 +169,17 @@ final class SourceAnalyzer
         {
             // Cannot fail: findSources only returns files whose language is known.
             languageOf(f, langs[i]);
-            // A file that vanished or cannot be stat'ed keeps the zero stamp; it is still parsed (and fails there).
+            // The attributes are read without following links first. A path that is no longer a regular file (replaced
+            // by a link or a FIFO since the walk) and a file over `maxFileBytes` are not read at all: they fail,
+            // uncached. A file that vanished or cannot be stat'ed keeps the zero stamp; it is still parsed (and fails
+            // there).
             try
             {
+                if (!attrIsFile(getLinkAttributes(f)) || f.getSize > maxFileBytes)
+                {
+                    results[i] = ParsedFile(null, null, true);
+                    continue;
+                }
                 stamps[i].modified = f.timeLastModified;
                 stamps[i].size = f.getSize;
             }
@@ -279,11 +304,15 @@ final class SourceAnalyzer
             case Language.rust: return rustlang.parse(root, file, code);
             }
         }
+        catch (OutOfMemoryError e)
+            throw e; // not this file's fault: the run cannot go on, as in the other editions
         catch (Throwable e)
         {
-            // A bug in an analyser, not a syntax error in the file: report it (once) rather than hide it.
+            // A bug in an analyser (an exception, or an Error such as a failed bounds check, which the Java edition
+            // sees as a RuntimeException and the Rust edition as a panic), not a syntax error in the file: report it
+            // (once) rather than hide it.
             if (cas(&reportedFailure, false, true))
-                stderr.writefln("warning: could not analyse %s: %s", file, e.msg);
+                { import app : printable; stderr.writefln("warning: could not analyse %s: %s", printable(file), printable(e.msg)); }
             return ParsedFile(null, null, true);
         }
     }
@@ -292,8 +321,10 @@ final class SourceAnalyzer
 /// Supported files under `root`, skipping build output and VCS directories, sorted. The second overload also
 /// collects the `manifestNames` files it passes, sorted, into `manifests`.
 ///
-/// Symbolic links are not followed (neither to files nor to directories), which also rules out cycles. Directories
-/// that cannot be listed and entries that cannot be stat'ed are skipped silently. Returned paths are `root` joined
+/// Symbolic links are not followed (neither to files nor to directories), which also rules out cycles and keeps files
+/// outside the tree from being read. FIFOs, devices and sockets are not regular files (`isFile`), so nothing is opened
+/// that could block. Entries whose name fails `isValidName` are skipped. Directories that cannot be listed and entries
+/// that cannot be stat'ed are skipped silently. Returned paths are `root` joined
 /// with the relative path, as `dirEntries` builds them.
 string[] findSources(string root)
 {
@@ -316,7 +347,7 @@ string[] findSources(string root, out string[] manifests)
         {
             try
             {
-                if (e.isSymlink) continue;
+                if (e.isSymlink || !isValidName(e.name.baseName)) continue;
                 if (e.isDir)
                 {
                     if (!isIgnoredDir(e.name.baseName)) visit(e.name);
@@ -335,4 +366,42 @@ string[] findSources(string root, out string[] manifests)
     files.sort();
     manifests.sort();
     return files;
+}
+
+/// The walk over a hostile tree (the Java and Rust editions have the same test): links to files and directories
+/// outside the tree, a link cycle, a FIFO, a name that is not UTF-8 and an oversized file. Only the two ordinary files
+/// count; the oversized one is found but fails, and nothing blocks or escapes the tree.
+version (Posix) unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, symlink, tempDir, write;
+    import std.path : buildPath;
+    import std.process : execute;
+    import std.stdio : File;
+    import std.uuid : randomUUID;
+
+    const tmp = buildPath(tempDir, "codecity-walk-test-" ~ randomUUID.toString);
+    scope (exit) rmdirRecurse(tmp);
+    const outside = buildPath(tmp, "outside"), src = buildPath(tmp, "root", "src");
+    mkdirRecurse(outside);
+    mkdirRecurse(src);
+    write(buildPath(outside, "Secret.java"), "class Secret {}");
+    write(buildPath(src, "A.java"), "class A {}");
+    write(buildPath(src, "B.ts"), "export class B {}");
+    symlink(buildPath(outside, "Secret.java"), buildPath(src, "Link.java"));
+    symlink(outside, buildPath(src, "outlink"));
+    symlink(src, buildPath(src, "loop"));
+    {
+        auto big = File(buildPath(src, "Big.java"), "w");
+        big.seek(maxFileBytes);
+        big.rawWrite("x"); // sparse, maxFileBytes + 1 bytes
+    }
+    assert(execute(["mkfifo", buildPath(src, "Fifo.java")]).status == 0);
+    write(src ~ "/B\xffd.java", "class Bad {}");
+
+    auto a = new SourceAnalyzer().analyze(buildPath(tmp, "root"), true);
+    string[] fqns;
+    foreach (t; a.types) fqns ~= t.fqn;
+    assert(fqns == ["A", "src/B.ts:B"], fqns.to!string);
+    assert(a.files == 3, a.files.to!string); // A.java, B.ts and Big.java
+    assert(a.failedFiles == 1); // Big.java is too large to parse
 }

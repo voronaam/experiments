@@ -9,6 +9,13 @@
 /// a daemon heartbeat thread pings the event streams; `update` is called from the watcher's thread. `lock` guards
 /// `model_`, `clients` and every `EventClient`'s fields. A request takes the current model once at its start and
 /// uses that snapshot throughout, so a concurrent swap never mixes two models in one response.
+///
+/// Who may connect: binding to 127.0.0.1 keeps other machines out, but not web pages open in the user's browser. A
+/// page on `evil.example` can point its DNS name at 127.0.0.1 ("DNS rebinding") and then read this server's responses
+/// as same-origin. Such requests carry the attacker's name in their `Host` header, so every request whose `Host` is
+/// not a loopback name (`isAllowedHost`) is refused with 403. Ordinary cross-origin requests need no check: no
+/// response carries CORS headers, so the browser does not let the requesting page read it, and no endpoint changes
+/// any state.
 module codecity.server;
 
 import codecity.assets;
@@ -22,10 +29,10 @@ import std.algorithm : min, remove, startsWith;
 import std.array : array;
 import std.range : iota;
 import std.conv : to;
-import std.file : getSize, read;
+import std.file : attrIsFile, getLinkAttributes, getSize, read;
 import std.format : format;
 import std.socket;
-import std.string : indexOf, split;
+import std.string : indexOf, split, strip, toLower;
 import std.utf : validate;
 
 /// Larger source files are not sent to the viewer (a placeholder comment is sent instead).
@@ -144,15 +151,16 @@ final class CityServer
             catch (Throwable e)
             {
                 import std.stdio : stderr;
-                stderr.writeln("request failed: ", e.msg);
+                { import app : printable; stderr.writeln("request failed: ", printable(e.msg)); }
             }
         });
         t.isDaemon = true;
         t.start();
     }
 
-    /// Reads one request and dispatches it by path. Only the request line is looked at; headers and any body are
-    /// ignored. The query string is not percent-decoded (only `/api/source` uses it, with a plain number).
+    /// Reads one request and dispatches it by path. Of the headers only `Host` is looked at (a foreign one is refused,
+    /// see `isAllowedHost`); any body is ignored. The query string is not percent-decoded (only `/api/source` uses it,
+    /// with a plain number).
     private void handle(Socket conn)
     {
         scope (exit) conn.close();
@@ -176,6 +184,11 @@ final class CityServer
         const q = target.indexOf('?');
         const path = q < 0 ? target : target[0 .. q];
         const query = q < 0 ? "" : target[q + 1 .. $];
+        if (!isAllowedHost(headerValue(request, "host"), port))
+        {
+            send(conn, 403, "text/plain", "forbidden host");
+            return;
+        }
         auto model = current();
         switch (path)
         {
@@ -199,7 +212,7 @@ final class CityServer
     /// every rebuild. Send errors are ignored: the connection is closed afterwards anyway.
     private static void send(Socket conn, int status, string contentType, const(char)[] body_)
     {
-        const reason = status == 200 ? "OK" : status == 404 ? "Not Found" : "Bad Request";
+        const reason = status == 200 ? "OK" : status == 403 ? "Forbidden" : status == 404 ? "Not Found" : "Bad Request";
         auto head = format("HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
             status, reason, contentType, body_.length);
         sendAll(conn, head);
@@ -222,7 +235,10 @@ final class CityServer
     ///
     /// `id` is a building index (`CityModel.buildings`), so the client cannot name a path at all. Read errors and
     /// oversized files are reported inside the `code` field rather than as an HTTP error, so the viewer shows them
-    /// in place of the source. Invalid UTF-8 is replaced (`sanitize`) because the JSON writer needs valid UTF-8.
+    /// in place of the source. The attributes are read without following links, and only a regular file is read:
+    /// should the file have been replaced by a symbolic link (to a file outside the tree) or a FIFO since the analysis,
+    /// it is reported as unreadable rather than followed or blocked on. An error names the file by its path relative
+    /// to the root, never the absolute path. Invalid UTF-8 is replaced (`sanitize`) because the JSON writer needs valid UTF-8.
     private static void source(Socket conn, CityModel model, string query)
     {
         // size_t.max means "missing or not a number" and fails the range check below.
@@ -241,7 +257,8 @@ final class CityServer
         string code;
         try
         {
-            if (getSize(t.file) > maxSourceBytes) code = "// file too large to display";
+            if (!attrIsFile(getLinkAttributes(t.file))) code = "// unable to read " ~ b.file;
+            else if (getSize(t.file) > maxSourceBytes) code = "// file too large to display";
             else
             {
                 code = cast(string) read(t.file);
@@ -253,8 +270,8 @@ final class CityServer
                 }
             }
         }
-        catch (Exception e)
-            code = "// unable to read " ~ t.file ~ ": " ~ e.msg;
+        catch (Exception)
+            code = "// unable to read " ~ b.file;
         auto w = JsonWriter.create();
         w.beginObject().field("file", b.file).field("line", t.line).field("endLine", t.endLine).field("code", code).endObject();
         send(conn, 200, "application/json; charset=utf-8", w.finish());
@@ -295,3 +312,87 @@ final class CityServer
     }
 }
 
+/// True for a `Host` header naming this server by a loopback name: `localhost`, `127.0.0.1` or `[::1]`, either alone or
+/// followed by `:port` (case-insensitive). Anything else, including a missing header (null), is what a DNS-rebinding
+/// page would send (see the module comment). The Java and Rust editions apply the same rule.
+bool isAllowedHost(string host, ushort port)
+{
+    if (host is null) return false;
+    auto h = host.toLower;
+    const suffix = format(":%d", port);
+    if (h.length >= suffix.length && h[$ - suffix.length .. $] == suffix) h = h[0 .. $ - suffix.length];
+    return h == "localhost" || h == "127.0.0.1" || h == "[::1]";
+}
+
+/// The value of the first header called `name` (lower case; header names are matched case-insensitively), with
+/// surrounding blanks removed, or null if the request has no such header. `request` is the raw request head.
+private string headerValue(string request, string name)
+{
+    foreach (line; request.split("\r\n")[1 .. $])
+    {
+        if (line.length == 0) break; // end of the headers
+        const colon = line.indexOf(':');
+        if (colon > 0 && line[0 .. colon].toLower == name) return line[colon + 1 .. $].strip;
+    }
+    return null;
+}
+
+unittest
+{
+    foreach (ok; ["localhost", "localhost:8080", "LOCALHOST:8080", "127.0.0.1:8080", "[::1]:8080", "[::1]"])
+        assert(isAllowedHost(ok, 8080), ok);
+    foreach (bad; ["", "evil.example", "evil.example:8080", "localhost:8081", "localhost.:8080", "127.0.0.2:8080",
+            "localhost.evil.example:8080", "localhost:8080:8080", "0.0.0.0:8080"])
+        assert(!isAllowedHost(bad, 8080), bad);
+    assert(!isAllowedHost(null, 8080));
+    assert(headerValue("GET / HTTP/1.1\r\nhOsT:  localhost:1 \r\nHost: x\r\n\r\n", "host") == "localhost:1");
+    assert(headerValue("GET / HTTP/1.1\r\nX: y\r\n\r\nHost: x", "host") is null);
+}
+
+/// A DNS-rebinding request is refused; the source endpoint does not follow a link swapped in after analysis. The Java
+/// and Rust editions have the same test.
+version (Posix) unittest
+{
+    import codecity.analysis : SourceAnalyzer;
+    import codecity.github : GitHubInfo;
+    import std.algorithm : canFind;
+    import std.file : mkdirRecurse, remove, rmdirRecurse, symlink, tempDir, write;
+    import std.path : buildPath;
+    import std.uuid : randomUUID;
+
+    const tmp = buildPath(tempDir, "codecity-server-test-" ~ randomUUID.toString);
+    scope (exit) rmdirRecurse(tmp);
+    const root = buildPath(tmp, "root");
+    mkdirRecurse(root);
+    write(buildPath(root, "A.java"), "class A {}");
+    write(buildPath(tmp, "secret.txt"), "TOP SECRET");
+    auto server = new CityServer(CityModel.build(new SourceAnalyzer, root, true, false, false, GitHubInfo.init), 0);
+    auto t = new Thread({ server.run(); });
+    t.isDaemon = true;
+    t.start();
+
+    // Sends a raw GET (so the Host header is fully controlled; null leaves it out) and returns the whole response.
+    string get(string path, string host)
+    {
+        auto s = new TcpSocket(new InternetAddress("127.0.0.1", server.port));
+        scope (exit) s.close();
+        s.send("GET " ~ path ~ " HTTP/1.1\r\n" ~ (host is null ? "" : "Host: " ~ host ~ "\r\n") ~ "Connection: close\r\n\r\n");
+        char[4096] buf;
+        string r;
+        for (ptrdiff_t n; (n = s.receive(buf[])) > 0;) r ~= buf[0 .. n].idup;
+        return r;
+    }
+    const p = format(":%d", server.port);
+    assert(get("/api/city", "evil.example" ~ p).startsWith("HTTP/1.1 403"));
+    assert(get("/", "evil.example" ~ p).startsWith("HTTP/1.1 403"));
+    assert(get("/api/source?id=0", null).startsWith("HTTP/1.1 403"));
+    assert(get("/api/city", "localhost" ~ p).startsWith("HTTP/1.1 200"));
+    assert(get("/api/source?id=0", "127.0.0.1" ~ p).canFind("class A {}"));
+
+    remove(buildPath(root, "A.java"));
+    symlink(buildPath(tmp, "secret.txt"), buildPath(root, "A.java"));
+    const r = get("/api/source?id=0", "localhost" ~ p);
+    assert(!r.canFind("TOP SECRET"), r);
+    assert(r.canFind("unable to read A.java"), r);
+    assert(!r.canFind(tmp), r);
+}

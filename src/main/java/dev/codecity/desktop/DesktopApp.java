@@ -280,7 +280,7 @@ public final class DesktopApp extends Application {
 
             @Override
             public void openLink(String url) {
-                getHostServices().showDocument(url);
+                DesktopApp.this.openLink(url);
             }
         });
         inspector.hide();
@@ -734,7 +734,7 @@ public final class DesktopApp extends Application {
                     : " · " + gh.pulls().size() + (gh.pullsSource() != null && gh.pullsSource().startsWith("all") ? "" : "+") + " PRs";
             Hyperlink link = new Hyperlink(gh.repo().owner() + "/" + gh.repo().name() + prs);
             link.getStyleClass().addAll("chip", "gh-chip");
-            link.setOnAction(e -> getHostServices().showDocument(gh.repo().webUrl()));
+            link.setOnAction(e -> openLink(gh.repo().webUrl()));
             stats.getChildren().add(link);
         }
         if (!s.languages().isEmpty()) {
@@ -1269,6 +1269,15 @@ public final class DesktopApp extends Application {
             }
         }
         ImageIO.write(out, "png", file);
+    }
+
+    /** Opens {@code url} in the system browser if it is an https:// link ({@link Look#isWebLink}); else a toast. */
+    private void openLink(String url) {
+        if (Look.isWebLink(url)) {
+            getHostServices().showDocument(url);
+        } else {
+            toast("Not opening a link that is not https://");
+        }
     }
 
     private void toast(String message) {

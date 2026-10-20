@@ -211,7 +211,7 @@ public final class CityModel {
             gitLog.cancel(true);
             return Map.of();
         } catch (ExecutionException e) {
-            System.err.println("warning: git history unavailable: " + e.getCause());
+            System.err.println("warning: git history unavailable: " + CodeCity.printable(String.valueOf(e.getCause())));
             return Map.of();
         }
     }

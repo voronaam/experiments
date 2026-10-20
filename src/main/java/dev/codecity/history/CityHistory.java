@@ -4,6 +4,8 @@ import dev.codecity.analysis.Analysis;
 import dev.codecity.analysis.GitHistory;
 import dev.codecity.analysis.SourceAnalyzer;
 import dev.codecity.analysis.TypeInfo;
+import dev.codecity.github.Git;
+import dev.codecity.github.RepoCloner;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
@@ -23,6 +25,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
@@ -47,6 +50,12 @@ import java.util.stream.Stream;
  * <p>A type's git activity in snapshot k (commits, authors, last) is counted over the commits of the normal
  * {@link GitHistory} pass that touched the type's file (as it was named in that snapshot) with an author time not
  * after snapshot k's.
+ *
+ * <p>The repository is untrusted. Its git commands are hardened ({@link Git#command}); only a clone of the GitHub
+ * clone cache may fetch missing objects. Tree entries are only written below the temporary tree when their path is
+ * a plain relative one ({@link #safePath}): a crafted tree can hold entries such as ".." or "/abs/dir" that git itself
+ * would never check out. A blob larger than {@link SourceAnalyzer#MAX_FILE_BYTES}, which the analysis would not read
+ * anyway, is treated like a missing one: its file is absent from that snapshot.
  */
 public final class CityHistory {
 
@@ -118,7 +127,11 @@ public final class CityHistory {
         if (commits.isEmpty()) {
             return null;
         }
-        prefetchMissing(top, out);
+        // Only the clone cache may fetch: the configuration of any other repository could run programs on fetch.
+        boolean cached = RepoCloner.isCached(top);
+        if (cached) {
+            prefetchMissing(top, out);
+        }
 
         int[] picked = sample(commits.size(), n);
         List<String> shas = new ArrayList<>();
@@ -137,7 +150,7 @@ public final class CityHistory {
         Path tmp = Files.createTempDirectory("codecity-history");
         Path tree = tmp.resolve(root.getFileName() == null ? "root" : root.getFileName().toString());
         Files.createDirectories(tree);
-        try (Blobs blobs = new Blobs(top)) {
+        try (Blobs blobs = new Blobs(top, cached)) {
             Materialiser files = new Materialiser(analyzer, tree, prefix, blobs);
             int reported = 0;
             for (int k = 0; k < count; k++) {
@@ -233,10 +246,11 @@ public final class CityHistory {
     }
 
     /**
-     * Fetches, in one go, the objects a blobless clone (like the ones the GitHub clone cache makes) lacks. Without
-     * this, reading old blobs would make git fetch them lazily one request at a time. Works with git 2.34, which has
-     * no {@code fetch --refetch}: the missing object ids are fed to a plain fetch on stdin, and the noop negotiation
+     * Fetches, in one go, the objects a blobless clone of the GitHub clone cache lacks. Without this, reading old
+     * blobs would make git fetch them lazily one request at a time. Works with git 2.34, which has no
+     * {@code fetch --refetch}: the missing object ids are fed to a plain fetch on stdin, and the noop negotiation
      * stops git from walking the history to find common commits. Failures are ignored; git then still fetches lazily.
+     * Only called for a repository of the cache ({@link RepoCloner#isCached}).
      */
     private static void prefetchMissing(Path top, PrintStream out) {
         try {
@@ -260,7 +274,7 @@ public final class CityHistory {
                 return;
             }
             out.printf("  history: fetching %d missing objects …%n", n);
-            run(top, missing.toString().getBytes(StandardCharsets.UTF_8), "-c", "fetch.negotiationAlgorithm=noop",
+            run(top, true, missing.toString().getBytes(StandardCharsets.UTF_8), "-c", "fetch.negotiationAlgorithm=noop",
                     "fetch", "-q", "origin", "--no-tags", "--no-write-fetch-head", "--recurse-submodules=no",
                     "--filter=blob:none", "--stdin");
         } catch (IOException e) {
@@ -295,10 +309,35 @@ public final class CityHistory {
     }
 
     /**
+     * Whether {@code rel}, a path from a tree listing relative to the analysed root, may be written below the
+     * temporary tree: every '/'-separated component is non-empty and neither ".", "..", nor ".git" in any case, and
+     * none holds a backslash or a colon (path syntax on Windows). git never checks out anything else, but a crafted
+     * tree object can hold such entries, and writing "../../x" or "/home/u/x" would put a file outside the tree.
+     */
+    static boolean safePath(String rel) {
+        for (String part : rel.split("/", -1)) {
+            if (part.isEmpty() || part.equals(".") || part.equals("..") || part.toLowerCase(Locale.ROOT).equals(".git")
+                    || part.indexOf('\\') >= 0 || part.indexOf(':') >= 0 || part.indexOf('\0') >= 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * The pathspec ({@code -- :(literal)<dir>}) that limits a tree listing to the analysed root's directory, or
+     * nothing at the top of the work tree. Literal, so that glob characters in a directory name are not interpreted.
+     */
+    private static List<String> pathspec(String prefix) {
+        return prefix.isEmpty() ? List.of() : List.of("--", ":(literal)" + prefix.substring(0, prefix.length() - 1));
+    }
+
+    /**
      * Keeps the temporary tree in step with the snapshot being analysed. A file is written when the analysis would
-     * read it (a source file or a manifest) and its tree entry is a regular file; symbolic links and submodules are
-     * skipped. Every written file gets a modification time one millisecond after the previous one, so the analyser's
-     * cache (keyed by time and size) re-parses it even when its size did not change.
+     * read it (a source file or a manifest), its path is safe ({@link #safePath}) and its tree entry is a regular file;
+     * symbolic links and submodules are skipped. Every written file gets a modification time one millisecond after
+     * the previous one, so the analyser's cache (keyed by time and size) re-parses it even when its size did not
+     * change.
      */
     private static final class Materialiser {
         private final SourceAnalyzer analyzer;
@@ -321,9 +360,7 @@ public final class CityHistory {
          */
         void writeAll(Path top, String commit) throws IOException {
             List<String> args = new ArrayList<>(List.of("ls-tree", "-r", "-z", commit));
-            if (!prefix.isEmpty()) {
-                args.add(prefix);
-            }
+            args.addAll(pathspec(prefix));
             for (String entry : git(top, args.toArray(String[]::new)).split("\0")) {
                 int tab = entry.indexOf('\t');
                 if (tab < 0) {
@@ -335,16 +372,14 @@ public final class CityHistory {
         }
 
         /**
-         * Applies the changes between two commits under the prefix. The {@code --raw -z} form of the diff names the
-         * same changes as {@code --name-status}, plus the new mode and blob sha:
+         * Applies the changes between two commits under the prefix. {@code diff-tree -r -z} names the same changes as
+         * {@code diff --name-status}, plus the new mode and blob sha:
          * {@code :<old mode> <new mode> <old sha> <new sha> <status>\0<path>\0}. Added, modified and type-changed
          * entries are (re)written by their new mode, deletions removed.
          */
         void applyDiff(Path top, String from, String to) throws IOException {
-            List<String> args = new ArrayList<>(List.of("diff", "--raw", "-z", "--no-renames", "--no-abbrev", from, to));
-            if (!prefix.isEmpty()) {
-                args.addAll(List.of("--", prefix));
-            }
+            List<String> args = new ArrayList<>(List.of("diff-tree", "-r", "-z", "--no-renames", from, to));
+            args.addAll(pathspec(prefix));
             String[] parts = git(top, args.toArray(String[]::new)).split("\0");
             for (int i = 0; i + 1 < parts.length; i += 2) {
                 String[] head = parts[i].substring(1).split(" ");
@@ -357,21 +392,25 @@ public final class CityHistory {
             }
         }
 
-        /** Writes blob {@code sha} at {@code path} (relative to the work tree), or deletes it if it is not wanted. */
+        /**
+         * Writes blob {@code sha} at {@code path} (relative to the work tree), or deletes it if it is not wanted.
+         * Paths that are not safe ({@link #safePath}) are ignored altogether.
+         */
         private void apply(String mode, String sha, String path) throws IOException {
-            if (!path.startsWith(prefix)) {
+            if (!path.startsWith(prefix) || !safePath(path.substring(prefix.length()))) {
                 return;
             }
             Path file = tree.resolve(path.substring(prefix.length()));
             if (!analyzer.isSource(file) && !SourceAnalyzer.isManifest(file)) {
                 return;
             }
-            if (mode.equals("100644") || mode.equals("100755")) {
+            byte[] content = mode.equals("100644") || mode.equals("100755") ? blobs.read(sha) : null;
+            if (content != null) {
                 Files.createDirectories(file.getParent());
-                Files.write(file, blobs.read(sha));
+                Files.write(file, content);
                 Files.setLastModifiedTime(file, FileTime.fromMillis(++clock));
             } else {
-                // Deleted, or now a symlink or submodule.
+                // Deleted, now a symlink or submodule, or its blob is missing or too large.
                 Files.deleteIfExists(file);
             }
         }
@@ -379,20 +418,24 @@ public final class CityHistory {
 
     /**
      * Blob contents from a single {@code git cat-file --batch} process: each request is a sha on stdin, each answer a
-     * {@code <sha> blob <size>} header line, the content and a newline.
+     * {@code <sha> blob <size>} header line, the content and a newline, or {@code <sha> missing}.
      */
     private static final class Blobs implements AutoCloseable {
         private final Process process;
         private final OutputStream in;
         private final InputStream out;
 
-        Blobs(Path top) throws IOException {
-            process = new ProcessBuilder("git", "-C", top.toString(), "cat-file", "--batch")
-                    .redirectError(ProcessBuilder.Redirect.DISCARD).start();
+        /** {@code fetch}: whether git may fetch missing objects lazily (only in the clone cache). */
+        Blobs(Path top, boolean fetch) throws IOException {
+            process = Git.command(top, fetch, "cat-file", "--batch").redirectInput(ProcessBuilder.Redirect.PIPE).start();
             in = process.getOutputStream();
             out = new BufferedInputStream(process.getInputStream(), 1 << 16);
         }
 
+        /**
+         * The content of blob {@code sha}, or null when it is missing or larger than
+         * {@link SourceAnalyzer#MAX_FILE_BYTES} (its content is then skipped unread).
+         */
         byte[] read(String sha) throws IOException {
             in.write((sha + "\n").getBytes(StandardCharsets.US_ASCII));
             in.flush();
@@ -406,9 +449,14 @@ public final class CityHistory {
             }
             String[] h = header.toString(StandardCharsets.UTF_8).split(" ");
             if (h.length != 3) {
-                throw new IOException("cannot read blob " + sha + ": " + header);
+                return null; // "<sha> missing"
             }
-            byte[] content = out.readNBytes(Integer.parseInt(h[2]));
+            long size = Long.parseLong(h[2]);
+            if (size > SourceAnalyzer.MAX_FILE_BYTES) {
+                out.skipNBytes(size + 1); // the content and the newline after it
+                return null;
+            }
+            byte[] content = out.readNBytes((int) size);
             out.read(); // the newline after the content
             return content;
         }
@@ -441,19 +489,25 @@ public final class CityHistory {
 
     // ------------------------------------------------------------------ git
 
-    /** Stdout of {@code git -C dir args...}, decoded as UTF-8; throws when git cannot run or exits non-zero. */
+    /**
+     * Stdout of the hardened {@code git -C dir args...} ({@link Git#command}), decoded as UTF-8; throws when git
+     * cannot run or exits non-zero.
+     */
     private static String git(Path dir, String... args) throws IOException {
-        return run(dir, null, args);
+        return run(dir, false, null, args);
     }
 
     /**
-     * Runs git with {@code stdin} (or nothing) as input and returns its stdout. Stdin is written on its own thread so
-     * that a command printing while it reads cannot deadlock against us; stderr is discarded.
+     * Runs the hardened git ({@link Git#command}; {@code fetch} only for the clone cache) with {@code stdin} (or
+     * nothing) as input and returns its stdout. Stdin is written on its own thread so that a command printing while
+     * it reads cannot deadlock against us; stderr is discarded.
      */
-    private static String run(Path dir, byte[] stdin, String... args) throws IOException {
-        List<String> cmd = new ArrayList<>(List.of("git", "-C", dir.toString()));
-        cmd.addAll(List.of(args));
-        Process p = new ProcessBuilder(cmd).redirectError(ProcessBuilder.Redirect.DISCARD).start();
+    private static String run(Path dir, boolean fetch, byte[] stdin, String... args) throws IOException {
+        ProcessBuilder command = Git.command(dir, fetch, args);
+        if (stdin != null) {
+            command.redirectInput(ProcessBuilder.Redirect.PIPE);
+        }
+        Process p = command.start();
         Thread feeder = Thread.ofVirtual().start(() -> {
             try (OutputStream os = p.getOutputStream()) {
                 if (stdin != null) {

@@ -17,6 +17,8 @@ import javafx.stage.Window;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -63,16 +65,20 @@ final class SourceViewer {
 
     /**
      * Opens a window on {@code b}'s file, scrolled so the type's first line is near the top (three lines of context
-     * above it). Files over 4 MiB, like in the web viewer's server, are not loaded; a read error is shown in place of
-     * the code. Esc closes the window.
+     * above it). The rules are those of the web viewer's server ({@code api/source}): the file may have changed
+     * since the analysis, so only a regular file is read (a symbolic link or FIFO swapped in for it is not followed
+     * or opened) and files over 4 MiB are not loaded; invalid UTF-8 is replaced, and a read error is shown in place
+     * of the code. Esc closes the window.
      */
     static void show(Window owner, Building b, String stylesheet) {
         String code;
         try {
-            code = Files.size(b.type().file()) > 4L * 1024 * 1024 ? "// file too large to display"
-                    : Files.readString(b.type().file(), StandardCharsets.UTF_8);
+            BasicFileAttributes attrs = Files.readAttributes(b.type().file(), BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            code = !attrs.isRegularFile() ? "// unable to read " + b.file()
+                    : attrs.size() > 4L * 1024 * 1024 ? "// file too large to display"
+                    : new String(Files.readAllBytes(b.type().file()), StandardCharsets.UTF_8);
         } catch (IOException e) {
-            code = "// unable to read " + b.type().file() + ": " + e.getMessage();
+            code = "// unable to read " + b.file();
         }
         List<List<Token>> lines = highlight(code, switch (b.type().language()) {
             case JAVA -> KEYWORDS;

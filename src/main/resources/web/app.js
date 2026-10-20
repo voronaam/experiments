@@ -28,6 +28,9 @@ import * as Replay from './replay.js';
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+// Link targets come from the city data (the GitHub API's PR URLs, the repository URL); only https:// URLs become
+// links, anything else (javascript:, data:, file:, …) is replaced by an inert '#'. Still pass the result through esc.
+const httpsUrl = (u) => (/^https:\/\//i.test(String(u)) ? String(u) : '#');
 const fmt = (n) => (n >= 10000 ? (n / 1000).toFixed(n >= 100000 ? 0 : 1) + 'k' : n.toLocaleString());
 
 // ---------------------------------------------------------------- metrics & palettes
@@ -580,7 +583,7 @@ function renderStats() {
   const gh = state.city.github;
   if (gh) {
     const prs = gh.pulls ? ` · ${gh.pulls.length}${gh.pullsSource?.startsWith('all') ? '' : '+'} PRs` : '';
-    chips.unshift(`<a class="chip gh" href="${esc(gh.url)}" target="_blank" rel="noopener" title="Open on GitHub${gh.pullsSource ? ' · ' + esc(gh.pullsSource) : ''}">${GH_MARK}<b>${esc(gh.owner)}/${esc(gh.repo)}</b><span>${prs}</span></a>`);
+    chips.unshift(`<a class="chip gh" href="${esc(httpsUrl(gh.url))}" target="_blank" rel="noopener" title="Open on GitHub${gh.pullsSource ? ' · ' + esc(gh.pullsSource) : ''}">${GH_MARK}<b>${esc(gh.owner)}/${esc(gh.repo)}</b><span>${prs}</span></a>`);
   }
   const langs = Object.entries(stats.languages || {});
   if (langs.length) {
@@ -652,19 +655,19 @@ function renderGitHubSection(b) {
   const gh = state.city.github;
   if (!gh) return '';
   const links = `<div class="gh-links">
-      <a href="${esc(githubLink('blob', b))}" target="_blank" rel="noopener">${GH_MARK}File</a>
-      <a href="${esc(githubLink('blame', b))}" target="_blank" rel="noopener">Blame</a>
-      <a href="${esc(githubLink('history', b))}" target="_blank" rel="noopener">History</a>
+      <a href="${esc(httpsUrl(githubLink('blob', b)))}" target="_blank" rel="noopener">${GH_MARK}File</a>
+      <a href="${esc(httpsUrl(githubLink('blame', b)))}" target="_blank" rel="noopener">Blame</a>
+      <a href="${esc(httpsUrl(githubLink('history', b)))}" target="_blank" rel="noopener">History</a>
     </div>`;
   if (!gh.pulls) return links;
   const prs = (b.prs || []).map((k) => gh.pulls[k]);
   return `${links}
     <h3><span>Open pull requests</span><span>${prs.length}</span></h3>
     <div class="prs">${prs.map((pr) => `
-      <a class="pr" href="${esc(pr.url)}" target="_blank" rel="noopener">
-        <span class="pr-num">#${pr.number}</span>
+      <a class="pr" href="${esc(httpsUrl(pr.url))}" target="_blank" rel="noopener">
+        <span class="pr-num">#${esc(pr.number)}</span>
         <span class="pr-title">${esc(pr.title)}</span>
-        <span class="pr-meta">${esc(pr.author || 'ghost')} · ${relTime(Date.parse(pr.updatedAt) / 1000)} · ${pr.files} files${pr.draft ? ' · <i>draft</i>' : ''}</span>
+        <span class="pr-meta">${esc(pr.author || 'ghost')} · ${relTime(Date.parse(pr.updatedAt) / 1000)} · ${esc(pr.files)} files${pr.draft ? ' · <i>draft</i>' : ''}</span>
       </a>`).join('') || `<span class="muted">none${gh.pullsSource?.startsWith('all') ? '' : ' among the ' + esc(gh.pullsSource)}</span>`}
     </div>`;
 }
@@ -690,8 +693,8 @@ function renderInspector() {
       <button class="close" id="inspector-close" aria-label="Close">✕</button>
     </div>
     <div class="badges">
-      <span class="badge kind" style="background:${KINDS[b.kind] || KINDS.class}">${b.kind}</span>
-      <span class="badge">${LANGUAGES[b.lang] || b.lang}</span>
+      <span class="badge kind" style="background:${esc(KINDS[b.kind] || KINDS.class)}">${esc(b.kind)}</span>
+      <span class="badge">${esc(LANGUAGES[b.lang] || b.lang)}</span>
       ${b.test ? '<span class="badge">test</span>' : ''}
     </div>
     <div class="metrics">
@@ -975,7 +978,7 @@ function showTooltip(target, x, y) {
     // During replay: the values of snapshot round(p), dated, and no open PRs.
     const v = replay ? Replay.valuesAt(b, replay.r) : b;
     const at = replay ? `<span class="t-at">· at ${Replay.formatDate(replay.snapshots[replay.r].time)}</span>` : '';
-    html = `<b>${esc(b.name)}</b> <span class="t-pkg">${b.kind}</span><div class="t-pkg">${esc(b.pkg)}</div>
+    html = `<b>${esc(b.name)}</b> <span class="t-pkg">${esc(b.kind)}</span><div class="t-pkg">${esc(b.pkg)}</div>
       <div class="t-row"><span>${v.nom} methods</span><span>${v.noa} attrs</span><span>${fmt(v.loc)} loc</span><span>cx ${v.cx}</span>${b.commits != null ? `<span>${v.commits} commits</span>` : ''}${b.prs && !replay ? `<span class="t-pr">${b.prs.length} open PR${b.prs.length > 1 ? 's' : ''}</span>` : ''}${at}</div>`;
   } else {
     const d = state.city.districts[target.index];

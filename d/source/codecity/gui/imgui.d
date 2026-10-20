@@ -169,7 +169,6 @@ ImVec2 igGetWindowSize();
 float igGetWindowWidth();
 
 void igTextUnformatted(const(char)* text, const(char)* text_end);
-void igTextColored(ImVec4 col, const(char)* fmt, ...);
 bool igButton(const(char)* label, ImVec2 size);
 bool igSmallButton(const(char)* label);
 bool igCheckbox(const(char)* label, bool* v);
@@ -185,6 +184,7 @@ void igEndTable();
 bool igTableNextColumn();
 bool igBeginTooltip();
 void igEndTooltip();
+/// A printf-style format: call it only through `itemTooltip` in codecity.gui.app, which passes the text as `%s`.
 void igSetItemTooltip(const(char)* fmt, ...);
 void igDummy(ImVec2 size);
 void igSameLine(float offset_from_start_x, float spacing);

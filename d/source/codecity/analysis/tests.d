@@ -333,3 +333,234 @@ unittest // cached parses see manifest changes: same .rs file, renamed crate
     auto second = analyzer.analyze(f.root, true);
     get(second, "after_rename::A");
 }
+
+// ------------------------------------------------------------------ hostile input
+// Inputs that used to take quadratic time or memory, overflow the stack, or read outside the analysed tree. Each
+// analysis must finish well within the limit (the old behaviour took minutes or crashed). The Java edition's
+// AdversarialInputTest and the Rust edition's tests.rs run the same cases.
+
+/// Analyses the fixture and checks that it took less than a limit that is generous for these inputs in linear time,
+/// but far too short for the quadratic behaviour they guard against. (Unittests run unoptimised, hence the margin.)
+private Analysis analyzeInTime(ref Fixture f)
+{
+    import std.datetime.stopwatch : AutoStart, StopWatch;
+    auto sw = StopWatch(AutoStart.yes);
+    auto a = f.analyze();
+    assert(sw.peek.total!"seconds" < 60);
+    return a;
+}
+
+private bool has(ref Analysis a, string fqn)
+{
+    foreach (ref t; a.types) if (t.fqn == fqn) return true;
+    return false;
+}
+
+unittest // the hand-written Cargo.toml scan finds what the regular expression it replaced found
+{
+    import codecity.analysis.rustlang : packageName;
+    // "" stands for "no name", as packageName returns.
+    immutable string[2][] cases = [
+        ["[package]\nname = \"a-b\"\n", "a-b"],
+        ["[package]\nauthors = [\"x\"]\nname = \"n\"\n", "n"],
+        ["[package] # c\n  name\t=  \"x\"", "x"],
+        ["[package]\nversion = \"1\"\n\n  \nname = \"x\"\n", "x"],
+        ["[package]\r\nname = \"x\"\r\n", "x"],
+        ["[package]\nname =\n \"x\"\n", "x"],
+        ["[package]\nname = \"\"\nname = \"y\"\n", "y"],
+        ["[package]\n[dependencies]\n[package]\nname = \"second\"\n", "second"],
+        ["[workspace]\nname = \"w\"\n", ""],
+        ["[package]\n[lib]\nname = \"l\"\n", ""],
+        ["  [package]\nname = \"x\"\n", ""],
+        ["[package]", ""],
+        ["[package]\nname = \"x", ""],
+        ["[package]\n\x0cname = \"x\"\n", ""],
+        ["[package]\nversion = 1", ""],
+    ];
+    foreach (c; cases) assert(packageName(c[0]) == c[1], c[0]);
+}
+
+unittest // a long [package] table (the Java edition's regular expression overflowed the stack on it)
+{
+    import std.array : replicate;
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    f.put("Cargo.toml", "[package]\n" ~ "a = 1\n".replicate(100_000) ~ "name = \"deep\"\n");
+    f.put("src/lib.rs", "pub struct A;\n");
+    auto a = analyzeInTime(f);
+    assert(a.has("deep::A"));
+}
+
+unittest // manifests are read only as regular files within the size cap; a symbolic link could point anywhere
+{
+    import codecity.analysis.rustlang : maxManifestBytes;
+    import std.array : replicate;
+    import std.file : remove, symlink;
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    auto outside = Fixture.create();
+    scope (exit) outside.cleanup();
+    outside.put("Cargo.toml", "[package]\nname = \"leak\"\n");
+    f.put("a/src/lib.rs", "pub struct A;\n");
+    symlink(buildPath(outside.root, "Cargo.toml"), buildPath(f.root, "a/Cargo.toml"));
+    f.put("b/Cargo.toml", "[package]\nname = \"big\"\n" ~ "#".replicate(maxManifestBytes));
+    f.put("b/src/lib.rs", "pub struct B;\n");
+    f.put("web/src/c.ts", "export class C {}\n");
+    symlink(buildPath(outside.root, "Cargo.toml"), buildPath(f.root, "web/package.json"));
+    auto a = analyzeInTime(f);
+    foreach (ref t; a.types)
+    {
+        import std.algorithm : startsWith;
+        assert(!t.fqn.startsWith("leak::") && !t.fqn.startsWith("big::"));
+    }
+    assert(get(a, "web/src/c.ts:C").module_ == "", "a linked package.json is no project");
+}
+
+unittest // all methods on one line: lines of code used to be judged once per method, over the whole line
+{
+    import std.format : format;
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    string code = "class C {";
+    foreach (i; 0 .. 50_000) code ~= format(" void m%s() { int x = 1; }", i);
+    f.put("C.java", code ~ " }");
+    auto a = analyzeInTime(f);
+    auto c = get(a, "C");
+    assert(c.methods.length == 50_000 && c.loc == 1);
+}
+
+unittest // a < a < a …: every `<` was tried as type arguments down to the depth cap, re-lexing each time
+{
+    import std.array : replicate;
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    f.put("a.ts", "export const x = " ~ "a < ".replicate(100_000) ~ "b;\nexport class After {}\n");
+    auto a = analyzeInTime(f);
+    assert(a.has("a.ts:After"));
+}
+
+unittest // A.A.A…: every prefix of a qualified name was a reference, quadratic in its length
+{
+    import codecity.analysis.java : maxQualifiedPrefixes;
+    import std.array : replicate;
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    f.put("C.java", "class C { A" ~ ".A".replicate(200_000) ~ " x; }");
+    auto a = analyzeInTime(f);
+    assert(get(a, "C").references.length <= maxQualifiedPrefixes + 1);
+}
+
+unittest // every reference was checked against every import
+{
+    import std.format : format;
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    string java = "package p;\n", fields, ts;
+    foreach (i; 0 .. 20_000)
+    {
+        java ~= format("import a%s.B;\nimport w%s.*;\n", i, i);
+        fields ~= format(" B%s x%s;", i, i);
+        ts ~= format("import { B%s } from \"./b%s\";\n", i, i);
+    }
+    foreach (i; 0 .. 20_000) ts ~= format("export class C%s { x: B%s; }\n", i, i);
+    f.put("p/C.java", java ~ "class C {" ~ fields ~ " }");
+    f.put("a.ts", ts);
+    auto a = analyzeInTime(f);
+    assert(a.types.length >= 20_001);
+}
+
+unittest // only the first maxImportCandidates on-demand imports of a Java file are used
+{
+    import codecity.analysis.java : maxImportCandidates;
+    import std.array : replicate;
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    f.put("q/D.java", "package q; public class D {}");
+    const first = "import w.*;\n".replicate(maxImportCandidates - 1);
+    f.put("p/In.java", "package p;\n" ~ first ~ "import q.*;\nclass In { D d; }");
+    f.put("p/Out.java", "package p;\n" ~ first ~ "import w.*;\nimport q.*;\nclass Out { D d; }");
+    auto a = analyzeInTime(f);
+    assert(a.dependencies["p.In"].canFind("q.D"));
+    assert(!a.dependencies["p.Out"].canFind("q.D"));
+}
+
+unittest // the same for Rust glob imports, with maxGlobImports per module
+{
+    import codecity.analysis.rustlang : maxGlobImports;
+    import std.array : replicate;
+    import std.format : format;
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    f.put("Cargo.toml", "[package]\nname = \"k\"\n");
+    const first = "use w::*;\n".replicate(maxGlobImports - 1);
+    f.put("src/lib.rs", "pub mod q { pub struct D; }\npub mod a {\n" ~ first ~ "use crate::q::*;\npub struct In { d: D }\n}\n"
+        ~ "pub mod b {\n" ~ first ~ "use w::*;\nuse crate::q::*;\npub struct Out { d: D }\n}\n");
+    string many, fields;
+    foreach (i; 0 .. 20_000)
+    {
+        many ~= format("use g%s::*;\n", i);
+        fields ~= format(" x%s: B%s,", i, i);
+    }
+    f.put("src/many.rs", many ~ "pub struct S {" ~ fields ~ " }\n");
+    auto a = analyzeInTime(f);
+    assert(a.dependencies["k::a::In"].canFind("k::q::D"));
+    assert(!a.dependencies["k::b::Out"].canFind("k::q::D"));
+}
+
+unittest // over-long package, outer type, namespace and module names: the buildings inside are skipped
+{
+    import codecity.analysis.text : maxFqnBytes;
+    import std.array : replace, replicate;
+    import std.format : format;
+    import std.uni : toLower;
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    const longName = "N".replicate(maxFqnBytes + 1);
+    string classes;
+    foreach (i; 0 .. 2_000) classes ~= format("class C%s {}\n", i);
+    f.put("p/A.java", "package " ~ longName ~ ";\n" ~ classes);
+    f.put("p/B.java", "class " ~ longName ~ " {\n" ~ classes ~ "}\nclass Kept {}\n");
+    f.put("a.ts", "namespace " ~ longName ~ " {\n" ~ classes.replace("class", "export class") ~ "}\nexport class Kept {}\n");
+    f.put("Cargo.toml", "[package]\nname = \"k\"\n");
+    f.put("src/lib.rs", "mod " ~ longName.toLower ~ " {\n" ~ classes.replace("class", "pub struct").replace(" {}", ";")
+        ~ "}\npub struct Kept;\n");
+    auto a = analyzeInTime(f);
+    string[] fqns;
+    foreach (ref t; a.types) fqns ~= t.fqn;
+    fqns.sort();
+    assert(fqns == ["Kept", "a.ts:Kept", "k::Kept"]);
+    assert(a.failedFiles == 4);
+}
+
+unittest // member types nested deeper than maxTypeNesting are not buildings
+{
+    import codecity.analysis.java : maxTypeNesting;
+    import std.array : replicate;
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    f.put("C.java", "class C0 {".replicate(maxTypeNesting + 4) ~ "}".replicate(maxTypeNesting + 4));
+    auto a = analyzeInTime(f);
+    assert(a.types.length == maxTypeNesting && a.failedFiles == 1);
+}
+
+unittest // repeated declarations of one name get numbered ids without rescanning from the first
+{
+    import std.array : replicate;
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    f.put("a.ts", "interface A {}\n".replicate(30_000));
+    auto a = analyzeInTime(f);
+    assert(a.has("a.ts:A#interface29999"));
+}
+
+unittest // module buildings created for impls are resolvable from types and from impls before or after them
+{
+    auto f = Fixture.create();
+    scope (exit) f.cleanup();
+    f.put("Cargo.toml", "[package]\nname = \"k\"\n");
+    f.put("src/lib.rs", "pub trait Tr {}\npub mod a { impl crate::Tr for u8 { fn f() { crate::b::g(); } } }\npub mod b { impl crate::Tr for u16 { fn f() { crate::b::g(); } } }\npub struct User { f: b::helper }\npub mod c { impl crate::Tr for u32 { fn f() { crate::b::g(); } } }\n");
+    auto a = f.analyze();
+    assert(a.dependencies["k::User"].canFind("k::b::{fn}"));
+    assert(a.dependencies["k::c::{fn}"].canFind("k::b::{fn}"));
+    assert(a.dependencies["k::a::{fn}"].canFind("k::b::{fn}"));
+}

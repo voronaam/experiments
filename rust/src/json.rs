@@ -185,6 +185,24 @@ mod tests {
         assert_eq!(w.finish(), format!(r#"{{"a":"{escaped}","b":2,"c":0.4,"d":1.235,"e":[1,2]}}"#));
     }
 
+    /// A hostile string (from a file name, commit message or pull request title) cannot end or confuse the
+    /// `<script>` element an export embeds the JSON in, nor break a JavaScript string. The Java and D editions have
+    /// the same test.
+    #[test]
+    fn escapes_everything_that_could_escape_a_script_element() {
+        let mut w = JsonWriter::new();
+        w.begin_array().str("</script><!--\u{2028}\u{2029}\u{1}&>\"\\").end_array();
+        assert_eq!(w.finish(), r#"["\u003c/script\u003e\u003c!--\u2028\u2029\u0001\u0026\u003e\"\\"]"#);
+    }
+
+    /// The viewer files an export inlines as they are must not contain what would end their element early.
+    #[test]
+    fn inlined_viewer_files_cannot_end_their_elements() {
+        let (js, css) = (crate::assets::APP_JS.to_ascii_lowercase(), crate::assets::STYLE_CSS.to_ascii_lowercase());
+        assert!(!js.contains("</script") && !js.contains("<!--"));
+        assert!(!css.contains("</style"));
+    }
+
     #[test]
     fn rounds_halves_up_like_java_and_writes_non_finite_as_zero() {
         let mut w = JsonWriter::new();

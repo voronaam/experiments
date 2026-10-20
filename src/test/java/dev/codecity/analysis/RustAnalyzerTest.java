@@ -183,4 +183,18 @@ class RustAnalyzerTest {
         write("src/lib.rs", "pub struct A; // changed, so the file is parsed again\n");
         assertTrue(byFqn(analyzer.analyze(root, true)).containsKey("after::A"));
     }
+
+    /**
+     * Module buildings created for impls (module b has only an impl) are resolvable like any other building: from a
+     * type declared before them, and from impls attached before or after them. The editions used to differ here.
+     */
+    @Test
+    void moduleBuildingsCreatedForImplsAreResolvable() throws IOException {
+        write("Cargo.toml", "[package]\nname = \"k\"\n");
+        write("src/lib.rs", "pub trait Tr {}\npub mod a { impl crate::Tr for u8 { fn f() { crate::b::g(); } } }\npub mod b { impl crate::Tr for u16 { fn f() { crate::b::g(); } } }\npub struct User { f: b::helper }\npub mod c { impl crate::Tr for u32 { fn f() { crate::b::g(); } } }\n");
+        Analysis a = analyze();
+        assertTrue(a.dependencies().get("k::User").contains("k::b::{fn}"));
+        assertTrue(a.dependencies().get("k::c::{fn}").contains("k::b::{fn}"));
+        assertTrue(a.dependencies().get("k::a::{fn}").contains("k::b::{fn}"));
+    }
 }

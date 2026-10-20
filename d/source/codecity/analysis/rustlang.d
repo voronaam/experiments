@@ -25,10 +25,15 @@ import codecity.model;
 import core.sync.mutex : Mutex;
 import std.algorithm : canFind, endsWith, startsWith;
 import std.array : join, replace, split;
-import std.file : exists, isFile, readText;
+import std.file : attrIsFile, exists, getLinkAttributes, getSize, isFile, readText;
 import std.path : baseName, buildPath, dirName, pathSplitter;
-import std.regex : ctRegex, matchFirst;
+import std.string : indexOf;
 import std.uni : isLower, isWhite;
+
+/// Glob imports (`use a::b::*;`) beyond this many in one module are ignored. A name is tried in each of them, so the
+/// cap keeps a crafted file with very many from making the analysis quadratic; real modules have a handful. The Java
+/// and Rust editions use the same limit.
+enum size_t maxGlobImports = 64;
 
 /// Last fqn segment of a module's function building. Braces cannot occur in a Rust identifier, so it never clashes
 /// with a real item.
@@ -104,9 +109,13 @@ ParsedFile parse(string root, string file, string code)
 
     // The crate is the build module of every type in it.
     auto st = new FileState(code, tree, file, crate.name);
-    auto scope_ = st.addScope(new Scope([crate.name] ~ modulePath));
-    st.visitItems(0, scope_, scope_, file.baseName, test);
-    return ParsedFile(st.types, st.ctx, tree.errors);
+    auto path = [crate.name] ~ modulePath;
+    if (st.fits(path))
+    {
+        auto scope_ = st.addScope(new Scope(path));
+        st.visitItems(0, scope_, scope_, file.baseName, test);
+    }
+    return ParsedFile(st.types, st.ctx, tree.errors || st.skipped);
 }
 
 /// The directory module paths are relative to: the nearest one (within the crate) holding `lib.rs` or `main.rs`.
@@ -181,23 +190,85 @@ private Crate crateOf(string root, string dir)
     return Crate(root.baseName.replace("-", "_"), root);
 }
 
+/// Largest `Cargo.toml` that is read; a bigger one counts as having no package name. Real manifests are a few KiB;
+/// the cap keeps a crafted one from exhausting memory. The Java and Rust editions use the same limit.
+enum ulong maxManifestBytes = 1024 * 1024;
+
 /// The `name` in the `[package]` table of `dir`'s Cargo.toml, with hyphens turned into underscores as the crate is
-/// written in Rust paths, or "" when missing or unreadable.
-///
-/// A regex rather than a TOML parser: `(?m)` lets `^` match at every line start; the lines lazily skipped before
-/// `name` must not start with `[` (after indentation), so the match cannot run into the next `[table]`. A `[`
-/// elsewhere on a line (`authors = ["a"]`) does not stop it.
+/// written in Rust paths, or "" when the manifest is missing, unreadable, not valid UTF-8, larger than
+/// `maxManifestBytes` or has no package name. Only a regular file is read: a symbolic link (which could point outside
+/// the analysed tree, or at a device such as `/dev/zero`) counts as missing.
 package string readCrateName(string dir)
 {
     const manifest = buildPath(dir, "Cargo.toml");
-    if (!manifest.exists || !manifest.isFile) return "";
     try
     {
-        auto m = readText(manifest).matchFirst(ctRegex!(`(?m)^\[package\][^\n]*\n(?:[ \t\r]*(?:[^\[\s][^\n]*)?\n)*?[ \t]*name\s*=\s*"([^"]+)"`));
-        return m.empty ? "" : m[1].replace("-", "_");
+        // getLinkAttributes does not follow a symbolic link, so a link is not a regular file here.
+        if (!attrIsFile(getLinkAttributes(manifest)) || getSize(manifest) > maxManifestBytes) return "";
+        return packageName(readText(manifest)).replace("-", "_");
     }
     catch (Exception)
         return "";
+}
+
+/// The `name = "…"` of the `[package]` table of a Cargo.toml, or "" when there is none. Not a TOML parser, and
+/// hand-written rather than a regular expression so that all three editions run the same scan in time linear in the
+/// manifest's size (std.regex backtracks).
+///
+/// Starting at each line that begins with `[package]`, the following lines are scanned: the first one of the form
+/// `[ \t]* name \s* = \s* "value"` gives the name (the value may not be empty and ends at the next `"`, even on a later
+/// line). Lines skipped on the way must end with a newline and must not start with `[` after indentation
+/// (`[ \t\r]`), which keeps the search inside the table, as the next table header starts with `[`; a `[` elsewhere on
+/// a line (`authors = ["…"]`) does not stop it. When a `[package]` line yields nothing, the search goes on at the next
+/// one. `\s` is ASCII whitespace and lines end at `\n` only.
+package string packageName(string toml) pure @safe
+{
+    const n = toml.length;
+    size_t nextLine(size_t i)
+    {
+        const p = toml[i .. $].indexOf('\n');
+        return p < 0 ? n : i + p + 1;
+    }
+    for (size_t start = 0; start < n; start = nextLine(start))
+    {
+        if (!toml[start .. $].startsWith("[package]")) continue;
+        size_t line = nextLine(start);
+        while (line < n)
+        {
+            const name = nameValue(toml, line);
+            if (name.length) return name;
+            // Skip the line, unless it would leave the table.
+            size_t i = line;
+            while (i < n && (toml[i] == ' ' || toml[i] == '\t' || toml[i] == '\r')) i++;
+            if (i == n || toml[i] == '[' || (toml[i] != '\n' && isTomlSpace(toml[i]))) break;
+            const p = toml[i .. $].indexOf('\n');
+            if (p < 0) break;
+            line = i + p + 1;
+        }
+    }
+    return "";
+}
+
+/// The value of a `[ \t]* name \s* = \s* "value"` at byte `i`, or "" when there is none.
+private string nameValue(string s, size_t i) pure @safe
+{
+    const n = s.length;
+    while (i < n && (s[i] == ' ' || s[i] == '\t')) i++;
+    if (!s[i .. $].startsWith("name")) return "";
+    i += 4;
+    while (i < n && isTomlSpace(s[i])) i++;
+    if (i == n || s[i] != '=') return "";
+    i++;
+    while (i < n && isTomlSpace(s[i])) i++;
+    if (i == n || s[i] != '"') return "";
+    const close = s[i + 1 .. $].indexOf('"');
+    return close > 0 ? s[i + 1 .. i + 1 + close] : "";
+}
+
+/// ASCII whitespace, as `\s` in a Java regular expression: space, `\t \n \x0B \x0C \r`.
+private bool isTomlSpace(char c) pure nothrow @safe @nogc
+{
+    return c == ' ' || (c >= '\t' && c <= '\r');
 }
 
 /// Everything collected while walking one file.
@@ -205,11 +276,13 @@ private final class FileState
 {
     string code;
     Tree tree;
-    string[] lines;
+    Lines lines;
     /// module_ is the crate name.
     string file, module_;
     TypeDecl[] types;
     RustContext ctx;
+    /// Set when a module or building was skipped for the length of its fqn (see `fits`).
+    bool skipped;
 
     this(string code, Tree tree, string file, string module_)
     {
@@ -219,6 +292,16 @@ private final class FileState
         this.file = file;
         this.module_ = module_;
         ctx = new RustContext;
+    }
+
+    /// Whether the module with this path gets a module building fqn (`path::{fn}`) within `maxFqnBytes`. If not, the
+    /// module and everything in it are skipped, and the file counts as failed; so no fqn of a building inside it can
+    /// be too long either, apart from a single over-long name, which `addType` checks.
+    bool fits(const string[] path)
+    {
+        const fits = pathBytes(path) + 2 + functionsId.length <= maxFqnBytes;
+        if (!fits) skipped = true;
+        return fits;
     }
 
     Scope addScope(Scope s)
@@ -313,7 +396,9 @@ private final class FileState
                 if (body_ != noNode)
                 {
                     const modName = name(item);
-                    auto childScope = addScope(new Scope(scope_.path ~ modName));
+                    auto childPath = scope_.path ~ modName;
+                    if (!fits(childPath)) break;
+                    auto childScope = addScope(new Scope(childPath));
                     // The module always gets its own scope (its names are `parent::tests::…`), but a cfg(test)
                     // module does not get its own district.
                     visitItems(body_, childScope, cfgTest ? district : childScope, "mod " ~ modName, isTest);
@@ -353,6 +438,11 @@ private final class FileState
     void addType(size_t item, Scope scope_, Scope district, string kind_, uint noa, MethodInfo[] methods, bool test)
     {
         const typeName_ = name(item);
+        if (pathBytes(scope_.path) + 2 + typeName_.length > maxFqnBytes)
+        {
+            skipped = true;
+            return;
+        }
         bool[string] refs;
         collectRefs(code, tree, item, refs);
         const id = fqn(scope_, typeName_);
@@ -432,8 +522,8 @@ private final class FileState
             {
                 // A single name, at the top level or inside a `{…}` list.
                 const single = tok(node.first);
-                if (single == "self" && prefix.length) scope_.uses[prefix[$ - 1]] = prefix.dup; // a::{self}
-                else scope_.uses[single] = prefix ~ single;
+                if (single == "self" && prefix.length) addUse(scope_, prefix[$ - 1], prefix.dup); // a::{self}
+                else addUse(scope_, single, prefix ~ single);
                 break;
             }
             // `use a::b::C;` binds the last segment; `use a::b::self` binds `b`.
@@ -444,29 +534,42 @@ private final class FileState
                 path = path[0 .. $ - 1];
                 alias_ = path.length ? path[$ - 1] : "self";
             }
-            scope_.uses[alias_] = path;
+            addUse(scope_, alias_, path);
             break;
         }
         case NodeKind.useAs:
         {
             const alias_ = tok(node.name);
             // `use Trait as _;` only brings trait methods into scope and binds no name.
-            if (alias_ != "_") scope_.uses[alias_] = prefix ~ segments(tree.child(n, NodeKind.usePath));
+            if (alias_ != "_") addUse(scope_, alias_, prefix ~ segments(tree.child(n, NodeKind.usePath)));
             break;
         }
         case NodeKind.useGroup:
         {
             auto p = prefix ~ segments(tree.child(n, NodeKind.usePrefix));
+            // A group under an over-long prefix only holds over-long paths (see addUse).
+            if (pathBytes(p) > maxFqnBytes) break;
             foreach (c; tree.children(n))
                 if (tree.nodes[c].kind != NodeKind.usePrefix) expandUse(c, p, scope_);
             break;
         }
         case NodeKind.useGlob:
-            scope_.globs ~= prefix ~ segments(tree.child(n, NodeKind.usePrefix));
+        {
+            auto path = prefix ~ segments(tree.child(n, NodeKind.usePrefix));
+            if (scope_.globs.length < maxGlobImports && pathBytes(path) <= maxFqnBytes) scope_.globs ~= path;
             break;
+        }
         default:
             break;
         }
+    }
+
+    /// Records `use path as alias`, unless the path is longer than `maxFqnBytes`: it is copied into a candidate for
+    /// every reference to the alias, and a group of many names under one long prefix would make that quadratic. (Only
+    /// a path of mostly `super` could still name a building.)
+    void addUse(Scope scope_, string alias_, string[] path)
+    {
+        if (pathBytes(path) <= maxFqnBytes) scope_.uses[alias_] = path;
     }
 
     /// The segments of a use path: `a::b::c` → [a, b, c] (a leading `::` adds none).
@@ -498,7 +601,7 @@ private void collectRefs(string code, ref const Tree tree, size_t node, ref bool
         switch (n.kind)
         {
         case NodeKind.typeIdent:
-            refs[tree.tokText(code, n.first).idup] = true;
+            addReference(tree.tokText(code, n.first).idup, refs);
             break;
         case NodeKind.ident:
             addIdentifier(tree.tokText(code, n.first), refs);
@@ -514,7 +617,7 @@ private void collectRefs(string code, ref const Tree tree, size_t node, ref bool
             }
             string s;
             foreach (dchar c; tree.rangeText(code, n.first, n.last)) if (!isWhite(c)) s ~= c;
-            refs[s] = true;
+            addReference(s, refs);
             i = n.end; // nothing inside a path is a separate reference
             continue;
         default:
@@ -528,7 +631,22 @@ private void collectRefs(string code, ref const Tree tree, size_t node, ref bool
 private void addIdentifier(string s, ref bool[string] refs)
 {
     if (s.length && s[0] == '\'') s = s[1 .. $];
-    if (isUpperStart(s)) refs[s.idup] = true;
+    if (isUpperStart(s)) addReference(s.idup, refs);
+}
+
+/// Adds a reference unless it is longer than `maxFqnBytes`: no building's fqn is that long, so it could not resolve,
+/// and resolving it would copy it into every candidate tried.
+private void addReference(string name, ref bool[string] refs)
+{
+    if (name.length <= maxFqnBytes) refs[name] = true;
+}
+
+/// The length in bytes of a module path joined with `::`.
+private size_t pathBytes(const string[] path)
+{
+    size_t n = path.length ? 2 * (path.length - 1) : 0;
+    foreach (segment; path) n += segment.length;
+    return n;
 }
 
 /// McCabe cyclomatic complexity of a function body: 1 + `if`, `while`, `loop`, `for`, each `&&`/`||`, and k - 1 per
@@ -562,8 +680,9 @@ uint complexity(ref const Tree tree, size_t body_)
 /// 2. Attach each impl to the type it implements, resolved in the impl's scope. An impl for a type outside the
 ///    project (`impl From<Cart> for String`) goes to the function building of the module it is written in, which is
 ///    created if the module has no free functions. The implemented trait and the impl body's references become
-///    dependencies of the target.
+///    dependencies of the target; they are resolved after all impls are attached.
 /// 3. For every building: add the attached impls' methods and LOC, and resolve its own references in its own scope.
+/// References resolve against every building, including the function buildings created in step 2.
 Linked link(ParsedFile[] files)
 {
     // Every file of this analysis is parsed by now: the next analysis reads the manifests again.
@@ -599,6 +718,9 @@ Linked link(ParsedFile[] files)
     // Attach impl blocks to their types; impls of foreign types go to the module's function building.
     Impl[][string] attached;
     bool[string][string] extraDeps;
+    // crate → build module of the module buildings created for impls
+    string[string] moduleOfCrate;
+    string[] targets; // per impl, in impl order
     foreach (ref imp; impls)
     {
         auto target = resolver.resolveType(imp.type, imp.scope_);
@@ -613,13 +735,19 @@ Linked link(ParsedFile[] files)
                 // the same crate (all of a crate's types share it); it starts with no LOC of its own, the impl's LOC
                 // is added below like for any other target. District and name are those visitItems would have given
                 // it (a #[cfg(test)] module stays in its parent's district).
+                // Looked up once per crate rather than once per new module building.
                 string module_;
-                foreach (fqn; order)
-                    if (fqn.startsWith(imp.scope_.crate ~ "::"))
-                    {
-                        module_ = byFqn[fqn].module_;
-                        break;
-                    }
+                if (auto hit = imp.scope_.crate in moduleOfCrate) module_ = *hit;
+                else
+                {
+                    foreach (fqn; order)
+                        if (fqn.startsWith(imp.scope_.crate ~ "::"))
+                        {
+                            module_ = byFqn[fqn].module_;
+                            break;
+                        }
+                    moduleOfCrate[imp.scope_.crate] = module_;
+                }
                 TypeDecl t;
                 t.language = Language.rust;
                 t.fqn = target;
@@ -637,6 +765,16 @@ Linked link(ParsedFile[] files)
             }
         }
         attached[target] ~= imp;
+        targets ~= target;
+    }
+    // References resolve only now, against every building including the module buildings just created, so that the
+    // result does not depend on the order of the impls (the editions used to differ here).
+    bool[string] all;
+    foreach (k; byFqn.keys) all[k] = true;
+    resolver = Resolver(all, crates);
+    foreach (i, ref imp; impls)
+    {
+        const target = targets[i];
         if (target !in extraDeps) extraDeps[target] = null;
         if (imp.trait_ !is null)
             if (auto t = resolver.resolveType(imp.trait_, imp.scope_)) extraDeps[target][t] = true;

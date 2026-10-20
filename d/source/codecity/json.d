@@ -177,3 +177,22 @@ unittest
     w.endArray();
     assert(w.finish() == "[2.063,-2.062,-1,0,0,0]");
 }
+
+/// A hostile string (from a file name, commit message or pull request title) cannot end or confuse the `<script>`
+/// element an export embeds the JSON in, nor break a JavaScript string. The Java and Rust editions have the same test.
+unittest
+{
+    auto w = JsonWriter.create();
+    w.beginArray().value("</script><!--\u2028\u2029\x01&>\"\\").endArray();
+    assert(w.finish() == `["\u003c/script\u003e\u003c!--\u2028\u2029\u0001\u0026\u003e\"\\"]`);
+}
+
+/// The viewer files an export inlines as they are must not contain what would end their element early.
+unittest
+{
+    import codecity.assets : appJs, styleCss;
+    import std.algorithm : canFind;
+    import std.uni : toLower;
+    assert(!appJs.toLower.canFind("</script") && !appJs.toLower.canFind("<!--"));
+    assert(!styleCss.toLower.canFind("</style"));
+}

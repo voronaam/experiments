@@ -53,6 +53,9 @@ public final class HtmlExporter {
                 "<script id=\"city-data\" type=\"application/json\">" + model.json() + "</script>\n"
                         + "<script type=\"module\">\n" + js + "\n</script>");
 
+        // Last, once every inline script is in place: their hashes go into the page's Content-Security-Policy.
+        html = CityServer.withScriptHashes(html);
+
         Path parent = target.toAbsolutePath().getParent();
         if (parent != null) {
             Files.createDirectories(parent);

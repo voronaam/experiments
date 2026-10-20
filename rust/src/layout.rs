@@ -468,8 +468,8 @@ mod tests {
             test: false,
             methods: vec![],
             references: HashSet::new(),
-            explicit_imports: vec![],
-            wildcard_imports: vec![],
+            explicit_imports: Default::default(),
+            wildcard_imports: Default::default(),
         }
     }
 

@@ -7,8 +7,8 @@
 ///
 /// 1. `git rev-list --first-parent --reverse HEAD` lists the commits, oldest first; `sampleIndices` picks at most N
 ///    of them, always including the first and the last (HEAD). One `git log --no-walk` call reads their metadata.
-/// 2. A partial (blobless) clone is missing most old file contents; they are fetched in one batch up front
-///    (`prefetchMissing`), not lazily one by one.
+/// 2. A partial (blobless) clone of the clone cache is missing most old file contents; they are fetched in one batch
+///    up front (`prefetchMissing`), not lazily one by one.
 /// 3. One temporary directory mirrors the analysed root at the current snapshot. The first snapshot writes every
 ///    relevant blob (`git ls-tree`); each later one applies the difference to its predecessor (`git diff-tree`).
 ///    Only files the analysis looks at are written: supported sources and the manifests that affect their parse.
@@ -17,12 +17,19 @@
 ///    modification time and so hit the parse cache; every written file gets a new, strictly increasing modification
 ///    time, so it is parsed again even when its size did not change.
 ///
+/// The repository is untrusted. Its git commands are hardened (`codecity.git.gitArgs`); only a clone of the GitHub
+/// clone cache may fetch missing objects. Tree entries are only written below the mirror when their path is a plain
+/// relative one (`safePath`): a crafted tree can hold entries such as `..` or `/abs/dir` that git itself would never
+/// check out. A blob larger than `codecity.git.maxBlobBytes`, which the analysis would not read anyway, is treated
+/// like a missing one: its file is absent from that snapshot.
+///
 /// The Java and Rust editions implement the same rules and produce the same snapshots, so the city JSON with history
 /// is identical across editions.
 module codecity.history;
 
 import codecity.analysis : languageOf, manifestNames, SourceAnalyzer;
-import codecity.git : BlobReader, bytes, lossyUtf8, realPath, run;
+import codecity.git : BlobReader, bytes, gitArgs, gitEnv, lossyUtf8, realPath, run;
+import codecity.github : isCached;
 import codecity.model;
 import core.time : msecs;
 import std.algorithm : canFind, startsWith;
@@ -136,14 +143,24 @@ bool collect(SourceAnalyzer analyzer, string root, bool includeTests, uint sampl
     foreach (i; sampleIndices(commits.length, samples)) picked ~= commits[i];
     result.snapshots = readSnapshots(top, picked);
 
-    prefetchMissing(top);
+    // Only the clone cache may fetch: the configuration of any other repository could run programs on fetch.
+    const cached = isCached(top);
+    if (cached) prefetchMissing(top);
 
+    // A new directory (never an existing one, which another user of a shared temporary directory could have planted),
+    // readable by the user only.
     const base = buildPath(tempDir, "codecity-history-" ~ randomName());
-    mkdirRecurse(buildPath(base, root.baseName));
+    {
+        import core.sys.posix.sys.stat : mkdir;
+        import std.conv : octal;
+        import std.string : toStringz;
+        if (mkdir(base.toStringz, octal!700) != 0) throw new Exception("cannot create " ~ base);
+    }
     scope (exit) removeTree(base);
+    mkdirRecurse(buildPath(base, root.baseName));
     // canonical too (the system temp directory may be a symbolic link), so analysed paths start with `mirror`
     const mirror = realPath(buildPath(base, root.baseName));
-    auto blobs = new BlobReader(top);
+    auto blobs = new BlobReader(top, cached);
     scope (exit) blobs.close();
 
     // Modification times for written files: a fixed base plus one millisecond per file, so each write gets a time
@@ -173,7 +190,7 @@ bool collect(SourceAnalyzer analyzer, string root, bool includeTests, uint sampl
                 if (tab < 0) continue;
                 const meta = entry[0 .. tab].split(' ');
                 const path = entry[tab + 1 .. $];
-                if (meta.length != 3 || !path.startsWith(prefix)) continue;
+                if (meta.length != 3 || !path.startsWith(prefix) || !safePath(path[prefix.length .. $])) continue;
                 if (wanted(meta[0], path))
                 {
                     writes ~= path[prefix.length .. $];
@@ -191,7 +208,7 @@ bool collect(SourceAnalyzer analyzer, string root, bool includeTests, uint sampl
             {
                 const meta = fields[i].split(' ');
                 const path = fields[i + 1];
-                if (meta.length != 5 || !path.startsWith(prefix)) continue;
+                if (meta.length != 5 || !path.startsWith(prefix) || !safePath(path[prefix.length .. $])) continue;
                 const local = path[prefix.length .. $];
                 if (meta[4] != "D" && wanted(meta[1], path))
                 {
@@ -207,14 +224,19 @@ bool collect(SourceAnalyzer analyzer, string root, bool includeTests, uint sampl
             const f = buildPath(mirror, d);
             if (f.exists && f.isFile) remove(f);
         }
-        foreach (i, content; blobs.read(shas))
-        {
+        blobs.each(shas, (i, content, present) {
             const f = buildPath(mirror, writes[i]);
+            if (!present)
+            {
+                // missing, or too large to be analysed: the snapshot lacks the file
+                if (f.exists && f.isFile) remove(f);
+                return;
+            }
             mkdirRecurse(f.dirName);
             write(f, content);
             const stamp = stampBase + (++stamps).msecs;
             setTimes(f, stamp, stamp);
-        }
+        });
 
         auto analysis = analyzer.analyze(mirror, includeTests);
         result.snapshots[k].types = analysis.types.length;
@@ -243,18 +265,17 @@ bool collect(SourceAnalyzer analyzer, string root, bool includeTests, uint sampl
     return true;
 }
 
-/// Commit metadata of `shas`, in the same order, from one `git log --no-walk=unsorted` call. Each record is
-/// `%H \x1f %at \x1f %an \x1f %s` terminated by \x1e (ASCII unit / record separators, which do not occur in these
-/// fields); names and subjects are decoded lossily like the rest of git's output (`lossyUtf8`).
+/// Commit metadata of `shas`, in the same order, from one `git log --no-walk=unsorted` call. Each commit is one line
+/// `%H NUL %at NUL %an NUL %s`: git cuts a subject at a NUL and joins its lines, and a name holds neither, so any
+/// other character (also a control character) is kept as it is. Names and subjects are decoded lossily like the rest
+/// of git's output (`lossyUtf8`).
 private Snapshot[] readSnapshots(string top, string[] shas)
 {
-    auto raw = gitOrThrow(top, ["-c", "log.showSignature=false", "log", "--no-walk=unsorted",
-        "--format=%H%x1f%at%x1f%an%x1f%s%x1e"] ~ shas);
+    auto raw = gitOrThrow(top, ["log", "--no-walk=unsorted", "--format=%H%x00%at%x00%an%x00%s"] ~ shas);
     Snapshot[] result;
-    foreach (record; (cast(string) raw).split('\x1e'))
+    foreach (line; (cast(string) raw).split('\n'))
     {
-        // git puts a newline after each record's terminator
-        const fields = lossyUtf8(record.strip).split('\x1f');
+        const fields = lossyUtf8(line).split('\0');
         if (fields.length != 4) continue;
         result ~= Snapshot(fields[0], fields[1].to!long, fields[2], fields[3]);
     }
@@ -263,7 +284,9 @@ private Snapshot[] readSnapshots(string top, string[] shas)
 }
 
 /// In a partial clone (`remote.origin.promisor` = true, as made by the GitHub clone cache), fetches every missing
-/// object in one batch, so that materialising old snapshots does not make git fetch blobs lazily one at a time.
+/// object in one batch, so that materialising old snapshots does not make git fetch blobs lazily one at a time. Only
+/// called for a repository of the clone cache (`isCached`): the configuration of any other repository could run
+/// programs on fetch.
 ///
 /// `rev-list --missing=print` lists the missing objects (lines starting with `?`) without fetching them; they are
 /// passed to one `git fetch --stdin` (which takes object names as refspecs). The noop negotiation skips the
@@ -282,9 +305,9 @@ private void prefetchMissing(string top)
     try
     {
         auto input = pipe();
-        auto pid = spawnProcess(["git", "-C", top, "-c", "fetch.negotiationAlgorithm=noop", "fetch", "-q", "origin",
-            "--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--filter=blob:none", "--stdin"],
-            input.readEnd, File("/dev/null", "w"), File("/dev/null", "w"));
+        auto pid = spawnProcess(gitArgs(top, true, "-c", "fetch.negotiationAlgorithm=noop", "fetch", "-q", "origin",
+            "--no-tags", "--no-write-fetch-head", "--recurse-submodules=no", "--filter=blob:none", "--stdin"),
+            input.readEnd, File("/dev/null", "w"), File("/dev/null", "w"), gitEnv(true));
         foreach (m; missing) input.writeEnd.write(m, "\n");
         input.writeEnd.close();
         wait(pid);
@@ -298,6 +321,18 @@ private ubyte[] gitOrThrow(string top, string[] args)
     auto data = bytes(top, args);
     if (data is null) throw new Exception("git " ~ args[0] ~ " failed while building the history");
     return data;
+}
+
+/// Whether `rel`, a path from a tree listing relative to the analysed root, may be written below the mirror: every
+/// '/'-separated component is non-empty and neither ".", "..", nor ".git" in any case, and none holds a backslash or
+/// a colon (path syntax on Windows). git never checks out anything else, but a crafted tree object can hold such
+/// entries, and writing "../../x" or "/home/u/x" would put a file outside the mirror.
+bool safePath(string rel)
+{
+    import std.algorithm : any, equal, map;
+    import std.ascii : toLower;
+    return rel.length > 0 && !rel.split('/').any!(c => c.length == 0 || c == "." || c == ".."
+        || c.map!(ch => toLower(ch)).equal(".git") || c.canFind('\\') || c.canFind(':') || c.canFind('\0'));
 }
 
 /// The NUL-terminated fields of `-z` output.
@@ -411,4 +446,52 @@ git add -A; commit 2020-01-03T00:00:00 "drop B"
     assert(json.canFind(`"hist":{"nom":[-1,2,-1],"noa":[-1,0,-1],"loc":[-1,1,-1],"cx":[-1,2,-1],"commits":[0,1,0],"authors":[0,1,0],"last":[-1,1577923200,-1]},"gone":true}`));
     assert(json.canFind(`"hist":[1,1,1]}`));
     assert(json.canFind(`"history":{"snapshots":[{"commit":"` ~ shas[0] ~ `","time":1577836800,"author":"Ada","subject":"add A","types":1}`));
+}
+
+unittest
+{
+    // The hostile repository shared by all three editions (src/test/resources/hostile-repo.sh): its configuration
+    // names programs for git to run, and its trees hold paths that escape the work tree. Neither may have any effect.
+    import codecity.city : CityModel;
+    import codecity.git : load;
+    import codecity.github : GitHubInfo;
+    import std.algorithm : filter, map;
+    import std.array : array;
+    import std.file : dirEntries, SpanMode;
+    import std.process : Config, execute;
+    import std.uuid : randomUUID;
+    const dir = buildPath(tempDir, "codecity-hostile-test-" ~ randomUUID.toString);
+    const repo = buildPath(dir, "repo"), markers = buildPath(dir, "m");
+    mkdirRecurse(repo);
+    mkdirRecurse(markers);
+    scope (exit) rmdirRecurse(dir);
+    // next to the Java edition's sources: <repository>/src/test/resources, three levels above this file
+    import std.path : buildNormalizedPath;
+    const script = buildNormalizedPath(__FILE_FULL_PATH__.dirName, "..", "..", "..", "src", "test", "resources",
+        "hostile-repo.sh");
+    assert(execute(["sh", script, realPath(markers)], null, Config.none, size_t.max, repo).status == 0);
+    const root = realPath(repo);
+    const escA = buildPath(tempDir, "EscA.java");
+    if (escA.exists) remove(escA);
+
+    GitHubInfo info;
+    assert(GitHubInfo.detect(root, info));
+    assert(load(root).length > 0);
+    auto model = CityModel.build(new SourceAnalyzer, root, true, true, false, GitHubInfo.init, defaultSamples);
+
+    auto hits = dirEntries(markers, SpanMode.shallow).map!(e => e.name.baseName).filter!(n => n.startsWith("hit-")).array;
+    assert(hits.length == 0, hits.to!string);
+    assert(!escA.exists && !buildPath(markers, "EscB.java").exists && !buildPath(tempDir, "EscC.java").exists);
+    // Every snapshot holds just A: the escaping entries are skipped, and Z's blob is missing (not fetched).
+    size_t[] typeCounts;
+    foreach (s; model.snapshots) typeCounts ~= s.types;
+    assert(typeCounts == [1, 1, 1]);
+}
+
+unittest
+{
+    assert(safePath("src/A.java") && safePath("a.b/..c/.gitx/A.java"));
+    foreach (bad; ["../A.java", "a/../../A.java", "/tmp/A.java", "a//A.java", "./A.java", "a/", ".git/A.java",
+            "a/.GIT/A.java", `a\..\A.java`, "C:A.java", ""])
+        assert(!safePath(bad), bad);
 }

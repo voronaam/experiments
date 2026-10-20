@@ -87,15 +87,27 @@ public final class CodeCity {
 
     /**
      * Runs the tool. Exit codes: 0 on success (or after {@code --help}), 1 when a clone or the desktop window cannot be
-     * set up, 2 for a bad command line. In server mode this method never returns: the main thread parks forever and
-     * the process ends with Ctrl+C, which runs the shutdown hook that closes the server.
+     * set up or the run fails, 2 for a bad command line. In server mode this method never returns: the main thread
+     * parks forever and the process ends with Ctrl+C, which runs the shutdown hook that closes the server.
+     *
+     * <p>A failure is printed as one {@code error:} line, like the Rust and D editions, instead of a stack trace: the
+     * message can quote file names or git output from the analysed repository, so it goes through {@link #printable}.
      */
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) {
+        try {
+            run(args);
+        } catch (Exception e) {
+            System.err.println("error: " + printable(e.getMessage() != null ? e.getMessage() : e.toString()));
+            System.exit(1);
+        }
+    }
+
+    private static void run(String[] args) throws Exception {
         Options opts;
         try {
             opts = parse(args);
         } catch (IllegalArgumentException e) {
-            System.err.println("error: " + e.getMessage() + "\n");
+            System.err.println("error: " + printable(e.getMessage()) + "\n");
             System.err.print(USAGE);
             System.exit(2);
             return;
@@ -109,7 +121,7 @@ public final class CodeCity {
             try {
                 opts = opts.withRoot(RepoCloner.cloneOrUpdate(opts.remote()).toRealPath());
             } catch (IOException e) {
-                System.err.println("error: " + e.getMessage());
+                System.err.println("error: " + printable(e.getMessage()));
                 System.exit(1);
                 return;
             }
@@ -119,18 +131,18 @@ public final class CodeCity {
         // One analyser for the first build and every watch-mode rebuild; its isSource() also tells the watcher which
         // file changes matter.
         SourceAnalyzer analyzer = new SourceAnalyzer();
-        System.out.println("Analysing " + opts.root() + " …");
+        System.out.println("Analysing " + printable(opts.root().toString()) + " …");
         // An effectively final copy, so the watcher lambdas below can capture it.
         Options o = opts;
         CityModel model = CityModel.build(analyzer, o.root(), o.includeTests(), o.git(), github, o.history());
         printSummary(model);
         if (model.types().isEmpty()) {
-            System.err.println("No Java, TypeScript or Rust types found under " + opts.root());
+            System.err.println("No Java, TypeScript or Rust types found under " + printable(opts.root().toString()));
         }
 
         if (opts.export() != null) {
             HtmlExporter.export(model, opts.export());
-            System.out.println("Wrote " + opts.export().toAbsolutePath());
+            System.out.println("Wrote " + printable(opts.export().toAbsolutePath().toString()));
             return;
         }
 
@@ -152,7 +164,7 @@ public final class CodeCity {
                     server.update(next);
                     System.out.printf("↻ rebuilt city: %d types in %d ms%n", next.types().size(), next.buildMillis());
                 } catch (IOException | RuntimeException e) {
-                    System.err.println("rebuild failed: " + e.getMessage());
+                    System.err.println("rebuild failed: " + printable(e.getMessage()));
                 }
             });
             watcher.start();
@@ -281,7 +293,7 @@ public final class CodeCity {
                     DesktopApp.update(next);
                     System.out.printf("↻ rebuilt city: %d types in %d ms%n", next.types().size(), next.buildMillis());
                 } catch (IOException | RuntimeException e) {
-                    System.err.println("rebuild failed: " + e.getMessage());
+                    System.err.println("rebuild failed: " + printable(e.getMessage()));
                 }
             });
             watcher.start();
@@ -303,7 +315,7 @@ public final class CodeCity {
             return null;
         }
         GitHubInfo info = detected.get();
-        System.out.println("GitHub: " + info.repo().webUrl() + " — fetching open pull requests …");
+        System.out.println("GitHub: " + printable(info.repo().webUrl()) + " — fetching open pull requests …");
         PullRequests.Result pulls = PullRequests.fetch(info.repo());
         System.out.println("  loaded " + pulls.source());
         // A failed fetch should not look like "no open PRs": leave the PR features off instead.
@@ -328,6 +340,22 @@ public final class CodeCity {
                 a.failedFiles() > 0 ? ", " + a.failedFiles() + " with parse errors" : "",
                 a.history().isEmpty() ? "" : ", git history for " + a.history().size() + " files",
                 model.buildMillis());
+    }
+
+    /**
+     * {@code s} with every control character (C0, DEL and C1) other than newline and tab replaced by '?', for printing
+     * text that can come from the analysed repository: file names, git output and API errors in exception messages,
+     * the GitHub remote from its git config. An ESC or CSI there would otherwise reach the terminal as an escape
+     * sequence (colours, cursor moves, retitling the window, writing the clipboard), and a CR could overwrite a line.
+     * {@code null} prints as "null", like string concatenation.
+     */
+    public static String printable(String s) {
+        if (s == null) {
+            return "null";
+        }
+        StringBuilder b = new StringBuilder(s.length());
+        s.codePoints().forEach(c -> b.appendCodePoint(Character.isISOControl(c) && c != '\n' && c != '\t' ? '?' : c));
+        return b.toString();
     }
 
     /**

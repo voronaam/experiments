@@ -14,13 +14,22 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.Base64;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.StringJoiner;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Serves the WebGL viewer and the city model on localhost, and pushes rebuild notifications over server-sent events.
@@ -44,7 +53,13 @@ import java.util.concurrent.TimeUnit;
  * request thread (the initial {@code retry} line), the heartbeat thread and the rebuild thread, so they are serialised
  * per client by locking on its {@link EventClient}.
  *
- * <p>The server binds to the loopback address only, so the city and the source code are not exposed to the network.
+ * <h2>Who may connect</h2>
+ * The server binds to the loopback address only, so the city and the source code are not exposed to the network.
+ * That alone does not keep out web pages open in the user's browser: a page on {@code evil.example} can point its
+ * DNS name at 127.0.0.1 ("DNS rebinding") and then read this server's responses as same-origin. Such requests carry
+ * the attacker's name in their {@code Host} header, so every request whose {@code Host} is not a loopback name
+ * ({@link #isAllowedHost}) is refused with 403. Ordinary cross-origin requests need no check: no response carries
+ * CORS headers, so the browser does not let the requesting page read it, and no endpoint changes any state.
  */
 public final class CityServer implements AutoCloseable {
 
@@ -73,6 +88,15 @@ public final class CityServer implements AutoCloseable {
     private record EventClient(OutputStream out, CountDownLatch closed) {
     }
 
+    /** Where {@code index.html}'s Content-Security-Policy lists the hashes of the page's inline scripts. */
+    private static final String SCRIPT_HASHES = "{{inline-script-hashes}}";
+
+    /** An inline script: an import map or a module without {@code src}; the city data block is not a script. */
+    private static final Pattern INLINE_SCRIPT =
+            Pattern.compile("<script type=\"(?:importmap|module)\">(.*?)</script>", Pattern.DOTALL);
+
+    /** The served {@code index.html}, its policy filled in ({@link #withScriptHashes}) once at start-up. */
+    private final byte[] index;
     private final HttpServer server;
     private final List<EventClient> clients = new CopyOnWriteArrayList<>();
     private final ScheduledExecutorService heartbeat = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -84,6 +108,8 @@ public final class CityServer implements AutoCloseable {
 
     public CityServer(CityModel model, int preferredPort) throws IOException {
         this.model = model;
+        this.index = withScriptHashes(new String(resource("index.html"), StandardCharsets.UTF_8))
+                .getBytes(StandardCharsets.UTF_8);
         this.server = bind(preferredPort);
         server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
         server.createContext("/api/city", this::city);
@@ -129,12 +155,50 @@ public final class CityServer implements AutoCloseable {
         broadcast("event: update\ndata: {\"types\":" + next.types().size() + "}\n\n");
     }
 
+    /**
+     * True for a {@code Host} header naming this server by a loopback name: {@code localhost}, {@code 127.0.0.1} or
+     * {@code [::1]}, either alone or followed by {@code :port} (case-insensitive). Anything else, including a missing
+     * header, is what a DNS-rebinding page would send (see the class comment). The Rust and D editions apply the same
+     * rule.
+     */
+    static boolean isAllowedHost(String host, int port) {
+        if (host == null) {
+            return false;
+        }
+        String h = host.toLowerCase(Locale.ROOT);
+        String suffix = ":" + port;
+        if (h.endsWith(suffix)) {
+            h = h.substring(0, h.length() - suffix.length());
+        }
+        return h.equals("localhost") || h.equals("127.0.0.1") || h.equals("[::1]");
+    }
+
+    /** Refuses the request with 403 unless its {@code Host} is allowed; returns whether it was refused. */
+    private boolean refused(HttpExchange ex) throws IOException {
+        if (isAllowedHost(ex.getRequestHeaders().getFirst("Host"), server.getAddress().getPort())) {
+            return false;
+        }
+        send(ex, 403, "text/plain", "forbidden host".getBytes(StandardCharsets.UTF_8));
+        return true;
+    }
+
     private void city(HttpExchange ex) throws IOException {
+        if (refused(ex)) {
+            return;
+        }
         send(ex, 200, "application/json; charset=utf-8", model.json().getBytes(StandardCharsets.UTF_8));
     }
 
-    /** Only files that are part of the analysed model can be read — never arbitrary paths. */
+    /**
+     * Only files that are part of the analysed model can be read — never arbitrary paths. The file's attributes are
+     * read without following links, and only a regular file is read: should the file have been replaced by a symbolic
+     * link (to a file outside the tree) or a FIFO since the analysis, it is reported as unreadable rather than
+     * followed or blocked on. An error names the file by its path relative to the root, never the absolute path.
+     */
     private void source(HttpExchange ex) throws IOException {
+        if (refused(ex)) {
+            return;
+        }
         CityModel current = model;
         int id;
         try {
@@ -151,16 +215,22 @@ public final class CityServer implements AutoCloseable {
             return;
         }
         TypeInfo t = current.types().get(id);
+        String file = current.analysis().root().relativize(t.file()).toString().replace('\\', '/');
         String code;
         try {
-            code = Files.size(t.file()) > MAX_SOURCE_BYTES
-                    ? "// file too large to display"
-                    : new String(Files.readAllBytes(t.file()), StandardCharsets.UTF_8);
+            BasicFileAttributes attrs = Files.readAttributes(t.file(), BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (!attrs.isRegularFile()) {
+                code = "// unable to read " + file;
+            } else if (attrs.size() > MAX_SOURCE_BYTES) {
+                code = "// file too large to display";
+            } else {
+                code = new String(Files.readAllBytes(t.file()), StandardCharsets.UTF_8);
+            }
         } catch (IOException e) {
-            code = "// unable to read " + t.file() + ": " + e.getMessage();
+            code = "// unable to read " + file;
         }
         String json = new JsonWriter().beginObject()
-                .field("file", current.analysis().root().relativize(t.file()).toString().replace('\\', '/'))
+                .field("file", file)
                 .field("line", t.line())
                 .field("endLine", t.endLine())
                 .field("code", code)
@@ -174,6 +244,9 @@ public final class CityServer implements AutoCloseable {
      * reconnect two seconds after the connection drops (for example when the server restarts).
      */
     private void events(HttpExchange ex) throws IOException {
+        if (refused(ex)) {
+            return;
+        }
         ex.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
         ex.getResponseHeaders().set("Cache-Control", "no-cache");
         ex.sendResponseHeaders(200, 0);
@@ -210,12 +283,15 @@ public final class CityServer implements AutoCloseable {
     }
 
     private void staticFile(HttpExchange ex) throws IOException {
+        if (refused(ex)) {
+            return;
+        }
         String name = STATIC.get(ex.getRequestURI().getPath());
         if (name == null) {
             send(ex, 404, "text/plain", "not found".getBytes(StandardCharsets.UTF_8));
             return;
         }
-        byte[] body = resource(name);
+        byte[] body = name.equals("index.html") ? index : resource(name);
         String type = CONTENT_TYPES.get(name.substring(name.lastIndexOf('.') + 1));
         send(ex, 200, type, body);
     }
@@ -228,6 +304,30 @@ public final class CityServer implements AutoCloseable {
             }
             return in.readAllBytes();
         }
+    }
+
+    /**
+     * Fills in the page's Content-Security-Policy: replaces the placeholder with {@code 'sha256-…'} for every inline
+     * script of {@code html} (the import map of the served page; the import map and app.js of an exported page), so
+     * the browser runs exactly those. Used for the served page and by {@code HtmlExporter}; the Rust and D editions do
+     * the same. Throws if the placeholder is missing, like the exporter's markers.
+     */
+    public static String withScriptHashes(String html) {
+        int at = html.indexOf(SCRIPT_HASHES);
+        if (at < 0) {
+            throw new IllegalStateException("index.html lacks " + SCRIPT_HASHES);
+        }
+        StringJoiner hashes = new StringJoiner(" ");
+        Matcher m = INLINE_SCRIPT.matcher(html);
+        while (m.find()) {
+            try {
+                byte[] digest = MessageDigest.getInstance("SHA-256").digest(m.group(1).getBytes(StandardCharsets.UTF_8));
+                hashes.add("'sha256-" + Base64.getEncoder().encodeToString(digest) + "'");
+            } catch (NoSuchAlgorithmException e) {
+                throw new IllegalStateException(e); // every JDK has SHA-256
+            }
+        }
+        return html.substring(0, at) + hashes + html.substring(at + SCRIPT_HASHES.length());
     }
 
     /**

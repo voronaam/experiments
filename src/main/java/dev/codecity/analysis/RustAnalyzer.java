@@ -7,7 +7,9 @@ import dev.codecity.analysis.RustParse.Tree;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -17,8 +19,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * Rust support, on the in-house parser {@link RustParse}. Crates and modules are districts; structs, enums, unions and traits are buildings whose
@@ -43,13 +43,18 @@ import java.util.regex.Pattern;
 public final class RustAnalyzer implements LanguageSupport {
 
     /**
-     * The {@code name = "…"} line of the {@code [package]} table. {@code (?m)} lets {@code ^} match at line starts;
-     * the lines skipped before the name must not start with {@code [} (after indentation), which keeps the search
-     * inside the table, as the next table header starts with {@code [}. A {@code [} elsewhere on a line (e.g.
-     * {@code authors = ["…"]}) does not stop it.
+     * Glob imports ({@code use a::b::*;}) beyond this many in one module are ignored. A name is tried in each of them,
+     * so the cap keeps a crafted file with very many from making the analysis quadratic; real modules have a handful.
+     * The Rust and D editions use the same limit.
      */
-    private static final Pattern PACKAGE_NAME = Pattern.compile(
-            "(?m)^\\[package\\][^\\n]*\\n(?:[ \\t\\r]*(?:[^\\[\\s][^\\n]*)?\\n)*?[ \\t]*name\\s*=\\s*\"([^\"]+)\"");
+    static final int MAX_GLOB_IMPORTS = 64;
+
+    /**
+     * Largest {@code Cargo.toml} that is read; a bigger one counts as having no package name. Real manifests are a few
+     * KiB; the cap keeps a crafted one from exhausting memory. The Rust and D editions use the same limit.
+     */
+    static final long MAX_MANIFEST_BYTES = 1024 * 1024;
+
     /**
      * Last segment of a module building's fqn ({@code shop::cart::{fn}}). Braces cannot occur in a Rust identifier, so
      * the id never collides with a real item.
@@ -134,8 +139,10 @@ public final class RustAnalyzer implements LanguageSupport {
 
         FileState st = new FileState(tree, SourceText.lines(code), file, module);
         Scope scope = newScope(absolute);
-        st.visitItems(0, scope, scope, file.getFileName().toString(), test);
-        return new ParsedFile(file, st.types, new Context(st.scopes, st.impls), tree.errors);
+        if (st.fits(absolute)) {
+            st.visitItems(0, scope, scope, file.getFileName().toString(), test);
+        }
+        return new ParsedFile(file, st.types, new Context(st.scopes, st.impls), tree.errors || st.skipped);
     }
 
     private static Scope newScope(List<String> path) {
@@ -191,15 +198,17 @@ public final class RustAnalyzer implements LanguageSupport {
     /** Per-file extraction state. Created for one {@link #parse} call and used by one thread only. */
     private final class FileState {
         final Tree tree;
-        final String[] lines;
+        final SourceText.Lines lines;
         final Path file;
         final String module;
         final List<TypeInfo> types = new ArrayList<>();
         final List<Impl> impls = new ArrayList<>();
         /** See {@link Context#scopes}. */
         final Map<String, Scope> scopes = new HashMap<>();
+        /** Set when a module or building was skipped for the length of its fqn (see {@link #fits}). */
+        boolean skipped;
 
-        FileState(Tree tree, String[] lines, Path file, String module) {
+        FileState(Tree tree, SourceText.Lines lines, Path file, String module) {
             this.tree = tree;
             this.lines = lines;
             this.file = file;
@@ -209,6 +218,18 @@ public final class RustAnalyzer implements LanguageSupport {
         /** The module path without the crate name, e.g. {@code net::http}; "" for the crate root. */
         String packageOf(Scope scope) {
             return String.join("::", scope.path().subList(1, scope.path().size()));
+        }
+
+        /**
+         * Whether the module with this path gets a module building fqn ({@code path::{fn}}) within
+         * {@link SourceText#MAX_FQN_BYTES}. If not, the module and everything in it are skipped, and the file counts as
+         * failed; so no fqn of a building inside it can be too long either, apart from a single over-long name, which
+         * {@link #addType} checks.
+         */
+        boolean fits(List<String> path) {
+            boolean fits = pathBytes(path) + 2 + FUNCTIONS.length() <= SourceText.MAX_FQN_BYTES;
+            skipped |= !fits;
+            return fits;
         }
 
         String fqn(Scope scope, String name) {
@@ -298,6 +319,9 @@ public final class RustAnalyzer implements LanguageSupport {
                         if (body >= 0) {
                             List<String> child = new ArrayList<>(scope.path());
                             child.add(name(item));
+                            if (!fits(child)) {
+                                break;
+                            }
                             Scope childScope = newScope(child);
                             visitItems(body, childScope, cfgTest ? district : childScope, "mod " + child.getLast(),
                                     isTest);
@@ -328,6 +352,10 @@ public final class RustAnalyzer implements LanguageSupport {
         void addType(int item, Scope scope, Scope district, String kind, int noa, List<MethodInfo> methods,
                      boolean test) {
             String name = name(item);
+            if (pathBytes(scope.path()) + 2 + SourceText.utf8Length(name) > SourceText.MAX_FQN_BYTES) {
+                skipped = true;
+                return;
+            }
             Set<String> refs = new HashSet<>();
             collectRefs(item, refs);
             String id = fqn(scope, name);
@@ -402,7 +430,7 @@ public final class RustAnalyzer implements LanguageSupport {
             while (i < end) {
                 Node n = tree.node(i);
                 switch (n.kind) {
-                    case TYPE_IDENT -> refs.add(tree.tokText(n.first));
+                    case TYPE_IDENT -> addReference(tree.tokText(n.first), refs);
                     case IDENT -> addIdentifier(tree.tokText(n.first), refs);
                     case USE_AS -> {
                         if (n.name != RustParse.NONE) {
@@ -413,7 +441,7 @@ public final class RustAnalyzer implements LanguageSupport {
                         if (n.kind != NodeKind.PATH && n.first == n.last) {
                             addIdentifier(tree.tokText(n.first), refs);
                         } else {
-                            refs.add(withoutWhitespace(tree.rangeText(n.first, n.last)));
+                            addReference(withoutWhitespace(tree.rangeText(n.first, n.last)), refs);
                             i = n.end; // nothing inside a path is a separate reference
                             continue;
                         }
@@ -444,9 +472,9 @@ public final class RustAnalyzer implements LanguageSupport {
                         // A single name, at the top level or inside a `{…}` list.
                         String name = tree.tokText(node.first);
                         if (name.equals("self") && !prefix.isEmpty()) {
-                            scope.uses().put(prefix.getLast(), prefix); // use a::b::{self}
+                            addUse(scope, prefix.getLast(), prefix); // use a::b::{self}
                         } else {
-                            scope.uses().put(name, concat(prefix, List.of(name)));
+                            addUse(scope, name, concat(prefix, List.of(name)));
                         }
                     } else {
                         List<String> path = concat(prefix, segments(n));
@@ -455,26 +483,46 @@ public final class RustAnalyzer implements LanguageSupport {
                             path = path.subList(0, path.size() - 1);
                             alias = path.isEmpty() ? "self" : path.getLast();
                         }
-                        scope.uses().put(alias, path);
+                        addUse(scope, alias, path);
                     }
                 }
                 case USE_AS -> {
                     String alias = tree.tokText(node.name);
                     if (!alias.equals("_")) {
-                        scope.uses().put(alias, concat(prefix, segments(tree.child(n, NodeKind.USE_PATH))));
+                        addUse(scope, alias, concat(prefix, segments(tree.child(n, NodeKind.USE_PATH))));
                     }
                 }
                 case USE_GROUP -> {
                     List<String> p = concat(prefix, segments(tree.child(n, NodeKind.USE_PREFIX)));
+                    // A group under an over-long prefix only holds over-long paths (see addUse).
+                    if (pathBytes(p) > SourceText.MAX_FQN_BYTES) {
+                        break;
+                    }
                     for (int c : tree.children(n)) {
                         if (tree.node(c).kind != NodeKind.USE_PREFIX) {
                             expandUse(c, p, scope);
                         }
                     }
                 }
-                case USE_GLOB -> scope.globs().add(concat(prefix, segments(tree.child(n, NodeKind.USE_PREFIX))));
+                case USE_GLOB -> {
+                    List<String> path = concat(prefix, segments(tree.child(n, NodeKind.USE_PREFIX)));
+                    if (scope.globs().size() < MAX_GLOB_IMPORTS && pathBytes(path) <= SourceText.MAX_FQN_BYTES) {
+                        scope.globs().add(path);
+                    }
+                }
                 default -> {
                 }
+            }
+        }
+
+        /**
+         * Records {@code use path as alias}, unless the path is longer than {@link SourceText#MAX_FQN_BYTES}: it is
+         * copied into a candidate for every reference to the alias, and a group of many names under one long prefix
+         * would make that quadratic. (Only a path of mostly {@code super} could still name a building.)
+         */
+        void addUse(Scope scope, String alias, List<String> path) {
+            if (pathBytes(path) <= SourceText.MAX_FQN_BYTES) {
+                scope.uses().put(alias, path);
             }
         }
 
@@ -497,8 +545,27 @@ public final class RustAnalyzer implements LanguageSupport {
     private static void addIdentifier(String s, Set<String> refs) {
         String name = s.startsWith("'") ? s.substring(1) : s;
         if (!name.isEmpty() && Character.isUpperCase(name.codePointAt(0))) {
+            addReference(name, refs);
+        }
+    }
+
+    /**
+     * Adds a reference unless it is longer than {@link SourceText#MAX_FQN_BYTES}: no building's fqn is that long, so
+     * it could not resolve, and resolving it would copy it into every candidate tried.
+     */
+    private static void addReference(String name, Set<String> refs) {
+        if (SourceText.utf8Length(name) <= SourceText.MAX_FQN_BYTES) {
             refs.add(name);
         }
+    }
+
+    /** The length in UTF-8 bytes of a module path joined with {@code ::}. */
+    static int pathBytes(List<String> path) {
+        int n = 2 * Math.max(path.size() - 1, 0);
+        for (String segment : path) {
+            n += SourceText.utf8Length(segment);
+        }
+        return n;
     }
 
     /** The text without whitespace (Unicode White_Space, as Rust's {@code char::is_whitespace}). */
@@ -572,18 +639,104 @@ public final class RustAnalyzer implements LanguageSupport {
         return readCrate(dir).map(Crate::name).orElse("");
     }
 
-    /** Reads {@code dir/Cargo.toml}; empty when it is missing, unreadable or has no {@code [package]} name. */
+    /**
+     * Reads {@code dir/Cargo.toml}; empty when it is missing, unreadable, not valid UTF-8, larger than
+     * {@link #MAX_MANIFEST_BYTES} or has no {@code [package]} name. Only a regular file is read: a symbolic link
+     * (which could point outside the analysed tree, or at a device such as {@code /dev/zero}) counts as missing.
+     */
     private static Optional<Crate> readCrate(Path dir) {
         Path manifest = dir.resolve("Cargo.toml");
-        if (!Files.isRegularFile(manifest)) {
-            return Optional.empty();
-        }
         try {
-            Matcher m = PACKAGE_NAME.matcher(Files.readString(manifest));
-            return m.find() ? Optional.of(new Crate(m.group(1).replace('-', '_'), dir)) : Optional.empty();
+            BasicFileAttributes attrs = Files.readAttributes(manifest, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (!attrs.isRegularFile() || attrs.size() > MAX_MANIFEST_BYTES) {
+                return Optional.empty();
+            }
+            String name = packageName(Files.readString(manifest));
+            return name == null ? Optional.empty() : Optional.of(new Crate(name.replace('-', '_'), dir));
         } catch (IOException e) {
             return Optional.empty();
         }
+    }
+
+    /**
+     * The {@code name = "…"} of the {@code [package]} table of a {@code Cargo.toml}, or null. Not a TOML parser, and
+     * hand-written rather than a regular expression so that its running time is linear in the manifest's size
+     * whatever its content (a backtracking regex recursed once per skipped line and could overflow the stack).
+     *
+     * <p>Starting at each line that begins with {@code [package]}, the following lines are scanned: the first one of
+     * the form {@code [ \t]* name \s* = \s* "value"} gives the name (the value may not be empty and ends at the next
+     * {@code "}, even on a later line). Lines skipped on the way must end with a newline and must not start with
+     * {@code [} after indentation ({@code [ \t\r]}), which keeps the search inside the table, as the next table
+     * header starts with {@code [}; a {@code [} elsewhere on a line ({@code authors = ["…"]}) does not stop it. When a
+     * {@code [package]} line yields nothing, the search goes on at the next one. {@code \s} is ASCII whitespace and
+     * lines end at {@code \n} only. The Rust and D editions implement the same scan.
+     */
+    static String packageName(String toml) {
+        int n = toml.length();
+        for (int start = 0; start < n; start = nextLine(toml, start)) {
+            if (!toml.startsWith("[package]", start)) {
+                continue;
+            }
+            int line = nextLine(toml, start);
+            while (line < n) {
+                String name = nameValue(toml, line);
+                if (name != null) {
+                    return name;
+                }
+                // Skip the line, unless it would leave the table.
+                int i = line;
+                while (i < n && (toml.charAt(i) == ' ' || toml.charAt(i) == '\t' || toml.charAt(i) == '\r')) {
+                    i++;
+                }
+                if (i == n || toml.charAt(i) == '[' || (toml.charAt(i) != '\n' && isTomlSpace(toml.charAt(i)))) {
+                    break;
+                }
+                int newline = toml.indexOf('\n', i);
+                if (newline < 0) {
+                    break;
+                }
+                line = newline + 1;
+            }
+        }
+        return null;
+    }
+
+    /** The index just past the next {@code \n} at or after {@code i}, or the length of {@code s} if there is none. */
+    private static int nextLine(String s, int i) {
+        int newline = s.indexOf('\n', i);
+        return newline < 0 ? s.length() : newline + 1;
+    }
+
+    /** The value of a {@code [ \t]* name \s* = \s* "value"} at {@code i}, or null when there is none. */
+    private static String nameValue(String s, int i) {
+        int n = s.length();
+        while (i < n && (s.charAt(i) == ' ' || s.charAt(i) == '\t')) {
+            i++;
+        }
+        if (!s.startsWith("name", i)) {
+            return null;
+        }
+        i += 4;
+        while (i < n && isTomlSpace(s.charAt(i))) {
+            i++;
+        }
+        if (i == n || s.charAt(i) != '=') {
+            return null;
+        }
+        i++;
+        while (i < n && isTomlSpace(s.charAt(i))) {
+            i++;
+        }
+        if (i == n || s.charAt(i) != '"') {
+            return null;
+        }
+        int close = s.indexOf('"', i + 1);
+        return close > i + 1 ? s.substring(i + 1, close) : null;
+    }
+
+    /** ASCII whitespace, as {@code \s} in a Java regular expression: space, {@code \t \n \u000B \f \r}. */
+    private static boolean isTomlSpace(char c) {
+        return c == ' ' || (c >= '\t' && c <= '\r');
     }
 
     // ------------------------------------------------------------------ linking
@@ -597,7 +750,8 @@ public final class RustAnalyzer implements LanguageSupport {
      *       of the module it is written in, which is created if the module has no free functions;</li>
      *   <li>merges the attached impls' methods and LOC into their buildings and computes each building's
      *       dependencies: its own references resolved in its own scope, plus the implemented traits and the impl
-     *       bodies' references, already resolved in the impl's scope.</li>
+     *       bodies' references, resolved in the impl's scope. All references are resolved against every building,
+     *       including the module buildings created in step 2.</li>
      * </ol>
      */
     @Override
@@ -619,14 +773,18 @@ public final class RustAnalyzer implements LanguageSupport {
                 c.scopes().values().forEach(s -> crateNames.add(s.crate()));
             }
         }
-        // keySet() is a live view: module buildings added below for impls become resolvable immediately.
-        Resolver resolver = new Resolver(byFqn.keySet(), crateNames);
+        // Impl targets are resolved against the buildings declared in the files (a copy, as module buildings are added
+        // below), all references later against every building.
+        Resolver declared = new Resolver(Set.copyOf(byFqn.keySet()), crateNames);
 
         // Attach impl blocks to their types; impls of foreign types go to the module's function building.
         Map<String, List<Impl>> attached = new HashMap<>();
         Map<String, Set<String>> extraDeps = new HashMap<>();
+        // crate → build module, see moduleOf; looked up once per crate rather than once per new module building
+        Map<String, String> moduleOfCrate = new HashMap<>();
+        List<String> targets = new ArrayList<>(); // per impl, in impl order
         for (Impl impl : impls) {
-            String target = resolver.resolveType(impl.type(), impl.scope());
+            String target = declared.resolveType(impl.type(), impl.scope());
             if (target == null || byFqn.get(target).kind().equals("module")) {
                 target = String.join("::", impl.scope().path()) + "::" + FUNCTIONS;
                 if (!byFqn.containsKey(target)) {
@@ -636,13 +794,20 @@ public final class RustAnalyzer implements LanguageSupport {
                     Scope s = impl.scope();
                     List<String> d = impl.district().path();
                     byFqn.put(target, new TypeInfo(Language.RUST, target, impl.label(), String.join("::",
-                            d.subList(1, d.size())), moduleOf(byFqn, s), "module", impl.file(),
+                            d.subList(1, d.size())), moduleOfCrate.computeIfAbsent(s.crate(), k -> moduleOf(byFqn, s)), "module", impl.file(),
                             impl.line(), impl.line(), 0, 0, impl.test(), List.of(), Set.of(), List.of(), List.of()));
                     scopes.put(target, s);
                 }
             }
             attached.computeIfAbsent(target, k -> new ArrayList<>()).add(impl);
-            Set<String> deps = extraDeps.computeIfAbsent(target, k -> new HashSet<>());
+            targets.add(target);
+        }
+        // References resolve only now, against every building including the module buildings just created, so that
+        // the result does not depend on the order of the impls (the editions used to differ here).
+        Resolver resolver = new Resolver(byFqn.keySet(), crateNames);
+        for (int i = 0; i < impls.size(); i++) {
+            Impl impl = impls.get(i);
+            Set<String> deps = extraDeps.computeIfAbsent(targets.get(i), k -> new HashSet<>());
             if (impl.trait() != null) {
                 Optional.ofNullable(resolver.resolveType(impl.trait(), impl.scope())).ifPresent(deps::add);
             }

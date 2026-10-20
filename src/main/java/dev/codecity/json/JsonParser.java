@@ -15,11 +15,19 @@ import java.util.Map;
  * raw control characters inside strings are kept. Objects keep their key order ({@link LinkedHashMap}). Malformed
  * input raises an {@link IllegalArgumentException}, usually naming the offset (input that ends inside a string escape
  * raises an {@link IndexOutOfBoundsException} instead); {@code PullRequests} treats both as a failed fetch.
+ *
+ * <p>Arrays and objects may be nested at most {@link #MAX_DEPTH} deep, the limit of the Rust edition's JSON parser:
+ * the recursion would otherwise let a hostile response of a few kilobytes of brackets overflow the stack.
  */
 public final class JsonParser {
 
+    /** Deepest nesting of arrays and objects accepted. */
+    static final int MAX_DEPTH = 128;
+
     private final String s;
     private int i;
+    /** Arrays and objects currently open around the cursor. */
+    private int depth;
 
     private JsonParser(String s) {
         this.s = s;
@@ -54,6 +62,9 @@ public final class JsonParser {
             throw error("unexpected end");
         }
         char c = s.charAt(i);
+        if ((c == '{' || c == '[') && depth >= MAX_DEPTH) {
+            throw error("nested too deeply");
+        }
         return switch (c) {
             case '{' -> object();
             case '[' -> array();
@@ -69,9 +80,11 @@ public final class JsonParser {
     private Map<String, Object> object() {
         Map<String, Object> map = new LinkedHashMap<>();
         i++;
+        depth++;
         ws();
         if (peek() == '}') {
             i++;
+            depth--;
             return map;
         }
         while (true) {
@@ -85,6 +98,7 @@ public final class JsonParser {
                 i++;
             } else {
                 expect('}');
+                depth--;
                 return map;
             }
         }
@@ -93,9 +107,11 @@ public final class JsonParser {
     private List<Object> array() {
         List<Object> list = new ArrayList<>();
         i++;
+        depth++;
         ws();
         if (peek() == ']') {
             i++;
+            depth--;
             return list;
         }
         while (true) {
@@ -105,6 +121,7 @@ public final class JsonParser {
                 i++;
             } else {
                 expect(']');
+                depth--;
                 return list;
             }
         }

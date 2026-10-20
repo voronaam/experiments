@@ -153,7 +153,7 @@ int main(string[] args)
     }
     catch (Exception e)
     {
-        stderr.writeln("error: ", e.msg, "\n");
+        stderr.writeln("error: ", printable(e.msg), "\n");
         stderr.write(usage);
         return 2;
     }
@@ -161,7 +161,7 @@ int main(string[] args)
         return run(opts);
     catch (Exception e)
     {
-        stderr.writeln("error: ", e.msg);
+        stderr.writeln("error: ", printable(e.msg));
         return 1;
     }
 }
@@ -177,15 +177,15 @@ int run(Options opts)
     const hasGithub = opts.github && loadGithub(root, github);
 
     auto analyzer = new SourceAnalyzer;
-    writefln("Analysing %s …", root);
+    writefln("Analysing %s …", printable(root));
     auto model = CityModel.build(analyzer, root, opts.includeTests, opts.git, hasGithub, github, opts.history);
     printSummary(model);
-    if (model.buildings.length == 0) stderr.writefln("No Java, TypeScript or Rust types found under %s", root);
+    if (model.buildings.length == 0) stderr.writefln("No Java, TypeScript or Rust types found under %s", printable(root));
 
     if (opts.export_.length)
     {
         exportHtml(model, opts.export_);
-        writefln("Wrote %s", opts.export_.absolutePath);
+        writefln("Wrote %s", printable(opts.export_.absolutePath));
         return 0;
     }
 
@@ -223,12 +223,32 @@ int run(Options opts)
     return 0;
 }
 
+/// `s` with every control character (C0, DEL and C1) other than newline and tab replaced by '?', for printing text
+/// that can come from the analysed repository: file names, git output and API errors in exception messages, the
+/// GitHub remote from its git config. An ESC or CSI there would otherwise reach the terminal as an escape sequence
+/// (colours, cursor moves, retitling the window, writing the clipboard), and a CR could overwrite a line. Invalid
+/// UTF-8 is printed as U+FFFD.
+string printable(const(char)[] s)
+{
+    import std.algorithm : map;
+    import std.conv : to;
+    import std.uni : isControl;
+    import std.utf : byDchar;
+    return s.byDchar.map!(c => isControl(c) && c != '\n' && c != '\t' ? dchar('?') : c).to!string;
+}
+
+unittest
+{
+    assert(printable("a\x1b[31mred\x1b]0;title\x07\rb\n\tc\u009bd") == "a?[31mred?]0;title??b\n\tc?d");
+    assert(printable("ünïcödé ✓ %s %n") == "ünïcödé ✓ %s %n");
+}
+
 /// Detects a GitHub remote for `root` and fetches its open pull requests. Returns false only when there is no
 /// GitHub remote; if just the PR fetch fails, it still returns true (file links work) with `info.hasPulls` unset.
 bool loadGithub(string root, out GitHubInfo info)
 {
     if (!GitHubInfo.detect(root, info)) return false;
-    writefln("GitHub: %s — fetching open pull requests …", info.repo.webUrl);
+    writefln("GitHub: %s — fetching open pull requests …", printable(info.repo.webUrl));
     // A failed fetch should not look like "no open PRs": leave the PR features off instead.
     PullRequest[] pulls;
     string source;

@@ -583,44 +583,62 @@ Token[] lex(string code, out bool errors) @safe pure nothrow
 /// delimiter stayed unpaired.
 private bool matchDelimiters(const(ubyte)[] b, Token[] toks) @safe pure nothrow
 {
+    // The open delimiters (token indices), innermost last, each with the stack index of the previous one of the same
+    // kind (-1 for none); and the innermost of each kind. A closer thus finds its opener without scanning the stack,
+    // which made a long run of unmatched closers quadratic.
     size_t[] stack;
+    ptrdiff_t[] prev;
+    size_t size;
+    ptrdiff_t[3] top = -1;
     bool errors;
     foreach (k; 0 .. toks.length)
     {
         if (toks[k].kind != TokKind.punct) continue;
         const c = b[toks[k].start];
-        ubyte open;
-        switch (c)
+        const kind = delimiterKind(c);
+        if (kind < 0) continue;
+        if (c == '(' || c == '[' || c == '{')
         {
-        case ')': open = '('; break;
-        case ']': open = '['; break;
-        case '}': open = '{'; break;
-        case '(', '[', '{':
-            stack ~= k;
-            continue;
-        default:
+            if (size == stack.length)
+            {
+                stack.length = size * 2 + 16;
+                prev.length = size * 2 + 16;
+            }
+            prev[size] = top[kind];
+            top[kind] = size;
+            stack[size++] = k;
             continue;
         }
-        // The innermost open delimiter of the same kind.
-        size_t at = stack.length;
-        foreach_reverse (s; 0 .. stack.length)
-            if (b[toks[stack[s]].start] == open)
-            {
-                at = s;
-                break;
-            }
-        if (at == stack.length)
+        const at = top[kind];
+        if (at < 0)
         {
             errors = true;
             continue;
         }
-        if (at + 1 != stack.length) errors = true;
+        if (at + 1 != size) errors = true;
         const o = stack[at];
-        stack = stack[0 .. at];
+        // Close it and everything opened after it.
+        while (size > at)
+        {
+            size--;
+            top[delimiterKind(b[toks[stack[size]].start])] = prev[size];
+        }
         toks[o].pair = cast(uint) k;
         toks[k].pair = cast(uint) o;
     }
-    return errors || stack.length > 0;
+    return errors || size > 0;
+}
+
+/// 0 for `(` and `)`, 1 for `[` and `]`, 2 for braces, -1 for any other byte.
+private ptrdiff_t delimiterKind(ubyte c) @safe pure nothrow @nogc
+{
+    switch (c)
+    {
+    case '(', ')': return 0;
+    case '[', ']': return 1;
+    case '{', '}': return 2;
+    default: return -1;
+    }
 }
 
 // ------------------------------------------------------------------ parser
@@ -2455,7 +2473,13 @@ private struct Parser
             }
             if (punct('(') || punct('['))
             {
-                parseExprList();
+                // Calls and indexes nest without passing parsePrefix's depth guard (`f(f(f(…)))`), so they count a
+                // level of their own.
+                if (enter())
+                {
+                    parseExprList();
+                    leave();
+                }
                 info = ExprInfo.init;
                 continue;
             }
@@ -2472,13 +2496,21 @@ private struct Parser
             if (o.lbp < minBp) break;
             const opTok = pos;
             bumpN(o.len);
+            // A right operand nests (`a = b = c = …`) without passing parsePrefix's depth guard either.
+            if (!enter())
+            {
+                info = ExprInfo.init;
+                continue;
+            }
             if (o.range)
             {
                 if (canStartExpr(pos, ns)) parseExprBp(o.rbp, ns, false);
+                leave();
                 info = ExprInfo.init;
                 continue;
             }
             const rhs = parseExprBp(o.rbp, ns, cond);
+            leave();
             const and = o.logic && ch(opTok) == '&';
             if (and && (info.isLet || rhs.isLet))
             {
@@ -3000,6 +3032,27 @@ unittest // deep nesting stays within a small thread stack
     t.start();
     t.join();
     assert(flagged);
+}
+
+unittest // calls, indexes and right operands are capped too; unmatched closers are paired in linear time
+{
+    import core.thread : Thread;
+    import std.array : replicate;
+    import std.datetime.stopwatch : StopWatch, AutoStart;
+    // They nest without passing parsePrefix's depth guard, so they count a level of their own.
+    bool flagged;
+    auto t = new Thread({
+        flagged = parse("fn f() { " ~ "f(".replicate(100_000) ~ ")".replicate(100_000) ~ "; }").errors
+            && parse("fn f() { " ~ "a[".replicate(100_000) ~ "]".replicate(100_000) ~ "; }").errors
+            && parse("fn f() { " ~ "x = ".replicate(100_000) ~ "a; }").errors
+            && parse("fn f() { " ~ "([".replicate(100_000) ~ ")".replicate(100_000) ~ "; }").errors;
+    }, 256 * 1024);
+    t.start();
+    t.join();
+    assert(flagged);
+    auto sw = StopWatch(AutoStart.yes);
+    assert(parse("fn f() { " ~ "(]".replicate(200_000) ~ " }").errors);
+    assert(sw.peek.total!"seconds" < 10);
 }
 
 unittest // use trees keep their structure

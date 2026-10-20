@@ -546,30 +546,34 @@ fn char_end(b: &[u8], i: usize) -> Option<(usize, bool)> {
 /// delimiter stayed unpaired.
 fn match_delimiters(code: &str, toks: &mut [Token]) -> bool {
     let b = code.as_bytes();
-    let mut stack: Vec<usize> = Vec::new();
+    // The open delimiters, innermost last, each with the stack index of the previous one of the same kind; and the
+    // innermost of each kind. A closer thus finds its opener without scanning the stack, which made a long run of
+    // unmatched closers quadratic.
+    let mut stack: Vec<(usize, Option<usize>)> = Vec::new();
+    let mut top: [Option<usize>; 3] = [None; 3];
     let mut errors = false;
     for k in 0..toks.len() {
         if toks[k].kind != TokKind::Punct {
             continue;
         }
         let c = b[toks[k].start as usize];
-        let open = match c {
-            b')' => b'(',
-            b']' => b'[',
-            b'}' => b'{',
-            b'(' | b'[' | b'{' => {
-                stack.push(k);
-                continue;
-            }
-            _ => continue,
-        };
-        match stack.iter().rposition(|&o| b[toks[o].start as usize] == open) {
+        let Some(kind) = delimiter_kind(c) else { continue };
+        if matches!(c, b'(' | b'[' | b'{') {
+            stack.push((k, top[kind]));
+            top[kind] = Some(stack.len() - 1);
+            continue;
+        }
+        match top[kind] {
             Some(at) => {
                 if at + 1 != stack.len() {
                     errors = true;
                 }
-                let o = stack[at];
-                stack.truncate(at);
+                let o = stack[at].0;
+                // Close it and everything opened after it.
+                while stack.len() > at {
+                    let (t, prev) = stack.pop().unwrap();
+                    top[delimiter_kind(b[toks[t].start as usize]).unwrap()] = prev;
+                }
                 toks[o].pair = k as u32;
                 toks[k].pair = o as u32;
             }
@@ -577,6 +581,16 @@ fn match_delimiters(code: &str, toks: &mut [Token]) -> bool {
         }
     }
     errors || !stack.is_empty()
+}
+
+/// 0 for `(` and `)`, 1 for `[` and `]`, 2 for braces.
+fn delimiter_kind(c: u8) -> Option<usize> {
+    match c {
+        b'(' | b')' => Some(0),
+        b'[' | b']' => Some(1),
+        b'{' | b'}' => Some(2),
+        _ => None,
+    }
 }
 
 // ------------------------------------------------------------------ parser
@@ -2346,7 +2360,12 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.punct(b'(') || self.punct(b'[') {
-                self.parse_expr_list();
+                // Calls and indexes nest without passing parse_prefix's depth guard (`f(f(f(…)))`), so they count a
+                // level of their own.
+                if self.enter() {
+                    self.parse_expr_list();
+                    self.leave();
+                }
                 info = ExprInfo::default();
                 continue;
             }
@@ -2365,14 +2384,21 @@ impl<'a> Parser<'a> {
             }
             let op_tok = self.pos;
             self.bump_n(len);
+            // A right operand nests (`a = b = c = …`) without passing parse_prefix's depth guard either.
+            if !self.enter() {
+                info = ExprInfo::default();
+                continue;
+            }
             if range {
                 if self.can_start_expr(self.pos, ns) {
                     self.parse_expr_bp(rbp, ns, false);
                 }
+                self.leave();
                 info = ExprInfo::default();
                 continue;
             }
             let rhs = self.parse_expr_bp(rbp, ns, cond);
+            self.leave();
             let and = logic && self.code[self.toks[op_tok].start as usize] == b'&';
             if and && (info.is_let || rhs.is_let) {
                 info = ExprInfo { is_let: true, ..ExprInfo::default() };
@@ -2841,6 +2867,35 @@ mod tests {
         assert_eq!(t.nodes.iter().filter(|n| n.kind == NodeKind::Fn).count(), 1);
         let ok = format!("use {}a{};", "{".repeat(MAX_DEPTH as usize - 1), "}".repeat(MAX_DEPTH as usize - 1));
         assert!(!parse(&ok).errors);
+    }
+
+    #[test]
+    fn nested_calls_and_right_operands_are_capped() {
+        // Calls, indexes and right operands nest without passing parse_prefix's depth guard; they count too, so a
+        // small stack suffices.
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                for code in [
+                    format!("fn f() {{ {}{}; }}", "f(".repeat(100_000), ")".repeat(100_000)),
+                    format!("fn f() {{ {}{}; }}", "a[".repeat(100_000), "]".repeat(100_000)),
+                    format!("fn f() {{ {}a; }}", "x = ".repeat(100_000)),
+                    format!("fn f() {{ {}{}; }}", "([".repeat(100_000), ")".repeat(100_000)),
+                ] {
+                    assert!(parse(&code).errors);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn unmatched_closers_are_linear() {
+        // A long run of closers that match no opener used to rescan the open ones for each.
+        let start = std::time::Instant::now();
+        assert!(parse(&format!("fn f() {{ {} }}", "(]".repeat(200_000))).errors);
+        assert!(start.elapsed().as_secs() < 10);
     }
 
     #[test]

@@ -26,8 +26,8 @@ pub fn export(model: &CityModel, target: &Path) -> std::io::Result<()> {
         r#""imports": {"#,
         &format!(
             "\"imports\": {{\n        \"./walk.js\": \"data:text/javascript;base64,{}\",\n        \"./replay.js\": \"data:text/javascript;base64,{}\",",
-            base64(assets::WALK_JS.as_bytes()),
-            base64(assets::REPLAY_JS.as_bytes())
+            assets::base64(assets::WALK_JS.as_bytes()),
+            assets::base64(assets::REPLAY_JS.as_bytes())
         ),
     );
     // The JSON writer escapes '<', so the data cannot terminate the script element early. The script stays a module,
@@ -37,28 +37,12 @@ pub fn export(model: &CityModel, target: &Path) -> std::io::Result<()> {
         r#"<script type="module" src="app.js"></script>"#,
         &format!("<script id=\"city-data\" type=\"application/json\">{}</script>\n<script type=\"module\">\n{}\n</script>", model.json(), assets::APP_JS),
     );
+    // Last, once every inline script is in place: their hashes go into the page's Content-Security-Policy.
+    let html = assets::with_script_hashes(&html);
     if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(target, html)
-}
-
-/// Standard base64 (RFC 4648, with padding).
-fn base64(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        // Three bytes make 24 bits, emitted as four 6-bit digits; a short final chunk is padded with '='.
-        let n = (chunk[0] as u32) << 16 | (*chunk.get(1).unwrap_or(&0) as u32) << 8 | *chunk.get(2).unwrap_or(&0) as u32;
-        for k in 0..4 {
-            if k <= chunk.len() {
-                out.push(ALPHABET[(n >> (18 - 6 * k) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
 }
 
 /// Replaces the first occurrence of `marker`. Panics if it is missing: that means index.html changed and this
@@ -66,4 +50,59 @@ fn base64(data: &[u8]) -> String {
 fn replace_once(text: &mut String, marker: &str, replacement: &str) {
     let i = text.find(marker).unwrap_or_else(|| panic!("export marker not found: {marker}"));
     text.replace_range(i..i + marker.len(), replacement);
+}
+
+/// The viewer's Content-Security-Policy allows inline scripts only by hash. Each emitted page (the served one, as
+/// [`assets::get`] hands it to the server, and an exported one) must list exactly the hashes of its own inline
+/// scripts, so editing index.html, app.js, walk.js or replay.js cannot break it. The Java and D editions have the same
+/// test.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::SourceAnalyzer;
+
+    /// `'sha256-…'` of every inline script (import map or module without `src`) of `page`, in page order, found
+    /// independently of [`assets::with_script_hashes`].
+    fn script_hashes(page: &str) -> Vec<String> {
+        let re = regex::Regex::new(r#"(?s)<script type="(?:importmap|module)">(.*?)</script>"#).unwrap();
+        re.captures_iter(page)
+            .map(|c| format!("'sha256-{}'", assets::base64(&crate::sha256::digest(c[1].as_bytes()))))
+            .collect()
+    }
+
+    fn csp(page: &str) -> String {
+        let re = regex::Regex::new(r#"<meta http-equiv="Content-Security-Policy" content="([^"]*)">"#).unwrap();
+        re.captures(page).expect("no Content-Security-Policy meta tag")[1].to_string()
+    }
+
+    #[test]
+    fn csp_lists_every_inline_script_of_the_served_and_the_exported_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("A.java"), "class A { void f() {} }\n").unwrap();
+        let model = CityModel::build(&SourceAnalyzer::new(), &root, true, false, None, None);
+        let out = root.join("out/city.html");
+        export(&model, &out).unwrap();
+        let exported = std::fs::read_to_string(&out).unwrap();
+        let served = assets::get("/").unwrap().1;
+
+        assert_eq!(script_hashes(served).len(), 1);
+        assert_eq!(script_hashes(&exported).len(), 2);
+        let hash = regex::Regex::new(r" 'sha256-[A-Za-z0-9+/=]+'").unwrap();
+        for page in [served, exported.as_str()] {
+            assert!(!page.contains("{{inline-script-hashes}}"));
+            let policy = csp(page);
+            let listed: Vec<String> = hash.find_iter(&policy).map(|m| m.as_str().trim().to_string()).collect();
+            assert_eq!(listed, script_hashes(page), "the policy lists exactly the page's inline scripts");
+        }
+        assert_eq!(hash.replace_all(&csp(served), ""), hash.replace_all(&csp(&exported), ""));
+    }
+
+    /// Cross-check of the in-house SHA-256 as the policy uses it: the expected value was computed with Python's
+    /// hashlib (`base64(sha256(script))`), the same rule browsers apply.
+    #[test]
+    fn script_hash_matches_an_independent_implementation() {
+        let html = "<meta content=\"{{inline-script-hashes}}\"><script type=\"importmap\">\n    {\"imports\": {\"three\": \"x\"}}\n  </script>";
+        assert!(assets::with_script_hashes(html).starts_with("<meta content=\"'sha256-tWZD2WKW2jTO7eRqEuxxZFb5iSTDW1CRqMCgTsbKMJE='\">"));
+    }
 }

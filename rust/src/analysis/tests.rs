@@ -323,3 +323,191 @@ fn cached_parses_see_manifest_changes() {
     write(r, "Cargo.toml", "[package]\nname = \"after_rename\"\n");
     assert!(by_fqn(&analyzer.analyze(&root, true)).contains_key("after_rename::A"));
 }
+
+// ------------------------------------------------------------------ hostile input
+// Inputs that used to take quadratic time or memory, overflow the stack, or read outside the analysed tree. Each
+// analysis must finish well within the limit (the old behaviour took minutes or crashed). The Java edition's
+// AdversarialInputTest and the D edition's tests.d run the same cases.
+
+/// Generous for these inputs in linear time, far too short for the quadratic behaviour they guard against.
+const LIMIT_SECS: u64 = 20;
+
+fn analyze_in_time(root: &Path) -> Analysis {
+    let start = std::time::Instant::now();
+    let a = analyze(root);
+    assert!(start.elapsed().as_secs() < LIMIT_SECS, "took {:?}", start.elapsed());
+    a
+}
+
+/// The hand-written scan finds what the regular expression it replaced found.
+#[test]
+fn cargo_package_name_scan() {
+    let cases: [(&str, Option<&str>); 15] = [
+        ("[package]\nname = \"a-b\"\n", Some("a-b")),
+        ("[package]\nauthors = [\"x\"]\nname = \"n\"\n", Some("n")),
+        ("[package] # c\n  name\t=  \"x\"", Some("x")),
+        ("[package]\nversion = \"1\"\n\n  \nname = \"x\"\n", Some("x")),
+        ("[package]\r\nname = \"x\"\r\n", Some("x")),
+        ("[package]\nname =\n \"x\"\n", Some("x")),
+        ("[package]\nname = \"\"\nname = \"y\"\n", Some("y")),
+        ("[package]\n[dependencies]\n[package]\nname = \"second\"\n", Some("second")),
+        ("[workspace]\nname = \"w\"\n", None),
+        ("[package]\n[lib]\nname = \"l\"\n", None),
+        ("  [package]\nname = \"x\"\n", None),
+        ("[package]", None),
+        ("[package]\nname = \"x", None),
+        ("[package]\n\x0cname = \"x\"\n", None),
+        ("[package]\nversion = 1", None),
+    ];
+    for (toml, expected) in cases {
+        assert_eq!(super::rust_lang::package_name(toml), expected, "{toml:?}");
+    }
+}
+
+/// The Java edition's regular expression recursed once per line it skipped: a long [package] table overflowed the
+/// stack.
+#[test]
+fn long_cargo_package_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    write(r, "Cargo.toml", &format!("[package]\n{}name = \"deep\"\n", "a = 1\n".repeat(100_000)));
+    write(r, "src/lib.rs", "pub struct A;\n");
+    assert!(by_fqn(&analyze_in_time(r)).contains_key("deep::A"));
+}
+
+/// Manifests are read only as regular files within the size cap; a symbolic link could point anywhere.
+#[test]
+fn symlinked_and_oversized_manifests_are_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(outside.path(), "[package]\nname = \"leak\"\n").unwrap();
+    let r = dir.path();
+    write(r, "a/src/lib.rs", "pub struct A;\n");
+    std::os::unix::fs::symlink(outside.path(), r.join("a/Cargo.toml")).unwrap();
+    let pad = "#".repeat(super::rust_lang::MAX_MANIFEST_BYTES as usize);
+    write(r, "b/Cargo.toml", &format!("[package]\nname = \"big\"\n{pad}"));
+    write(r, "b/src/lib.rs", "pub struct B;\n");
+    write(r, "web/src/c.ts", "export class C {}\n");
+    std::os::unix::fs::symlink(outside.path(), r.join("web/package.json")).unwrap();
+    let a = analyze_in_time(r);
+    assert!(a.types.iter().all(|t| !t.fqn.starts_with("leak::") && !t.fqn.starts_with("big::")));
+    assert_eq!(by_fqn(&a)["web/src/c.ts:C"].module, "", "a linked package.json is no project");
+}
+
+/// All methods on one line: lines of code used to be judged once per method, over the whole line each time.
+#[test]
+fn minified_single_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    let methods: String = (0..50_000).map(|i| format!(" void m{i}() {{ int x = 1; }}")).collect();
+    write(r, "C.java", &format!("class C {{{methods} }}"));
+    let a = analyze_in_time(r);
+    let c = by_fqn(&a)["C"];
+    assert_eq!((c.methods.len(), c.loc), (50_000, 1));
+}
+
+/// `a < a < a …`: every `<` was tried as type arguments down to the depth cap, re-lexing each time.
+#[test]
+fn typescript_comparison_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    write(r, "a.ts", &format!("export const x = {}b;\nexport class After {{}}\n", "a < ".repeat(100_000)));
+    assert!(by_fqn(&analyze_in_time(r)).contains_key("a.ts:After"));
+}
+
+/// `A.A.A…`: every prefix of a qualified name was a reference, quadratic in its length.
+#[test]
+fn long_qualified_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    write(r, "C.java", &format!("class C {{ A{} x; }}", ".A".repeat(200_000)));
+    let a = analyze_in_time(r);
+    assert!(by_fqn(&a)["C"].references.len() <= super::java::MAX_QUALIFIED_PREFIXES + 1);
+}
+
+/// Every reference was checked against every import.
+#[test]
+fn many_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    let imports: String = (0..20_000).map(|i| format!("import a{i}.B;\nimport w{i}.*;\n")).collect();
+    let fields: String = (0..20_000).map(|i| format!(" B{i} x{i};")).collect();
+    write(r, "p/C.java", &format!("package p;\n{imports}class C {{{fields} }}"));
+    let ts_imports: String = (0..20_000).map(|i| format!("import {{ B{i} }} from \"./b{i}\";\n")).collect();
+    let ts_classes: String = (0..20_000).map(|i| format!("export class C{i} {{ x: B{i}; }}\n")).collect();
+    write(r, "a.ts", &format!("{ts_imports}{ts_classes}"));
+    assert!(analyze_in_time(r).types.len() >= 20_001);
+}
+
+/// Only the first MAX_IMPORT_CANDIDATES on-demand imports of a Java file are used.
+#[test]
+fn wildcard_imports_are_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    write(r, "q/D.java", "package q; public class D {}");
+    let first = "import w.*;\n".repeat(super::java::MAX_IMPORT_CANDIDATES - 1);
+    write(r, "p/In.java", &format!("package p;\n{first}import q.*;\nclass In {{ D d; }}"));
+    write(r, "p/Out.java", &format!("package p;\n{first}import w.*;\nimport q.*;\nclass Out {{ D d; }}"));
+    let a = analyze_in_time(r);
+    assert!(deps(&a, "p.In").contains(&"q.D".to_string()));
+    assert!(!deps(&a, "p.Out").contains(&"q.D".to_string()));
+}
+
+/// The same for Rust glob imports, with MAX_GLOB_IMPORTS per module.
+#[test]
+fn glob_imports_are_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    write(r, "Cargo.toml", "[package]\nname = \"k\"\n");
+    let first = "use w::*;\n".repeat(super::rust_lang::MAX_GLOB_IMPORTS - 1);
+    write(r, "src/lib.rs", &format!(
+        "pub mod q {{ pub struct D; }}\npub mod a {{\n{first}use crate::q::*;\npub struct In {{ d: D }}\n}}\n\
+         pub mod b {{\n{first}use w::*;\nuse crate::q::*;\npub struct Out {{ d: D }}\n}}\n"));
+    let globs: String = (0..20_000).map(|i| format!("use g{i}::*;\n")).collect();
+    let fields: String = (0..20_000).map(|i| format!(" x{i}: B{i},")).collect();
+    write(r, "src/many.rs", &format!("{globs}pub struct S {{{fields} }}\n"));
+    let a = analyze_in_time(r);
+    assert!(deps(&a, "k::a::In").contains(&"k::q::D".to_string()));
+    assert!(!deps(&a, "k::b::Out").contains(&"k::q::D".to_string()));
+}
+
+/// A long package, outer type, namespace or module name used to be copied into the fqn of every building inside it.
+/// Such buildings are skipped now (MAX_FQN_BYTES), and their files count as failed.
+#[test]
+fn over_long_names_are_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    let long_name = "N".repeat(super::text::MAX_FQN_BYTES + 1);
+    let classes: String = (0..2_000).map(|i| format!("class C{i} {{}}\n")).collect();
+    write(r, "p/A.java", &format!("package {long_name};\n{classes}"));
+    write(r, "p/B.java", &format!("class {long_name} {{\n{classes}}}\nclass Kept {{}}\n"));
+    write(r, "a.ts", &format!("namespace {long_name} {{\n{}}}\nexport class Kept {{}}\n", classes.replace("class", "export class")));
+    write(r, "Cargo.toml", "[package]\nname = \"k\"\n");
+    let structs = classes.replace("class", "pub struct").replace(" {}", ";");
+    write(r, "src/lib.rs", &format!("mod {} {{\n{structs}}}\npub struct Kept;\n", long_name.to_lowercase()));
+    let a = analyze_in_time(r);
+    let mut fqns: Vec<&str> = a.types.iter().map(|t| t.fqn.as_str()).collect();
+    fqns.sort();
+    assert_eq!(fqns, ["Kept", "a.ts:Kept", "k::Kept"]);
+    assert_eq!(a.failed_files, 4);
+}
+
+/// Member types nested deeper than MAX_TYPE_NESTING are not buildings.
+#[test]
+fn deep_member_types_are_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    let depth = super::java::MAX_TYPE_NESTING + 4;
+    write(r, "C.java", &format!("{}{}", "class C0 {".repeat(depth), "}".repeat(depth)));
+    let a = analyze_in_time(r);
+    assert_eq!((a.types.len(), a.failed_files), (super::java::MAX_TYPE_NESTING, 1));
+}
+
+/// Repeated declarations of one name get numbered ids; finding the next number used to rescan from the first.
+#[test]
+fn repeated_typescript_declarations() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = dir.path();
+    write(r, "a.ts", &"interface A {}\n".repeat(30_000));
+    assert!(by_fqn(&analyze_in_time(r)).contains_key("a.ts:A#interface29999"));
+}

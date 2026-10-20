@@ -8,12 +8,31 @@
 //! does not resolve to a project type (JDK and library types) is dropped.
 
 use super::java_parse::{self as jp, NodeKind, Tree};
-use super::text::{count_loc, in_test_directory, lines};
+use super::text::{count_loc, in_test_directory, lines, Lines, MAX_FQN_BYTES};
 use super::{Context, Linked, ParsedFile};
 use crate::model::{Language, MethodInfo, TypeInfo};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cell::Cell;
 use std::path::Path;
 use std::sync::Arc;
+
+/// A reference is tried against the file's on-demand imports (`import a.b.*;`) and against its single-type imports of
+/// the same simple name. Beyond this many of either kind, later ones are ignored, so a crafted file with very many
+/// cannot make the analysis quadratic; real files have a handful of on-demand imports and one single-type import per
+/// name. Imports longer than [`MAX_FQN_BYTES`] are ignored too: they cannot name a building. The Java and D editions
+/// use the same limits.
+pub const MAX_IMPORT_CANDIDATES: usize = 64;
+
+/// A qualified name (`a.b.C`) contributes its prefixes (`a`, `a.b`) as references too, but at most this many of them,
+/// the shortest; a crafted name of very many segments would otherwise yield an amount of text quadratic in its
+/// length. The Java and D editions use the same limit.
+pub const MAX_QUALIFIED_PREFIXES: usize = 16;
+
+/// Member types nested deeper than this (a top-level type is at depth 1) are not buildings; their code still counts
+/// towards the enclosing types. Every type collects and resolves the references of its member types as well, so with
+/// deep nesting the work grew with the square of the depth; real code nests a few levels. The Java and D editions use
+/// the same limit.
+pub const MAX_TYPE_NESTING: usize = 16;
 
 /// Parses one `.java` file into its types (top-level and member types, depth-first in source order).
 pub fn parse(root: &Path, file: &Path, code: &str) -> ParsedFile {
@@ -43,6 +62,9 @@ pub fn parse(root: &Path, file: &Path, code: &str) -> ParsedFile {
                 let asterisk = node.flags & jp::IMPORT_ASTERISK != 0;
                 // Names may be written with whitespace or line breaks around the dots; normalise to `a.b.C`.
                 let name = strip_ws(name_text(&tree, code, name));
+                if name.len() > MAX_FQN_BYTES {
+                    continue;
+                }
                 // Static imports name members, not types. What matters for dependencies is the class they come from:
                 // `import static a.b.C.m;` and `import static a.b.C.*;` both record `a.b.C` as a single-type import.
                 if is_static && !asterisk {
@@ -51,7 +73,11 @@ pub fn parse(root: &Path, file: &Path, code: &str) -> ParsedFile {
                         None => name,
                     });
                 } else if asterisk {
-                    if is_static { explicit.push(name) } else { wildcard.push(name) }
+                    if is_static {
+                        explicit.push(name)
+                    } else if wildcard.len() < MAX_IMPORT_CANDIDATES {
+                        wildcard.push(name)
+                    }
                 } else {
                     explicit.push(name);
                 }
@@ -61,13 +87,13 @@ pub fn parse(root: &Path, file: &Path, code: &str) -> ParsedFile {
     }
 
     let mut types = Vec::new();
-    let ctx = FileCtx { tree: &tree, code, lines: &lines, file, package: &package, module: &module, test, explicit: &explicit, wildcard: &wildcard };
+    let ctx = FileCtx { tree: &tree, code, lines: &lines, file, package: &package, module: &module, test, explicit: explicit.into(), wildcard: wildcard.into(), skipped: Cell::new(false) };
     for &n in &top {
         if tree.nodes[n].kind == NodeKind::TypeDecl {
-            collect_type(&ctx, n, "", &mut types);
+            collect_type(&ctx, n, "", 1, &mut types);
         }
     }
-    ParsedFile { types, context: Context::None, failed: tree.error }
+    ParsedFile { types, context: Context::None, failed: tree.error || ctx.skipped.get() }
 }
 
 /// The [`NodeKind::Name`] child of a package or import node.
@@ -89,13 +115,15 @@ fn token_text<'a>(tree: &Tree, code: &'a str, t: u32) -> &'a str {
 struct FileCtx<'a> {
     tree: &'a Tree,
     code: &'a str,
-    lines: &'a [&'a str],
+    lines: &'a Lines,
     file: &'a Path,
     package: &'a str,
     module: &'a str,
     test: bool,
-    explicit: &'a [String],
-    wildcard: &'a [String],
+    explicit: Arc<[String]>,
+    wildcard: Arc<[String]>,
+    /// Set when a type was skipped for its nesting or the length of its fqn (see [`collect_type`]).
+    skipped: Cell<bool>,
 }
 
 /// Adds a type and, recursively, the member types declared in its body (local classes are not types).
@@ -108,11 +136,19 @@ struct FileCtx<'a> {
 /// - `loc`: the whole declaration, including member types, so an outer type's LOC contains its inner types';
 /// - references: collected from the whole declaration, member types included.
 ///
-/// The type is pushed before its member types, so `out` is in pre-order.
-fn collect_type(ctx: &FileCtx, decl: usize, outer: &str, out: &mut Vec<TypeInfo>) {
+/// The type is pushed before its member types, so `out` is in pre-order. A type nested deeper than
+/// [`MAX_TYPE_NESTING`] or whose fqn would exceed [`MAX_FQN_BYTES`] is skipped with its member types (whose fqns are
+/// longer still), and the file counts as failed; the length is checked before the fqn is built.
+fn collect_type(ctx: &FileCtx, decl: usize, outer: &str, depth: usize, out: &mut Vec<TypeInfo>) {
     let tree = ctx.tree;
     let node = tree.nodes[decl];
     let simple = token_text(tree, ctx.code, node.name);
+    let dot = |s: &str| usize::from(!s.is_empty());
+    let fqn_bytes = ctx.package.len() + dot(ctx.package) + outer.len() + dot(outer) + simple.len();
+    if depth > MAX_TYPE_NESTING || fqn_bytes > MAX_FQN_BYTES {
+        ctx.skipped.set(true);
+        return;
+    }
     let name = if outer.is_empty() { simple.to_string() } else { format!("{outer}.{simple}") };
     let fqn = if ctx.package.is_empty() { name.clone() } else { format!("{}.{}", ctx.package, name) };
 
@@ -147,11 +183,11 @@ fn collect_type(ctx: &FileCtx, decl: usize, outer: &str, out: &mut Vec<TypeInfo>
         test: ctx.test,
         methods,
         references: references(tree, ctx.code, decl),
-        explicit_imports: ctx.explicit.to_vec(),
-        wildcard_imports: ctx.wildcard.to_vec(),
+        explicit_imports: ctx.explicit.clone(),
+        wildcard_imports: ctx.wildcard.clone(),
     });
     for n in nested {
-        collect_type(ctx, n, &name, out);
+        collect_type(ctx, n, &name, depth + 1, out);
     }
 }
 
@@ -205,31 +241,41 @@ fn references(tree: &Tree, code: &str, decl: usize) -> HashSet<String> {
         let text = tree.text(code, n.first, n.last);
         match n.kind {
             NodeKind::TypeName => {
-                refs.insert(text.to_string());
+                add_reference(&mut refs, text.to_string());
             }
             NodeKind::ScopedTypeName => {
                 // a qualified name: `Map.Entry` contributes "Map.Entry" and its scope "Map", but not "Entry" alone
                 // (the parser does not report the parts of a qualified name separately)
+                // At most MAX_QUALIFIED_PREFIXES of them, the shortest, so a crafted name of many segments does not
+                // yield a quadratic amount of text.
+                // A prefix longer than MAX_FQN_BYTES would be dropped by add_reference anyway.
                 let text = strip_ws(text);
-                let mut prefix = text.as_str();
-                while let Some(dot) = prefix.rfind('.') {
-                    prefix = &prefix[..dot];
-                    refs.insert(prefix.to_string());
+                for (dot, _) in text.match_indices('.').take(MAX_QUALIFIED_PREFIXES).take_while(|&(d, _)| d <= MAX_FQN_BYTES) {
+                    add_reference(&mut refs, text[..dot].to_string());
                 }
-                refs.insert(text);
+                add_reference(&mut refs, text);
             }
             NodeKind::AnnotationName => {
-                refs.insert(strip_ws(text));
+                add_reference(&mut refs, strip_ws(text));
             }
             NodeKind::MemberObject => {
                 if text.chars().next().is_some_and(char::is_uppercase) {
-                    refs.insert(text.to_string());
+                    add_reference(&mut refs, text.to_string());
                 }
             }
             _ => {}
         }
     }
     refs
+}
+
+/// Adds a reference unless it is longer than [`MAX_FQN_BYTES`]: it could not name a building, only resolve through its
+/// first segment, which a qualified name contributes on its own (see [`references`]), and resolving it would copy it
+/// into every candidate tried.
+fn add_reference(refs: &mut HashSet<String>, name: String) {
+    if name.len() <= MAX_FQN_BYTES {
+        refs.insert(name);
+    }
 }
 
 /// Removes all whitespace: names are taken from the source text, and `java.util . List` is a legal way to write one.
@@ -271,16 +317,36 @@ pub fn link(files: &[Arc<ParsedFile>]) -> Linked {
         }
     }
     let mut dependencies = HashMap::new();
+    // The single-type imports of each import list by simple name; the types of a file share one list, so each file's
+    // imports are indexed once.
+    let mut import_index: HashMap<*const String, HashMap<&str, Vec<&str>>> = HashMap::new();
     for t in by_fqn.values() {
+        let imports = import_index.entry(t.explicit_imports.as_ptr()).or_insert_with(|| by_simple_name(&t.explicit_imports));
         let out: HashSet<String> = t
             .references
             .iter()
-            .filter_map(|r| resolve(r, t, &by_fqn))
+            .filter_map(|r| resolve(r, t, imports, &by_fqn))
             .filter(|target| *target != t.fqn)
             .collect();
         dependencies.insert(t.fqn.clone(), out);
     }
     Linked { types: by_fqn.into_values().cloned().collect(), dependencies }
+}
+
+/// Single-type imports by simple name (the last segment: `a.b.C` under "C"), each list in import order and at most
+/// [`MAX_IMPORT_CANDIDATES`] long. An import without a dot names no package member and is left out. Lets [`resolve`] find the imports that match a name without
+/// scanning them all for every reference.
+fn by_simple_name(imports: &[String]) -> HashMap<&str, Vec<&str>> {
+    let mut index: HashMap<&str, Vec<&str>> = HashMap::new();
+    for imp in imports {
+        if let Some(dot) = imp.rfind('.') {
+            let same = index.entry(&imp[dot + 1..]).or_default();
+            if same.len() < MAX_IMPORT_CANDIDATES {
+                same.push(imp);
+            }
+        }
+    }
+    index
 }
 
 /// Java's own lookup order: enclosing types, single-type imports, same package, on-demand imports.
@@ -300,7 +366,7 @@ pub fn link(files: &[Arc<ParsedFile>]) -> Linked {
 /// candidate is a project type is the reference taken as already fully qualified (`com.acme.Order`). Types in the
 /// default package are found only from the default package itself (as its "same package" candidate): as in Java,
 /// they are invisible from named packages.
-fn resolve(reference: &str, from: &TypeInfo, known: &BTreeMap<String, &TypeInfo>) -> Option<String> {
+fn resolve(reference: &str, from: &TypeInfo, imports: &HashMap<&str, Vec<&str>>, known: &BTreeMap<String, &TypeInfo>) -> Option<String> {
     let (first, rest) = match reference.find('.') {
         Some(dot) => (&reference[..dot], &reference[dot..]),
         None => (reference, ""),
@@ -316,14 +382,10 @@ fn resolve(reference: &str, from: &TypeInfo, known: &BTreeMap<String, &TypeInfo>
             None => break,
         }
     }
-    for imp in &from.explicit_imports {
-        // Match the import's last segment.
-        if imp.ends_with(&format!(".{first}")) {
-            candidates.push(imp.clone());
-        }
-    }
+    // The single-type imports whose last segment is `first`.
+    candidates.extend(imports.get(first).into_iter().flatten().map(|imp| imp.to_string()));
     candidates.push(format!("{prefix}{first}"));
-    for w in &from.wildcard_imports {
+    for w in from.wildcard_imports.iter() {
         candidates.push(format!("{w}.{first}"));
     }
     // For a qualified reference prefer the full name (`a.Map.Entry`), then fall back to the first segment alone

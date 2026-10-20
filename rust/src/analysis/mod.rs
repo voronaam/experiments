@@ -84,6 +84,18 @@ pub fn is_ignored_dir(name: &str) -> bool {
     IGNORED_DIRS.contains(&name) || (name.starts_with('.') && name.len() > 1)
 }
 
+/// Larger source files are not parsed and count as failed (16 MiB, far beyond any hand-written file). Reading and
+/// parsing take memory and time in proportion to the size, so a crafted multi-gigabyte file would otherwise exhaust
+/// memory or stall the analysis.
+pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// False for a file or directory name that is not valid UTF-8, or that contains U+FFFD: the Java edition only sees
+/// such names with U+FFFD in place of the bad bytes, so all three editions skip both and see the same files. Skipping
+/// them keeps undecodable bytes out of paths, module names and the JSON.
+pub fn is_valid_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|n| !n.contains('\u{FFFD}'))
+}
+
 /// Manifest file names whose content feeds into the parse of other files: a `.rs` file's crate name comes from the
 /// nearest `Cargo.toml`, a `.ts` file's project from the nearest `package.json`.
 pub const MANIFESTS: [&str; 2] = ["Cargo.toml", "package.json"];
@@ -217,10 +229,16 @@ impl SourceAnalyzer {
     /// Returns the cached result if the file's modification time and size are unchanged, otherwise parses it and
     /// caches the result. Files whose modification time cannot be read are parsed every time and never cached.
     ///
+    /// The metadata is read without following links. A path that is no longer a regular file (replaced by a link or
+    /// a FIFO since the walk) and a file over [`MAX_FILE_BYTES`] are not read at all: they fail, uncached.
+    ///
     /// Called concurrently from rayon workers: the lock is taken for the lookup and again for the insert, never
     /// across the parse. Two workers never parse the same path because each path occurs once in the file list.
     fn parse_cached(&self, lang: Language, root: &Path, file: &Path) -> Arc<ParsedFile> {
-        let meta = std::fs::metadata(file).ok();
+        let meta = std::fs::symlink_metadata(file).ok();
+        if meta.as_ref().is_some_and(|m| !m.is_file() || m.len() > MAX_FILE_BYTES) {
+            return Arc::new(failed());
+        }
         let modified = meta.as_ref().and_then(|m| m.modified().ok());
         let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
         if let Some(modified) = modified {
@@ -261,7 +279,7 @@ impl SourceAnalyzer {
             Err(_) => {
                 // A bug in an analyser, not a syntax error in the file: report it (once) rather than hide it.
                 if !self.reported_failure.swap(true, Ordering::Relaxed) {
-                    eprintln!("warning: could not analyse {}", file.display());
+                    eprintln!("warning: could not analyse {}", crate::printable(&file.display().to_string()));
                 }
                 failed()
             }
@@ -278,8 +296,10 @@ fn failed() -> ParsedFile {
 /// in parallel.
 ///
 /// `standard_filters(false)` turns off the `ignore` crate's own rules (.gitignore, hidden files), so the result does
-/// not depend on ignore files; only [`is_ignored_dir`] prunes directories. Symlinks are not followed, which also rules
-/// out cycles. The root itself is never pruned, even if its name looks ignored (e.g. a project checked out as
+/// not depend on ignore files; only [`is_ignored_dir`] prunes directories. Symlinks are not followed, neither to
+/// directories (which also rules out cycles) nor to files: a link's own file type is not a file, so a link to a file
+/// outside the tree is never read. FIFOs, devices and sockets are not files either, so nothing is opened that could
+/// block. Entries whose name fails [`is_valid_name`] are skipped. The root itself is never pruned, even if its name looks ignored (e.g. a project checked out as
 /// `build/`). The walker threads push into shared vectors, so the lists are sorted afterwards to be deterministic.
 fn find_sources(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let files = Mutex::new(Vec::new());
@@ -289,10 +309,13 @@ fn find_sources(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
         .standard_filters(false)
         .follow_links(false)
         .filter_entry(move |e| {
-            if e.path() == root_buf || !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if e.path() == root_buf {
                 return true;
             }
-            !is_ignored_dir(&e.file_name().to_string_lossy())
+            if !is_valid_name(e.file_name()) {
+                return false;
+            }
+            !e.file_type().map(|t| t.is_dir()).unwrap_or(false) || !is_ignored_dir(&e.file_name().to_string_lossy())
         })
         .build_parallel()
         .run(|| {
@@ -316,4 +339,40 @@ fn find_sources(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut manifests = manifests.into_inner().unwrap();
     manifests.sort();
     (files, manifests)
+}
+
+/// The walk over a hostile tree (the Java and D editions have the same test): links to files and directories outside
+/// the tree, a link cycle, a FIFO, a name that is not UTF-8 and an oversized file. Only the two ordinary files count;
+/// the oversized one is found but fails, and nothing blocks or escapes the tree.
+#[cfg(all(test, unix))]
+mod walk_tests {
+    use super::*;
+
+    #[test]
+    fn walk_stays_inside_the_tree_and_skips_special_files() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = std::fs::canonicalize(tmp.path()).unwrap();
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("Secret.java"), "class Secret {}").unwrap();
+        let src = tmp.join("root/src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("A.java"), "class A {}").unwrap();
+        std::fs::write(src.join("B.ts"), "export class B {}").unwrap();
+        symlink(outside.join("Secret.java"), src.join("Link.java")).unwrap();
+        symlink(&outside, src.join("outlink")).unwrap();
+        symlink(&src, src.join("loop")).unwrap();
+        std::fs::File::create(src.join("Big.java")).unwrap().set_len(MAX_FILE_BYTES + 1).unwrap(); // sparse
+        let status = std::process::Command::new("mkfifo").arg(src.join("Fifo.java")).status().unwrap();
+        assert!(status.success());
+        std::fs::write(src.join(std::ffi::OsStr::from_bytes(b"B\xffd.java")), "class Bad {}").unwrap();
+
+        let a = SourceAnalyzer::new().analyze(&tmp.join("root"), true);
+        let fqns: Vec<&str> = a.types.iter().map(|t| t.fqn.as_str()).collect();
+        assert_eq!(fqns, ["A", "src/B.ts:B"]);
+        assert_eq!(a.files, 3); // A.java, B.ts and Big.java
+        assert_eq!(a.failed_files, 1); // Big.java is too large to parse
+    }
 }

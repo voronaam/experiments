@@ -42,6 +42,8 @@ impl CityServer {
             .find_map(|port| Server::http(("127.0.0.1", port)).ok())
             .map_or_else(|| Server::http(("127.0.0.1", 0)), Ok)
             .map_err(std::io::Error::other)?;
+        // Fill in index.html's script hashes now rather than on the first request.
+        assets::served_index();
         // The port actually bound, which differs from `preferred` after a fallback or for port 0.
         let port = server.server_addr().to_ip().map_or(preferred, |a| a.port());
         Ok(CityServer { server: Arc::new(server), model: Arc::new(RwLock::new(model)), clients: Arc::new(Mutex::new(vec![])), port })
@@ -78,7 +80,8 @@ impl CityServer {
         for request in self.server.incoming_requests() {
             let model = self.model.read().unwrap().clone();
             let clients = self.clients.clone();
-            std::thread::spawn(move || handle(request, model, clients));
+            let port = self.port;
+            std::thread::spawn(move || handle(request, model, clients, port));
         }
     }
 }
@@ -104,8 +107,23 @@ fn send(request: Request, status: u16, content_type: &str, body: Vec<u8>) {
     let _ = request.respond(response);
 }
 
-/// Routes one request; runs on its own thread. The URL is matched as-is, without percent-decoding.
-fn handle(request: Request, model: Arc<CityModel>, clients: Arc<Mutex<Vec<Sender<Vec<u8>>>>>) {
+/// True for a `Host` header naming this server by a loopback name: `localhost`, `127.0.0.1` or `[::1]`, either alone
+/// or followed by `:port` (case-insensitive). Anything else, including a missing header, is what a DNS-rebinding page
+/// would send (see the module comment). The Java and D editions apply the same rule.
+pub fn is_allowed_host(host: Option<&str>, port: u16) -> bool {
+    let Some(host) = host else { return false };
+    let h = host.to_ascii_lowercase();
+    let h = h.strip_suffix(&format!(":{port}")).unwrap_or(&h);
+    matches!(h, "localhost" | "127.0.0.1" | "[::1]")
+}
+
+/// Routes one request; runs on its own thread. The URL is matched as-is, without percent-decoding. A request with a
+/// foreign `Host` is refused first ([`is_allowed_host`]).
+fn handle(request: Request, model: Arc<CityModel>, clients: Arc<Mutex<Vec<Sender<Vec<u8>>>>>, port: u16) {
+    let host = request.headers().iter().find(|h| h.field.equiv("Host")).map(|h| h.value.as_str());
+    if !is_allowed_host(host, port) {
+        return send(request, 403, "text/plain", b"forbidden host".to_vec());
+    }
     let url = request.url().to_string();
     let (path, query) = url.split_once('?').unwrap_or((&url, ""));
     match path {
@@ -142,20 +160,81 @@ fn handle(request: Request, model: Arc<CityModel>, clients: Arc<Mutex<Vec<Sender
 /// `id` is an index into the model's buildings, the same index the viewer got in `/api/city`. Since each request
 /// holds the model it started with, an index from an older model can name a different building after a rebuild.
 /// The answer is `{"file", "line", "endLine", "code"}`; a file that is too large or unreadable is answered with a
-/// one-line comment as its code, so the viewer can show it in place of the source.
+/// one-line comment as its code, so the viewer can show it in place of the source. The metadata is read without
+/// following links, and only a regular file is read: should the file have been replaced by a symbolic link (to a file
+/// outside the tree) or a FIFO since the analysis, it is reported as unreadable rather than followed or blocked on.
+/// An error names the file by its path relative to the root, never the absolute path.
 fn source(request: Request, model: &CityModel, query: &str) {
     let id = query.split('&').find_map(|kv| kv.strip_prefix("id=")).and_then(|v| v.parse::<usize>().ok());
     let Some(b) = id.and_then(|i| model.buildings.get(i)) else {
         return send(request, 404, "text/plain", b"unknown type".to_vec());
     };
     let t = &model.types()[b.index];
-    let code = match std::fs::metadata(&t.file) {
+    let unreadable = || format!("// unable to read {}", b.file);
+    let code = match std::fs::symlink_metadata(&t.file) {
+        Ok(m) if !m.is_file() => unreadable(),
         Ok(m) if m.len() > MAX_SOURCE_BYTES => "// file too large to display".to_string(),
-        _ => std::fs::read(&t.file)
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_else(|e| format!("// unable to read {}: {e}", t.file.display())),
+        Ok(_) => std::fs::read(&t.file).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()).unwrap_or_else(|_| unreadable()),
+        Err(_) => unreadable(),
     };
     let mut w = JsonWriter::new();
     w.begin_object().field_str("file", &b.file).field_int("line", t.line as i64).field_int("endLine", t.end_line as i64).field_str("code", &code).end_object();
     send(request, 200, "application/json; charset=utf-8", w.finish().into_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn only_loopback_host_names_are_allowed() {
+        for ok in ["localhost", "localhost:8080", "LOCALHOST:8080", "127.0.0.1:8080", "[::1]:8080", "[::1]"] {
+            assert!(is_allowed_host(Some(ok), 8080), "{ok}");
+        }
+        for bad in ["", "evil.example", "evil.example:8080", "localhost:8081", "localhost.:8080", "127.0.0.2:8080",
+            "localhost.evil.example:8080", "localhost:8080:8080", "0.0.0.0:8080"] {
+            assert!(!is_allowed_host(Some(bad), 8080), "{bad}");
+        }
+        assert!(!is_allowed_host(None, 8080));
+    }
+
+    /// Sends a raw GET (so the Host header is fully controlled; None leaves it out) and returns the whole response.
+    fn get(port: u16, path: &str, host: Option<&str>) -> String {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let host = host.map(|h| format!("Host: {h}\r\n")).unwrap_or_default();
+        s.write_all(format!("GET {path} HTTP/1.1\r\n{host}Connection: close\r\n\r\n").as_bytes()).unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    }
+
+    /// A DNS-rebinding request is refused; the source endpoint does not follow a link swapped in after analysis.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_foreign_hosts_and_does_not_follow_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = tmp.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("A.java"), "class A {}").unwrap();
+        std::fs::write(tmp.join("secret.txt"), "TOP SECRET").unwrap();
+        let model = CityModel::build(&crate::analysis::SourceAnalyzer::new(), &root, true, false, None, None);
+        let server = Arc::new(CityServer::bind(Arc::new(model), 0).unwrap());
+        let port = server.port;
+        let s = server.clone();
+        std::thread::spawn(move || s.run());
+        assert!(get(port, "/api/city", Some(&format!("evil.example:{port}"))).starts_with("HTTP/1.1 403"));
+        assert!(get(port, "/", Some(&format!("evil.example:{port}"))).starts_with("HTTP/1.1 403"));
+        assert!(!get(port, "/api/source?id=0", None).starts_with("HTTP/1.1 200"));
+        assert!(get(port, "/api/city", Some(&format!("localhost:{port}"))).starts_with("HTTP/1.1 200"));
+        assert!(get(port, "/api/source?id=0", Some(&format!("127.0.0.1:{port}"))).contains("class A {}"));
+
+        std::fs::remove_file(root.join("A.java")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("secret.txt"), root.join("A.java")).unwrap();
+        let r = get(port, "/api/source?id=0", Some(&format!("localhost:{port}")));
+        assert!(!r.contains("TOP SECRET"), "{r}");
+        assert!(r.contains("unable to read A.java"), "{r}");
+        assert!(!r.contains(tmp.to_str().unwrap()), "{r}");
+    }
 }

@@ -50,7 +50,8 @@
 //! - every loop over list items (members, statements, arguments, …) checks that an iteration consumed at least one
 //!   token; if not, it flags the error and skips one token, or a whole bracketed group if the token opens one (using
 //!   the bracket pairs from the lexer), so it always makes progress;
-//! - recursion is capped at [`MAX_DEPTH`] nested constructs; deeper input is skipped group by group and flagged.
+//! - recursion is capped at [`MAX_DEPTH`] nested constructs; deeper input is skipped group by group and flagged, and
+//!   from then on the parser no longer speculates (see `Parser::depth_capped`).
 //!
 //! So a file with errors still yields every declaration the parser could recognise, which is what the analyser
 //! reports (with the file counted as failed).
@@ -488,6 +489,7 @@ pub fn parse(code: &str) -> Tree {
         nodes: Vec::new(),
         error: lexed.error,
         depth: 0,
+        depth_capped: false,
         label_arrow: NONE as usize,
     };
     p.compilation_unit();
@@ -521,6 +523,12 @@ struct Parser<'a> {
     error: bool,
     /// Current nesting of guarded constructs (see [`MAX_DEPTH`]).
     depth: u32,
+    /// Set once the depth cap has been reached anywhere in the file. From then on the parser no longer tries the
+    /// speculative readings (a local variable, a cast, a type pattern, a record pattern, a type before `::` or
+    /// `.class`, a method outside a class) and takes the plain one. Input nested past the cap at each of many such
+    /// points (`a < a < a < …`) would otherwise cost up to the cap's worth of steps per token; real code never gets
+    /// near the cap. The TypeScript parser does the same.
+    depth_capped: bool,
     /// Index of the `->` that ends the `case` label being parsed (or `NONE`): `case A -> x` must not read `A -> x` as
     /// a lambda.
     label_arrow: usize,
@@ -651,6 +659,7 @@ impl Parser<'_> {
     /// make progress) and returns false; the caller then skips the construct. Pair with [`Parser::leave`].
     fn enter(&mut self) -> bool {
         if self.depth >= MAX_DEPTH {
+            self.depth_capped = true;
             self.skip();
             return false;
         }
@@ -802,6 +811,9 @@ impl Parser<'_> {
 
     /// At the top level: `Type name (` (a method outside any class, which is accepted).
     fn looks_like_method(&mut self) -> bool {
+        if self.depth_capped {
+            return false;
+        }
         let m = self.mark();
         let ok = self.type_() && self.kind() == Tok::Ident && self.peek_is(1, "(");
         self.reset(m);
@@ -1579,6 +1591,9 @@ impl Parser<'_> {
 
     /// At an identifier: `Type name` follows, so this is a local variable declaration.
     fn is_local_variable(&mut self) -> bool {
+        if self.depth_capped {
+            return false;
+        }
         let m = self.mark();
         let ok = self.type_() && self.kind() == Tok::Ident;
         self.reset(m);
@@ -1856,12 +1871,14 @@ impl Parser<'_> {
         if self.try_record_pattern(true) {
             return;
         }
-        let m = self.mark();
-        if self.type_() && self.kind() == Tok::Ident && self.ends_pattern(self.pos + 1) {
-            self.bump();
-            return;
+        if !self.depth_capped {
+            let m = self.mark();
+            if self.type_() && self.kind() == Tok::Ident && self.ends_pattern(self.pos + 1) {
+                self.bump();
+                return;
+            }
+            self.reset(m);
         }
-        self.reset(m);
         self.expression();
     }
 
@@ -1874,7 +1891,7 @@ impl Parser<'_> {
     /// followed by what ends a case label item. All or nothing. The plain name is not a type reference
     /// (it is a plain identifier), a generic one is.
     fn try_record_pattern(&mut self, in_label: bool) -> bool {
-        if self.kind() != Tok::Ident || !(self.peek_is(1, "(") || self.peek_is(1, "<")) {
+        if self.depth_capped || self.kind() != Tok::Ident || !(self.peek_is(1, "(") || self.peek_is(1, "<")) {
             return false;
         }
         let m = self.mark();
@@ -2034,6 +2051,9 @@ impl Parser<'_> {
     /// `(Foo) ++x` and `(int) -x` as casts but `(Foo) - x` as a parenthesized expression minus `x`, i.e. only a
     /// primitive type may be followed by `+`/`-`. All or nothing.
     fn try_cast(&mut self) -> bool {
+        if self.depth_capped {
+            return false;
+        }
         let m = self.mark();
         self.bump(); // (
         let primitive = self.is_primitive_at(self.pos) && self.peek_is(1, ")");
@@ -2184,7 +2204,7 @@ impl Parser<'_> {
         let class_literal = self.is_at(k, ".") && self.is_at(k + 1, "class");
         let array = self.is_at(k, "[") && self.is_at(k + 1, "]");
         let generic = self.is_at(k, "<");
-        if !(class_literal || array || generic) {
+        if self.depth_capped || !(class_literal || array || generic) {
             return false;
         }
         let m = self.mark();
@@ -2592,6 +2612,16 @@ public sealed abstract class T<K extends Comparable<? super K> & java.io.Seriali
     }
 
     /// Pathological nesting must not overflow the stack (run on a thread with a small 2 MiB stack) and must finish.
+    /// `a < a < a …`: each `<` was tried as type arguments down to the depth cap. Once the cap has been hit, the
+    /// parser no longer speculates, so this stays linear (it took about ten times the limit before).
+    #[test]
+    fn comparison_chain_past_the_depth_cap_is_linear() {
+        let code = format!("class C {{ void m() {{ x = {}b; List{} y; }} }}", "a < ".repeat(1_000_000), "<List".repeat(400_000));
+        let start = std::time::Instant::now();
+        assert!(parse(&code).error);
+        assert!(start.elapsed().as_secs() < 5, "took {:?}", start.elapsed());
+    }
+
     #[test]
     fn survives_deep_nesting() {
         let inputs: Vec<String> = vec![

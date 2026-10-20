@@ -4,15 +4,19 @@ import dev.codecity.json.JsonParser;
 import dev.codecity.json.JsonWriter;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.function.Function;
 
 /**
  * Fetches open pull requests and the files they touch. The viewers use the file lists to put a beacon on every
@@ -24,6 +28,12 @@ import java.util.Optional;
  *   <li>Without one: the REST API, limited to the most recently updated PRs that fit the anonymous rate limit.</li>
  * </ul>
  * Never throws: failures are reported and result in an empty list with the source {@code "unavailable"}.
+ *
+ * <p>The repository may come from the analysed tree's own (untrusted) git configuration, so the token is guarded: an
+ * environment token for github.com only ever goes to api.github.com, and a GitHub Enterprise host gets a token (or a
+ * request at all) only when the user opted in to that very host (see {@link #token} and {@link #fetch}). Redirects
+ * are followed only within the same host, and responses are capped in size ({@link #MAX_RESPONSE_BYTES}) and in
+ * nesting depth (by {@link JsonParser}).
  *
  * <p>The {@code source} string of a {@link Result} says how complete the list is. It starts with {@code "all"} only
  * when every open PR was loaded; the viewers rely on that prefix to decide whether "no PRs" means none at all or
@@ -41,6 +51,14 @@ public final class PullRequests {
      * the quota left.
      */
     private static final int ANONYMOUS_FILE_LOOKUPS = 30;
+    /** Largest response body read; a larger one fails the fetch. The same limit as the Rust edition's HTTP client. */
+    static final int MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+    /** Redirect statuses that are followed (within the same host), and how many of them in a row. */
+    private static final Set<Integer> REDIRECTS = Set.of(301, 302, 307, 308);
+    private static final int MAX_REDIRECTS = 5;
+    /** Environment variables that may hold a token; {@code gh} runs without them (see {@link #ghToken}). */
+    private static final List<String> TOKEN_VARIABLES =
+            List.of("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN");
 
     public record Result(List<PullRequest> pulls, String source) {
     }
@@ -76,7 +94,9 @@ public final class PullRequests {
 
     private final HttpClient http = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
-            .followRedirects(HttpClient.Redirect.NORMAL)
+            // Redirects are followed by hand in request(), and only within the same host: the JDK client would resend
+            // the Authorization header to wherever a redirect points.
+            .followRedirects(HttpClient.Redirect.NEVER)
             .build();
     private final GitHubRepo repo;
     private final String token;
@@ -86,14 +106,23 @@ public final class PullRequests {
         this.token = token;
     }
 
-    /** Fetches the open PRs of {@code repo}, via GraphQL when a token is available and via REST otherwise. */
+    /**
+     * Fetches the open PRs of {@code repo}, via GraphQL when a token is available and via REST otherwise. A GitHub
+     * Enterprise host is not contacted at all unless there is a token for it or {@code GH_HOST} names it: the host
+     * may come from a hostile repository's remote URL, and CodeCity should not call out to it on its own.
+     */
     public static Result fetch(GitHubRepo repo) {
         String token = token(repo).orElse(null);
+        if (token == null && !repo.isPublicGitHub() && !optedIn(repo, System::getenv)) {
+            System.err.println("  GitHub: not contacting " + repo.host() + " (for a GitHub Enterprise host, set GH_HOST="
+                    + repo.host() + " or log in with `gh auth login --hostname " + repo.host() + "`)");
+            return new Result(List.of(), "unavailable");
+        }
         PullRequests client = new PullRequests(repo, token);
         try {
             return token != null ? client.graphql() : client.rest();
         } catch (IOException | RuntimeException e) {
-            System.err.println("  GitHub: could not fetch pull requests (" + e.getMessage() + ")");
+            System.err.println("  GitHub: could not fetch pull requests (" + dev.codecity.CodeCity.printable(e.getMessage()) + ")");
             return new Result(List.of(), "unavailable");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -102,21 +131,52 @@ public final class PullRequests {
     }
 
     /**
-     * Looks for an API token: the usual environment variables first (the Enterprise ones only for non-github.com
-     * hosts), then the GitHub CLI's stored login for the repository's host ({@code gh auth token}). Empty when there
-     * is none, in which case the REST API is used anonymously.
+     * Looks for an API token: the environment first ({@link #envToken}), then the GitHub CLI's stored login for the
+     * repository's host ({@link #ghToken}). Empty when there is none, in which case the REST API is used anonymously.
      */
     static Optional<String> token(GitHubRepo repo) {
-        for (String var : repo.isPublicGitHub()
-                ? List.of("GH_TOKEN", "GITHUB_TOKEN")
-                : List.of("GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_TOKEN")) {
-            String v = System.getenv(var);
+        return envToken(repo, System::getenv).or(() -> ghToken(repo.host()));
+    }
+
+    /**
+     * The token from the environment variables the {@code gh} CLI reads: {@code GH_TOKEN} or {@code GITHUB_TOKEN}
+     * for github.com, {@code GH_ENTERPRISE_TOKEN} or {@code GITHUB_ENTERPRISE_TOKEN} for any other host, but only when
+     * {@code GH_HOST} names that host ({@link #optedIn}). Without that opt-in, a crafted remote URL such as
+     * {@code https://github.attacker.example/o/r} in an analysed repository would receive the user's token.
+     */
+    static Optional<String> envToken(GitHubRepo repo, Function<String, String> env) {
+        List<String> vars = repo.isPublicGitHub() ? List.of("GH_TOKEN", "GITHUB_TOKEN")
+                : optedIn(repo, env) ? List.of("GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN") : List.of();
+        for (String var : vars) {
+            String v = env.apply(var);
             if (v != null && !v.isBlank()) {
                 return Optional.of(v.strip());
             }
         }
-        return Git.runCommand(Path.of("."), List.of("gh", "auth", "token", "--hostname", repo.host()))
-                .filter(s -> !s.isBlank());
+        return Optional.empty();
+    }
+
+    /** Whether {@code GH_HOST} names the repository's host (case-insensitively): the opt-in for an Enterprise host. */
+    static boolean optedIn(GitHubRepo repo, Function<String, String> env) {
+        String host = env.apply("GH_HOST");
+        return host != null && host.strip().equalsIgnoreCase(repo.host());
+    }
+
+    /**
+     * {@code gh auth token} for {@code host}: the token of a login the user made to exactly that host. {@code gh}
+     * runs without the token variables, since it would otherwise answer with {@code GH_ENTERPRISE_TOKEN} for any
+     * host; the host is passed as {@code --hostname=<host>}, so it can never be read as another option.
+     */
+    private static Optional<String> ghToken(String host) {
+        Optional<java.nio.file.Path> exe = Git.executable("gh");
+        if (exe.isEmpty()) {
+            return Optional.empty();
+        }
+        ProcessBuilder gh = new ProcessBuilder(exe.get().toString(), "auth", "token", "--hostname=" + host)
+                .redirectInput(ProcessBuilder.Redirect.from(new java.io.File(Git.nullDevice())))
+                .redirectError(ProcessBuilder.Redirect.DISCARD);
+        TOKEN_VARIABLES.forEach(gh.environment()::remove);
+        return Git.runCommand(gh).filter(s -> !s.isBlank());
     }
 
     /**
@@ -152,7 +212,8 @@ public final class PullRequests {
                             .endObject()), "repository", "pullRequest", "files");
                 }
                 pulls.add(new PullRequest(number, str(JsonParser.path(node, "title")),
-                        str(JsonParser.path(node, "url")), str(JsonParser.path(node, "author", "login")),
+                        pullUrl(repo, str(JsonParser.path(node, "url")), number),
+                        str(JsonParser.path(node, "author", "login")),
                         str(JsonParser.path(node, "updatedAt")), Boolean.TRUE.equals(JsonParser.path(node, "isDraft")),
                         files));
             }
@@ -187,7 +248,7 @@ public final class PullRequests {
      */
     private Result rest() throws IOException, InterruptedException {
         String base = repo.restApi() + "/repos/" + repo.owner() + "/" + repo.name();
-        HttpResponse<String> listing = request(HttpRequest.newBuilder(
+        Reply listing = request(HttpRequest.newBuilder(
                 URI.create(base + "/pulls?state=open&sort=updated&direction=desc&per_page=100")).GET());
         // The "- 1" keeps one request of the remaining quota unused.
         int budget = Math.min(ANONYMOUS_FILE_LOOKUPS, remaining(listing) - 1);
@@ -211,7 +272,8 @@ public final class PullRequests {
                 break;
             }
             pulls.add(new PullRequest(number, str(JsonParser.path(node, "title")),
-                    str(JsonParser.path(node, "html_url")), str(JsonParser.path(node, "user", "login")),
+                    pullUrl(repo, str(JsonParser.path(node, "html_url")), number),
+                    str(JsonParser.path(node, "user", "login")),
                     str(JsonParser.path(node, "updated_at")), Boolean.TRUE.equals(JsonParser.path(node, "draft")),
                     files));
         }
@@ -228,11 +290,19 @@ public final class PullRequests {
         return JsonParser.parse(request(builder).body());
     }
 
+    /** A successful response: its body (UTF-8) and headers. */
+    private record Reply(String body, HttpHeaders headers) {
+    }
+
     /**
      * Sends a request with the headers GitHub expects (a User-Agent is mandatory for its API) and turns every non-2xx
      * status into an {@link IOException} whose message is shown to the user (see {@link #failure}).
+     *
+     * <p>A redirect (GitHub uses them for renamed repositories) is followed only to an https URL on the same host and
+     * port, with the same method and headers; a redirect elsewhere fails the request, so the token cannot be sent on.
+     * The body is read up to {@link #MAX_RESPONSE_BYTES}.
      */
-    private HttpResponse<String> request(HttpRequest.Builder builder) throws IOException, InterruptedException {
+    private Reply request(HttpRequest.Builder builder) throws IOException, InterruptedException {
         builder.timeout(Duration.ofSeconds(30))
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", "2022-11-28")
@@ -240,14 +310,44 @@ public final class PullRequests {
         if (token != null) {
             builder.header("Authorization", "Bearer " + token);
         }
-        HttpResponse<String> response = http.send(builder.build(), HttpResponse.BodyHandlers.ofString());
-        String failure = failure(response.statusCode(),
-                response.headers().firstValue("x-ratelimit-remaining").orElse(null),
-                response.headers().firstValue("retry-after").isPresent());
-        if (failure != null) {
-            throw new IOException(failure);
+        URI uri = builder.build().uri();
+        for (int hops = 0; ; hops++) {
+            HttpResponse<InputStream> response = http.send(builder.build(), HttpResponse.BodyHandlers.ofInputStream());
+            try (InputStream body = response.body()) {
+                Optional<String> location = response.headers().firstValue("location");
+                if (REDIRECTS.contains(response.statusCode()) && location.isPresent() && hops < MAX_REDIRECTS) {
+                    URI next = uri.resolve(location.get());
+                    if (!"https".equalsIgnoreCase(next.getScheme()) || !uri.getHost().equalsIgnoreCase(next.getHost())
+                            || uri.getPort() != next.getPort()) {
+                        throw new IOException("redirect to another host refused");
+                    }
+                    builder.uri(next);
+                    uri = next;
+                    continue;
+                }
+                String failure = failure(response.statusCode(),
+                        response.headers().firstValue("x-ratelimit-remaining").orElse(null),
+                        response.headers().firstValue("retry-after").isPresent());
+                if (failure != null) {
+                    throw new IOException(failure);
+                }
+                byte[] bytes = body.readNBytes(MAX_RESPONSE_BYTES + 1);
+                if (bytes.length > MAX_RESPONSE_BYTES) {
+                    throw new IOException("response larger than " + MAX_RESPONSE_BYTES + " bytes");
+                }
+                return new Reply(new String(bytes, StandardCharsets.UTF_8), response.headers());
+            }
         }
-        return response;
+    }
+
+    /**
+     * The link of PR {@code number}: {@code url} from the response when it is an https URL on the repository's host,
+     * otherwise the PR's page built from the repository. The URL ends up in the viewers' links and in the desktop
+     * viewers' browser launcher, which must only ever be handed a web page (not, say, a {@code file:} URL).
+     */
+    static String pullUrl(GitHubRepo repo, String url, int number) {
+        return url != null && url.startsWith("https://" + repo.host() + "/") && url.chars().noneMatch(c -> c <= ' ')
+                ? url : repo.webUrl() + "/pull/" + number;
     }
 
     /**
@@ -270,7 +370,7 @@ public final class PullRequests {
     }
 
     /** Requests left in the current rate-limit window; without the header, assume enough for the full lookup budget. */
-    private static int remaining(HttpResponse<?> response) {
+    private static int remaining(Reply response) {
         return response.headers().firstValue("x-ratelimit-remaining").map(Integer::parseInt).orElse(ANONYMOUS_FILE_LOOKUPS + 1);
     }
 

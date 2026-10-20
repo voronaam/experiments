@@ -308,6 +308,16 @@ final class Look {
         return String.format("%.1fy ago", days / 365);
     }
 
+    /**
+     * Whether {@code url} may be handed to the system browser: an {@code https://} URL without spaces or control
+     * characters. Link targets come from the city data (pull request URLs from the GitHub API, the repository URL
+     * from the analysed tree's git remote), so anything else ({@code file:}, {@code javascript:}, custom URL schemes
+     * that start other applications, option-like strings) is refused.
+     */
+    static boolean isWebLink(String url) {
+        return url != null && url.regionMatches(true, 0, "https://", 0, 8) && url.chars().noneMatch(c -> c <= ' ' || c == 0x7f);
+    }
+
     /** {@code #rrggbb} for use in inline JavaFX CSS; opacity is dropped. */
     static String hex(Color c) {
         return String.format("#%02x%02x%02x",

@@ -96,10 +96,10 @@ public final class GitHistory {
             // reader replaces bytes that are not valid UTF-8 (in a file name or an e-mail) with U+FFFD and goes on.
             // The pathspecs ("*" also matches "/" in git) restrict the log to files the analysers can read, and,
             // because they are relative to root, to the analysed sub-tree.
-            Process log = new ProcessBuilder("git", "-C", root.toString(), "-c", "core.quotepath=off",
+            // Git.command hardens git against the repository's own configuration (no gpg for signed commits, ...).
+            Process log = Git.command(root, false, "-c", "core.quotepath=off",
                     "log", "--no-merges", "--no-renames", "--format=%x1e%at%x1f%aE", "--name-only", "--",
-                    "*.java", "*.ts", "*.tsx", "*.mts", "*.cts", "*.rs")
-                    .redirectError(ProcessBuilder.Redirect.DISCARD).start();
+                    "*.java", "*.ts", "*.tsx", "*.mts", "*.cts", "*.rs").start();
             Map<String, List<Touch>> files = new HashMap<>();
             try (BufferedReader in = new BufferedReader(
                     new InputStreamReader(log.getInputStream(), StandardCharsets.UTF_8))) {

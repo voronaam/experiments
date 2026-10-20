@@ -51,7 +51,8 @@
 /// - every loop over list items (members, statements, arguments, …) checks that an iteration consumed at least one
 ///   token; if not, it flags the error and skips one token, or a whole bracketed group if the token opens one (using
 ///   the bracket pairs from the lexer), so it always makes progress;
-/// - recursion is capped at `maxDepth` nested constructs; deeper input is skipped group by group and flagged.
+/// - recursion is capped at `maxDepth` nested constructs; deeper input is skipped group by group and flagged, and
+///   from then on the parser no longer speculates (see `Parser.depthCapped`).
 ///
 /// So a file with errors still yields every declaration the parser could recognise, which is what the analyser
 /// reports (with the file counted as failed).
@@ -311,7 +312,10 @@ Lexed lex(string code)
     // error); so is an opener that is never closed.
     auto pair = new uint[tokens.length];
     pair[] = NONE;
+    // The open brackets are stack[0 .. depth], managed by hand: appending to a slice that was shortened would copy
+    // the whole stack each time, which made alternating openers and closers quadratic.
     size_t[] stack;
+    size_t depth;
     foreach (k, t; tokens)
     {
         if (t.kind != Tok.op || t.end - t.start != 1) continue;
@@ -319,15 +323,16 @@ Lexed lex(string code)
         switch (ch)
         {
         case '(', '[', '{':
-            stack ~= k;
+            if (depth == stack.length) stack.length = depth * 2 + 16;
+            stack[depth++] = k;
             break;
         case ')', ']', '}':
         {
             const open = ch == ')' ? '(' : ch == ']' ? '[' : '{';
-            if (stack.length && b[tokens[stack[$ - 1]].start] == open)
+            if (depth && b[tokens[stack[depth - 1]].start] == open)
             {
-                pair[stack[$ - 1]] = cast(uint) k;
-                stack = stack[0 .. $ - 1];
+                pair[stack[depth - 1]] = cast(uint) k;
+                depth--;
             }
             else error = true;
             break;
@@ -336,7 +341,7 @@ Lexed lex(string code)
             break;
         }
     }
-    if (stack.length) error = true;
+    if (depth) error = true;
     return Lexed(tokens, pair, error);
 }
 
@@ -576,6 +581,12 @@ private struct Parser
     bool error;
     /// Current nesting of guarded constructs (see `maxDepth`).
     uint depth;
+    /// Set once the depth cap has been reached anywhere in the file. From then on the parser no longer tries the
+    /// speculative readings (a local variable, a cast, a type pattern, a record pattern, a type before `::` or
+    /// `.class`, a method outside a class) and takes the plain one. Input nested past the cap at each of many such
+    /// points (`a < a < a < …`) would otherwise cost up to the cap's worth of steps per token; real code never gets
+    /// near the cap. The TypeScript parser does the same.
+    bool depthCapped;
     /// Index of the `->` that ends the `case` label being parsed (or `noIndex`): `case A -> x` must not read
     /// `A -> x` as a lambda.
     size_t labelArrow;
@@ -718,6 +729,7 @@ private struct Parser
     {
         if (depth >= maxDepth)
         {
+            depthCapped = true;
             skip();
             return false;
         }
@@ -888,6 +900,7 @@ private struct Parser
     /// At the top level: `Type name (` (a method outside any class, which is accepted).
     bool looksLikeMethod()
     {
+        if (depthCapped) return false;
         const m = mark();
         const ok = type_() && kind() == Tok.ident && peekIs(1, "(");
         reset(m);
@@ -1697,6 +1710,7 @@ private struct Parser
     /// At an identifier: `Type name` follows, so this is a local variable declaration.
     bool isLocalVariable()
     {
+        if (depthCapped) return false;
         const m = mark();
         const ok = type_() && kind() == Tok.ident;
         reset(m);
@@ -1968,13 +1982,16 @@ private struct Parser
         // `case null, default ->` (Java 21)
         if (eat("default")) return;
         if (tryRecordPattern(true)) return;
-        const m = mark();
-        if (type_() && kind() == Tok.ident && endsPattern(pos + 1))
+        if (!depthCapped)
         {
-            bump();
-            return;
+            const m = mark();
+            if (type_() && kind() == Tok.ident && endsPattern(pos + 1))
+            {
+                bump();
+                return;
+            }
+            reset(m);
         }
-        reset(m);
         expression();
     }
 
@@ -1989,7 +2006,7 @@ private struct Parser
     /// (it is a plain identifier), a generic one is.
     bool tryRecordPattern(bool inLabel)
     {
-        if (kind() != Tok.ident || !(peekIs(1, "(") || peekIs(1, "<"))) return false;
+        if (depthCapped || kind() != Tok.ident || !(peekIs(1, "(") || peekIs(1, "<"))) return false;
         const m = mark();
         const ok = recordPattern() && (!inLabel || endsPattern(pos));
         if (!ok) reset(m);
@@ -2146,6 +2163,7 @@ private struct Parser
     /// primitive type may be followed by `+`/`-`. All or nothing.
     bool tryCast()
     {
+        if (depthCapped) return false;
         const m = mark();
         bump(); // (
         const primitive = isPrimitiveAt(pos) && peekIs(1, ")");
@@ -2291,7 +2309,7 @@ private struct Parser
         const classLiteral = isAt(k, ".") && isAt(k + 1, "class");
         const array = isAt(k, "[") && isAt(k + 1, "]");
         const generic = isAt(k, "<");
-        if (!(classLiteral || array || generic)) return false;
+        if (depthCapped || !(classLiteral || array || generic)) return false;
         const m = mark();
         if (type_() && (is_("::") || (is_(".") && peekIs(1, "class")))) return true;
         reset(m);
@@ -2773,4 +2791,26 @@ unittest
     auto thread = new Thread(&run, 2 * 1024 * 1024);
     thread.start();
     thread.join(); // rethrows a failed assertion
+}
+
+unittest // brackets that alternate between opening and closing are paired in linear time
+{
+    import std.array : replicate;
+    import std.datetime.stopwatch : AutoStart, StopWatch;
+    // Appending to the shortened bracket stack used to copy it every time.
+    auto sw = StopWatch(AutoStart.yes);
+    auto t = parse("class C { void m() { x = " ~ "((A)".replicate(100_000) ~ "a" ~ ")".replicate(100_000) ~ "; } }");
+    assert(t.error); // deeper than maxDepth
+    assert(sw.peek.total!"seconds" < 10);
+}
+
+unittest // `a < a < a …` past the depth cap: no more speculation, so linear (it took minutes unoptimised before)
+{
+    import std.array : replicate;
+    import std.datetime.stopwatch : AutoStart, StopWatch;
+    auto sw = StopWatch(AutoStart.yes);
+    auto t = parse("class C { void m() { x = " ~ "a < ".replicate(1_000_000) ~ "b; List" ~ "<List".replicate(400_000)
+        ~ " y; } }");
+    assert(t.error);
+    assert(sw.peek.total!"seconds" < 30);
 }

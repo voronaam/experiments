@@ -376,8 +376,25 @@ pub fn rel_time(epoch: i64) -> String {
     }
 }
 
+/// Whether `url` may be handed to the system browser: an `https://` URL without spaces or control characters. Link
+/// targets come from the city data (pull request URLs from the GitHub API, the repository URL from the analysed tree's
+/// git remote), so anything else (`file:`, `javascript:`, custom URL schemes that start other applications,
+/// option-like strings) is refused.
+pub fn is_web_link(url: &str) -> bool {
+    url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) && !url.chars().any(|c| c <= ' ' || c == '\x7f')
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn web_links_are_https_only() {
+        assert!(super::is_web_link("https://github.com/o/r/pull/1"));
+        assert!(super::is_web_link("HTTPS://github.com/o/r"));
+        for bad in ["javascript:alert(1)", "file:///etc/passwd", "http://x", "--help", "https://x y", "https://x\n", "ssh://h", "", "https:/"] {
+            assert!(!super::is_web_link(bad), "{bad:?}");
+        }
+    }
+
     #[test]
     fn fmt_signs_and_separators() {
         assert_eq!(super::fmt(-123.0), "-123");

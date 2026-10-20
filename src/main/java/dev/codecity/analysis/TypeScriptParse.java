@@ -67,7 +67,9 @@ import java.util.Set;
  * parenthesised types), the parser <em>speculates</em>: it takes a {@link Snapshot}, tries the more specific reading
  * and rolls back to the snapshot if that reading hits an error (see {@link Parser#bail}). A rolled-back attempt drops
  * its nodes and its tokens (they are lexed again, possibly in a different mode). Failed arrow-function attempts are
- * remembered by source offset, so nested parentheses cannot make parsing exponential.
+ * remembered by source offset, so nested parentheses cannot make parsing exponential, and once the depth cap has been
+ * reached the parser stops speculating (see {@code Parser.depthCapped}), so input nested past the cap at every token
+ * cannot make it quadratic.
  *
  * <h2>Error recovery</h2>
  * A syntax error never stops the parse; it increments the parser's error count (the file is then reported as having
@@ -1057,6 +1059,14 @@ final class TypeScriptParse {
         private final boolean tsx;
         /** Source offsets of {@code (}/{@code <} tokens where an arrow function was tried and failed. */
         private final Set<Integer> arrowFailed = new HashSet<>();
+        /**
+         * Set once {@link #MAX_DEPTH} has been reached anywhere in the file. From then on the parser no longer
+         * speculates and takes the plain reading of every ambiguity (a comparison rather than type arguments, a
+         * parenthesised expression or type rather than an arrow function or function type). Input that nests past
+         * the cap at each of many speculation points ({@code a < a < a < …}) would otherwise cost up to
+         * {@code MAX_DEPTH} steps per token, each re-lexed after the rollback; real code never gets near the cap.
+         */
+        private boolean depthCapped;
         /** Offset of the first error outside speculation (-1 for none). */
         int firstError = -1;
 
@@ -1351,6 +1361,7 @@ final class TypeScriptParse {
         /** Enters a nested construct; false (after recording an error) when {@link #MAX_DEPTH} is reached. */
         private boolean enter() {
             if (depth >= MAX_DEPTH) {
+                depthCapped = true;
                 error();
                 return false;
             }
@@ -2858,6 +2869,9 @@ final class TypeScriptParse {
          * arguments (TypeScript's {@code canFollowTypeArgumentsInExpression}).
          */
         private boolean tryTypeArgumentsInExpression() {
+            if (depthCapped) {
+                return false;
+            }
             Snapshot s = beginSpec();
             typeArguments();
             boolean ok = !bail() && typeArgumentsCanFollow();
@@ -3144,7 +3158,7 @@ final class TypeScriptParse {
                 }
             }
             int start = toks.start[t];
-            if (arrowFailed.contains(start)) {
+            if (depthCapped || arrowFailed.contains(start)) {
                 return -1;
             }
             Snapshot s = beginSpec();
@@ -3382,7 +3396,7 @@ final class TypeScriptParse {
         private boolean tryFunctionType() {
             int t = cur();
             int start = toks.start[t];
-            if (arrowFailed.contains(start)) {
+            if (depthCapped || arrowFailed.contains(start)) {
                 return false;
             }
             Snapshot s = beginSpec();
@@ -3452,7 +3466,7 @@ final class TypeScriptParse {
             } else if (atKw("infer") && nthKind(1) == TokKind.IDENT) {
                 bump();
                 bumpRef();
-                if (atKw("extends") && !nthNl(0)) {
+                if (atKw("extends") && !nthNl(0) && !depthCapped) {
                     // infer U extends C – unless the extends starts the conditional type around it (TypeScript's
                     // rule: inside the extends clause of a conditional type, it is always a constraint)
                     Snapshot s = beginSpec();

@@ -4,6 +4,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -56,6 +57,30 @@ public final class JavaAnalyzer implements LanguageSupport {
     }
 
     /**
+     * A reference is tried against the file's on-demand imports ({@code import a.b.*;}) and against its single-type
+     * imports of the same simple name. Beyond this many of either kind, later ones are ignored, so a crafted file with
+     * very many cannot make the analysis quadratic; real files have a handful of on-demand imports and one single-type
+     * import per name. Imports longer than {@link SourceText#MAX_FQN_BYTES} are ignored too: they cannot name a
+     * building. The Rust and D editions use the same limits.
+     */
+    static final int MAX_IMPORT_CANDIDATES = 64;
+
+    /**
+     * A qualified name ({@code a.b.C}) contributes its prefixes ({@code a}, {@code a.b}) as references too, but at
+     * most this many of them, the shortest; a crafted name of very many segments would otherwise yield an amount of
+     * text quadratic in its length. The Rust and D editions use the same limit.
+     */
+    static final int MAX_QUALIFIED_PREFIXES = 16;
+
+    /**
+     * Member types nested deeper than this (a top-level type is at depth 1) are not buildings; their code still counts
+     * towards the enclosing types. Every type collects and resolves the references of its member types as well, so
+     * with deep nesting the work grew with the square of the depth; real code nests a few levels. The Rust and D
+     * editions use the same limit.
+     */
+    static final int MAX_TYPE_NESTING = 16;
+
+    /**
      * Extracts every type of one file: top-level and member types, depth-first in source order. The parser always
      * yields a tree; a file with syntax errors is analysed as far as it goes and only flagged as failed.
      */
@@ -93,11 +118,18 @@ public final class JavaAnalyzer implements LanguageSupport {
                     boolean asterisk = (tree.flags(n) & JavaParse.IMPORT_ASTERISK) != 0;
                     // Names may be written with whitespace or line breaks around the dots; normalise to `a.b.C`.
                     String name = stripWhitespace(tree.text(nameNode));
+                    if (SourceText.utf8Length(name) > SourceText.MAX_FQN_BYTES) {
+                        continue;
+                    }
                     if (isStatic && !asterisk) {
                         int dot = name.lastIndexOf('.');
                         explicitImports.add(dot >= 0 ? name.substring(0, dot) : name);
                     } else if (asterisk) {
-                        (isStatic ? explicitImports : wildcardImports).add(name);
+                        if (isStatic) {
+                            explicitImports.add(name);
+                        } else if (wildcardImports.size() < MAX_IMPORT_CANDIDATES) {
+                            wildcardImports.add(name);
+                        }
                     } else {
                         explicitImports.add(name);
                     }
@@ -111,10 +143,10 @@ public final class JavaAnalyzer implements LanguageSupport {
                 isTest(relative), List.copyOf(explicitImports), List.copyOf(wildcardImports));
         for (int n : top) {
             if (tree.kind(n) == NodeKind.TYPE_DECL) {
-                st.collectType(n, "");
+                st.collectType(n, "", 1);
             }
         }
-        return new ParsedFile(file, st.types, null, tree.error());
+        return new ParsedFile(file, st.types, null, tree.error() || st.skipped);
     }
 
     /** The {@link NodeKind#NAME} child of a package or import node, or {@link JavaParse#NONE}. */
@@ -130,7 +162,7 @@ public final class JavaAnalyzer implements LanguageSupport {
     /** Per-file data shared by every type declared in the file, and the types found so far (in pre-order). */
     private static final class FileState {
         final Tree tree;
-        final String[] lines;
+        final SourceText.Lines lines;
         final Path file;
         final String pkg;
         final String module;
@@ -138,8 +170,12 @@ public final class JavaAnalyzer implements LanguageSupport {
         final List<String> explicitImports;
         final List<String> wildcardImports;
         final List<TypeInfo> types = new ArrayList<>();
+        /** Length of {@link #pkg} in UTF-8 bytes. */
+        final int pkgBytes;
+        /** Set when a type was skipped for its nesting or the length of its fqn (see {@link #collectType}). */
+        boolean skipped;
 
-        FileState(Tree tree, String[] lines, Path file, String pkg, String module, boolean test,
+        FileState(Tree tree, SourceText.Lines lines, Path file, String pkg, String module, boolean test,
                   List<String> explicitImports, List<String> wildcardImports) {
             this.tree = tree;
             this.lines = lines;
@@ -149,6 +185,7 @@ public final class JavaAnalyzer implements LanguageSupport {
             this.test = test;
             this.explicitImports = explicitImports;
             this.wildcardImports = wildcardImports;
+            this.pkgBytes = SourceText.utf8Length(pkg);
         }
 
         /**
@@ -166,10 +203,19 @@ public final class JavaAnalyzer implements LanguageSupport {
          *       types';</li>
          *   <li>references: collected from the whole declaration, member types included.</li>
          * </ul>
-         * The type is added before its member types, so {@link #types} is in pre-order.
+         * The type is added before its member types, so {@link #types} is in pre-order. A type nested deeper than
+         * {@link #MAX_TYPE_NESTING} or whose fqn would exceed {@link SourceText#MAX_FQN_BYTES} is skipped with its
+         * member types (whose fqns are longer still), and the file counts as failed; the length is checked before the
+         * fqn is built.
          */
-        void collectType(int decl, String outer) {
+        void collectType(int decl, String outer, int depth) {
             String simple = tree.tokenText(tree.name(decl));
+            int fqnBytes = pkgBytes + (pkg.isEmpty() ? 0 : 1) + SourceText.utf8Length(outer) + (outer.isEmpty() ? 0 : 1)
+                    + SourceText.utf8Length(simple);
+            if (depth > MAX_TYPE_NESTING || fqnBytes > SourceText.MAX_FQN_BYTES) {
+                skipped = true;
+                return;
+            }
             String name = outer.isEmpty() ? simple : outer + "." + simple;
             String fqn = pkg.isEmpty() ? name : pkg + "." + name;
 
@@ -194,7 +240,7 @@ public final class JavaAnalyzer implements LanguageSupport {
                     SourceText.countLoc(lines, begin, end), noa, test, methods, references(decl),
                     explicitImports, wildcardImports));
             for (int n : nested) {
-                collectType(n, name);
+                collectType(n, name, depth + 1);
             }
         }
 
@@ -220,21 +266,26 @@ public final class JavaAnalyzer implements LanguageSupport {
             Set<String> refs = new HashSet<>();
             for (int n = decl + 1; n < tree.end(decl); n++) {
                 switch (tree.kind(n)) {
-                    case TYPE_NAME -> refs.add(tree.text(n));
+                    case TYPE_NAME -> addReference(refs, tree.text(n));
                     case SCOPED_TYPE_NAME -> {
                         // `Map.Entry` contributes "Map.Entry" and its scope "Map", but not "Entry" alone (the parser
                         // does not report the parts of a qualified name separately).
+                        // At most MAX_QUALIFIED_PREFIXES of them, the shortest, so a crafted name of many segments
+                        // does not yield a quadratic amount of text.
                         String text = stripWhitespace(tree.text(n));
-                        for (int dot = text.lastIndexOf('.'); dot >= 0; dot = text.lastIndexOf('.', dot - 1)) {
-                            refs.add(text.substring(0, dot));
+                        int count = 0;
+                        // A prefix longer than MAX_FQN_BYTES would be dropped by addReference anyway.
+                        for (int dot = text.indexOf('.'); dot >= 0 && count < MAX_QUALIFIED_PREFIXES
+                                && dot <= SourceText.MAX_FQN_BYTES; dot = text.indexOf('.', dot + 1), count++) {
+                            addReference(refs, text.substring(0, dot));
                         }
-                        refs.add(text);
+                        addReference(refs, text);
                     }
-                    case ANNOTATION_NAME -> refs.add(stripWhitespace(tree.text(n)));
+                    case ANNOTATION_NAME -> addReference(refs, stripWhitespace(tree.text(n)));
                     case MEMBER_OBJECT -> {
                         String s = tree.text(n);
                         if (!s.isEmpty() && Character.isUpperCase(s.codePointAt(0))) {
-                            refs.add(s);
+                            addReference(refs, s);
                         }
                     }
                     default -> {
@@ -242,6 +293,17 @@ public final class JavaAnalyzer implements LanguageSupport {
                 }
             }
             return refs;
+        }
+    }
+
+    /**
+     * Adds a reference unless it is longer than {@link SourceText#MAX_FQN_BYTES}: it could not name a building, only
+     * resolve through its first segment, which a qualified name contributes on its own (see {@link FileState#references}),
+     * and resolving it would copy it into every candidate tried.
+     */
+    private static void addReference(Set<String> refs, String name) {
+        if (SourceText.utf8Length(name) <= SourceText.MAX_FQN_BYTES) {
+            refs.add(name);
         }
     }
 
@@ -329,10 +391,15 @@ public final class JavaAnalyzer implements LanguageSupport {
      */
     static Map<String, Set<String>> resolveDependencies(List<TypeInfo> types, Map<String, TypeInfo> byFqn) {
         Map<String, Set<String>> deps = new HashMap<>();
+        // The single-type imports of each import list by simple name; the types of a file share one list, so each
+        // file's imports are indexed once.
+        Map<List<String>, Map<String, List<String>>> importIndex = new IdentityHashMap<>();
         for (TypeInfo t : types) {
+            Map<String, List<String>> imports = importIndex.computeIfAbsent(t.explicitImports(),
+                    JavaAnalyzer::bySimpleName);
             Set<String> out = new LinkedHashSet<>();
             for (String ref : t.references()) {
-                String target = resolve(ref, t, byFqn);
+                String target = resolve(ref, t, imports, byFqn);
                 if (target != null && !target.equals(t.fqn())) {
                     out.add(target);
                 }
@@ -340,6 +407,25 @@ public final class JavaAnalyzer implements LanguageSupport {
             deps.put(t.fqn(), out);
         }
         return deps;
+    }
+
+    /**
+     * Single-type imports by simple name (the last segment: {@code a.b.C} under "C"), each list in import order and
+     * at most {@link #MAX_IMPORT_CANDIDATES} long. An import without a dot names no package member and is left out. Lets {@link #resolve} find the imports that match
+     * a name without scanning them all for every reference.
+     */
+    private static Map<String, List<String>> bySimpleName(List<String> imports) {
+        Map<String, List<String>> index = new HashMap<>();
+        for (String imp : imports) {
+            int dot = imp.lastIndexOf('.');
+            if (dot >= 0) {
+                List<String> same = index.computeIfAbsent(imp.substring(dot + 1), k -> new ArrayList<>());
+                if (same.size() < MAX_IMPORT_CANDIDATES) {
+                    same.add(imp);
+                }
+            }
+        }
+        return index;
     }
 
     /**
@@ -360,7 +446,8 @@ public final class JavaAnalyzer implements LanguageSupport {
      * ({@code com.acme.Order}). Types in the default package are found only from the default package itself (as its
      * "same package" candidate): as in Java, they are invisible from named packages.
      */
-    private static String resolve(String ref, TypeInfo from, Map<String, TypeInfo> byFqn) {
+    private static String resolve(String ref, TypeInfo from, Map<String, List<String>> imports,
+                                  Map<String, TypeInfo> byFqn) {
         int dot = ref.indexOf('.');
         String first = dot < 0 ? ref : ref.substring(0, dot);
         String rest = dot < 0 ? "" : ref.substring(dot);
@@ -376,11 +463,7 @@ public final class JavaAnalyzer implements LanguageSupport {
             }
             enclosing = enclosing.substring(0, i);
         }
-        for (String imp : from.explicitImports()) {
-            if (imp.endsWith("." + first)) {
-                candidates.add(imp);
-            }
-        }
+        candidates.addAll(imports.getOrDefault(first, List.of()));
         candidates.add(prefix + first);
         for (String w : from.wildcardImports()) {
             candidates.add(w + "." + first);

@@ -16,6 +16,12 @@
 //! whose parse cache then skips the files a snapshot did not touch. Each written file gets a new, strictly larger
 //! modification time, so the cache never mistakes a rewritten file of equal size for an unchanged one.
 //!
+//! The repository is untrusted. Its git commands are hardened ([`git::command`]); only a clone of the GitHub clone
+//! cache may fetch missing objects. Tree entries are only written below the temporary directory when their path is a
+//! plain relative one ([`safe_path`]): a crafted tree can hold entries such as `..` or `/abs/dir` that git itself
+//! would never check out. A blob larger than [`crate::analysis::MAX_FILE_BYTES`], which the analysis would not read
+//! anyway, is treated like a missing one: its file is absent from that snapshot.
+//!
 //! The Java and D editions implement the same rules, and the JSON they write from it is identical.
 
 use crate::analysis::{is_ignored_dir, language_of, SourceAnalyzer, MANIFESTS};
@@ -126,10 +132,14 @@ pub fn compute(root: &Path, include_tests: bool, n: usize, events: &HashMap<Path
     }
     let picked: Vec<&str> = sample(commits.len(), n).into_iter().map(|i| commits[i].as_str()).collect();
     let mut snapshots = describe(root, &picked)?;
-    git::prefetch_missing(root);
+    // Only the clone cache may fetch: the configuration of any other repository could run programs on fetch.
+    let cached = crate::github::is_cached(&top);
+    if cached {
+        git::prefetch_missing(root);
+    }
 
     let tmp = TempDir::new(root).ok()?;
-    let mut cat = CatFile::new(&top)?;
+    let mut cat = CatFile::new(&top, cached)?;
     let analyzer = SourceAnalyzer::new();
     let count = snapshots.len();
     let mut tracks: HashMap<String, Track> = HashMap::new();
@@ -174,21 +184,18 @@ pub fn compute(root: &Path, include_tests: bool, n: usize, events: &HashMap<Path
 }
 
 /// Commit id, author time, author name and subject of each commit, in the given order, from one `git log`. Each
-/// record starts with a record separator and its fields are split by unit separators, characters that cannot occur
-/// in a name or a one-line subject. `types` is filled in later.
+/// commit is one line, its fields separated by NUL: git cuts a subject at a NUL and joins its lines, and a name holds
+/// neither, so any other character (also a control character) is kept as it is. `types` is filled in later.
 fn describe(root: &Path, shas: &[&str]) -> Option<Vec<Snapshot>> {
-    let mut args = vec!["log", "--no-walk=unsorted", "--format=%x1e%H%x1f%at%x1f%an%x1f%s"];
+    let mut args = vec!["log", "--no-walk=unsorted", "--format=%H%x00%at%x00%an%x00%s"];
     args.extend_from_slice(shas);
     let out = git::capture(root, &args)?;
-    let text = String::from_utf8_lossy(&out);
-    let snapshots: Vec<Snapshot> = text
-        .split('\u{1e}')
-        .filter(|r| !r.trim().is_empty())
-        .map(|r| {
-            let mut f = r.trim_end_matches(['\n', '\r']).splitn(4, '\u{1f}');
-            let mut next = || f.next().unwrap_or("").to_string();
-            let (commit, time, author, subject) = (next(), next(), next(), next());
-            Snapshot { commit, time: time.parse().unwrap_or(0), author, subject, types: 0 }
+    let snapshots: Vec<Snapshot> = out
+        .split(|&b| b == b'\n')
+        .filter_map(|line| {
+            let f: Vec<String> = line.split(|&b| b == 0).map(|f| String::from_utf8_lossy(f).into_owned()).collect();
+            let [commit, time, author, subject] = <[String; 4]>::try_from(f).ok()?;
+            Some(Snapshot { commit, time: time.parse().unwrap_or(0), author, subject, types: 0 })
         })
         .collect();
     (snapshots.len() == shas.len()).then_some(snapshots)
@@ -204,11 +211,14 @@ struct Changes {
 
 impl Changes {
     /// Records the new state of the work-tree path `path` (`mode`/`sha` of the new blob, or None when it is gone).
-    /// Paths outside the prefix are ignored (the pathspec should already have excluded them). Anything that is not a
-    /// regular file the analysis reads is deleted rather than written: a file that became a symlink or a submodule
-    /// (a type change) must not keep its old contents.
+    /// Paths outside the prefix are ignored (the pathspec should already have excluded them), and so are paths that
+    /// are not safe ([`safe_path`]). Anything that is not a regular file the analysis reads is deleted rather than
+    /// written: a file that became a symlink or a submodule (a type change) must not keep its old contents.
     fn add(&mut self, prefix: &str, path: &[u8], new: Option<(&str, &str)>) {
         let Some(rel) = path.strip_prefix(prefix.as_bytes()) else { return };
+        if !safe_path(rel) {
+            return;
+        }
         let rel = path_of(rel);
         match new {
             Some((mode, sha)) if (mode == "100644" || mode == "100755") && wanted(&rel) => self.write.push((rel, sha.to_string())),
@@ -217,13 +227,29 @@ impl Changes {
     }
 }
 
+/// Whether `rel`, a path from a tree listing relative to the root, may be written below the temporary directory:
+/// every `/`-separated component is non-empty and neither `.`, `..`, nor `.git` in any case, and none holds a
+/// backslash or a colon (path syntax on Windows). git never checks out anything else, but a crafted tree object can
+/// hold such entries, and writing `../../x` or `/home/u/x` would put a file outside the directory.
+fn safe_path(rel: &[u8]) -> bool {
+    rel.split(|&b| b == b'/').all(|c| !c.is_empty() && c != b"." && c != b".." && !c.eq_ignore_ascii_case(b".git") && !c.iter().any(|&b| b == b'\\' || b == b':' || b == 0))
+}
+
+/// The pathspec (`-- :(literal)<dir>`) that limits a tree listing to the root's directory, or nothing at the top of
+/// the work tree. Literal, so that glob characters in a directory name are not interpreted.
+fn pathspec(prefix: &str) -> Vec<String> {
+    match prefix.strip_suffix('/') {
+        Some(dir) => vec!["--".into(), format!(":(literal){dir}")],
+        None => vec![],
+    }
+}
+
 /// Every file of commit `sha` under the prefix, as an initial set of writes (`git ls-tree -r -z`, records
 /// `<mode> <type> <sha>\t<path>\0`).
 fn list_tree(top: &Path, sha: &str, prefix: &str) -> Option<Changes> {
+    let spec = pathspec(prefix);
     let mut args = vec!["ls-tree", "-r", "-z", sha];
-    if !prefix.is_empty() {
-        args.extend(["--", prefix]);
-    }
+    args.extend(spec.iter().map(String::as_str));
     let out = git::capture(top, &args)?;
     let mut changes = Changes::default();
     for record in out.split(|&b| b == 0).filter(|r| !r.is_empty()) {
@@ -244,10 +270,9 @@ fn list_tree(top: &Path, sha: &str, prefix: &str) -> Option<Changes> {
 /// raw form of `git diff --name-status`, with the new blob's mode and id included. Status D deletes; A, M and T
 /// (type change) take the new mode and blob.
 fn diff_trees(top: &Path, from: &str, to: &str, prefix: &str) -> Option<Changes> {
+    let spec = pathspec(prefix);
     let mut args = vec!["diff-tree", "-r", "-z", "--no-renames", from, to];
-    if !prefix.is_empty() {
-        args.extend(["--", prefix]);
-    }
+    args.extend(spec.iter().map(String::as_str));
     let out = git::capture(top, &args)?;
     let mut changes = Changes::default();
     let mut fields = out.split(|&b| b == 0);
@@ -295,15 +320,19 @@ struct Mirror {
 
 impl Mirror {
     /// Deletes, then writes (so a path that changes from file to directory or back works), reading every blob to
-    /// write through `cat` in one batch. A file that cannot be written is skipped: the snapshot just lacks it.
+    /// write through `cat` in one batch. A file that cannot be written, or whose blob is missing or too large, is
+    /// removed: the snapshot just lacks it.
     fn apply(&mut self, cat: &mut CatFile, changes: Changes) {
         for rel in &changes.delete {
             let _ = std::fs::remove_file(self.root.join(rel));
         }
         let shas: Vec<&str> = changes.write.iter().map(|(_, sha)| sha.as_str()).collect();
-        for ((rel, _), data) in changes.write.iter().zip(cat.read_all(&shas)) {
-            let Some(data) = data else { continue };
-            let path = self.root.join(rel);
+        cat.for_each(&shas, |i, data| {
+            let path = self.root.join(&changes.write[i].0);
+            let Some(data) = data else {
+                let _ = std::fs::remove_file(&path);
+                return;
+            };
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -317,13 +346,16 @@ impl Mirror {
                 let _ = std::fs::remove_file(&path);
             }
             self.clock += Duration::from_secs(1);
-        }
+        });
     }
 }
 
 /// A fresh directory in the system's temporary directory, removed with everything in it when dropped, so also on an
 /// early return or a panic. The mirror itself is a sub-directory named like the analysed root: an analyser that falls
 /// back to the root directory's name (a Rust crate without a `Cargo.toml`) then sees the same name as normally.
+///
+/// The directory is created new (never an existing one, which another user of a shared temporary directory could
+/// have planted, say as a symbolic link) and, on Unix, readable by the user only.
 struct TempDir {
     base: PathBuf,
     root: PathBuf,
@@ -331,9 +363,19 @@ struct TempDir {
 
 impl TempDir {
     fn new(like: &Path) -> std::io::Result<TempDir> {
-        let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        let base = std::env::temp_dir().join(format!("codecity-history-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&base)?;
+        let mut attempt = 0;
+        let base = loop {
+            let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+            let base = std::env::temp_dir().join(format!("codecity-history-{}-{nanos}-{attempt}", std::process::id()));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            match builder.create(&base) {
+                Ok(()) => break base,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 100 => attempt += 1,
+                Err(e) => return Err(e),
+            }
+        };
         // Created first, so that a failure below still cleans up.
         let dir = TempDir { root: base.join(like.file_name().unwrap_or("root".as_ref())), base };
         std::fs::create_dir_all(&dir.root)?;
@@ -440,6 +482,45 @@ mod tests {
         assert!(json.contains(r#""hist":{"nom":[-1,2,-1],"noa":[-1,0,-1],"loc":[-1,1,-1],"cx":[-1,2,-1],"commits":[0,1,0],"authors":[0,1,0],"last":[-1,1578009600,-1]},"gone":true}"#));
         assert!(json.contains(&format!(r#""history":{{"snapshots":[{{"commit":"{}","time":1577923200,"author":"Ann","subject":"one","types":1}}"#, shas[0])));
         assert!(json.contains(r#""types":1,"hist":[1,1,1]}"#));
+    }
+
+    /// The hostile repository shared by all three editions (`src/test/resources/hostile-repo.sh`): its configuration
+    /// names programs for git to run, and its trees hold paths that escape the work tree. Neither may have any effect.
+    #[test]
+    fn hostile_repository_runs_nothing_and_writes_nothing_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, markers) = (dir.path().join("repo"), dir.path().join("m"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&markers).unwrap();
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/hostile-repo.sh");
+        assert!(Command::new("sh").arg(script).arg(&markers).current_dir(&repo).status().unwrap().success());
+        let repo = std::fs::canonicalize(&repo).unwrap();
+        let esc_a = std::env::temp_dir().join("EscA.java");
+        let _ = std::fs::remove_file(&esc_a);
+
+        assert!(crate::github::GitHubInfo::detect(&repo).is_some());
+        assert!(!git::load(&repo).is_empty());
+        let model = CityModel::build(&SourceAnalyzer::new(), &repo, true, true, None, Some(60));
+
+        let hits: Vec<String> = std::fs::read_dir(&markers)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("hit-"))
+            .collect();
+        assert_eq!(hits, Vec::<String>::new());
+        assert!(!esc_a.exists() && !markers.join("EscB.java").exists() && !std::env::temp_dir().join("EscC.java").exists());
+        // Every snapshot holds just A: the escaping entries are skipped, and Z's blob is missing (not fetched).
+        let snaps = model.history.as_ref().expect("history");
+        assert_eq!(snaps.iter().map(|s| s.types).collect::<Vec<_>>(), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn only_plain_relative_paths_are_safe() {
+        assert!(safe_path(b"src/A.java"));
+        assert!(safe_path(b"a.b/..c/.gitx/A.java"));
+        for bad in ["../A.java", "a/../../A.java", "/tmp/A.java", "a//A.java", "./A.java", "a/", ".git/A.java", "a/.GIT/A.java", r"a\..\A.java", "C:A.java", ""] {
+            assert!(!safe_path(bad.as_bytes()), "{bad}");
+        }
     }
 
     /// Without git there is no history, and the city is the normal one.

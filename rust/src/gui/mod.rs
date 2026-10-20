@@ -99,7 +99,7 @@ pub fn run(model: Arc<CityModel>, watch: Option<(PathBuf, Rebuild)>) -> Result<(
                 Some(w)
             }
             Err(e) => {
-                eprintln!("cannot watch: {e}");
+                eprintln!("cannot watch: {}", crate::printable(&e.to_string()));
                 None
             }
         },
@@ -866,12 +866,20 @@ impl App {
 
     /// Opens the source window on the file declaring type `i`, scrolled to and highlighting the type's lines.
     ///
-    /// The file is read from disk now, so it shows the current contents even if they changed since the analysis.
-    /// Invalid UTF-8 is replaced rather than rejected, and a read error is shown as the window's only line.
+    /// The file is read from disk now, so it shows the current contents even if they changed since the analysis. The
+    /// rules are those of the browser viewer's `api/source`: only a regular file is read (a symbolic link or FIFO
+    /// swapped in for it is not followed or opened), files over 4 MiB are not loaded, invalid UTF-8 is replaced
+    /// rather than rejected, and a read error is shown as the window's only line.
     fn open_source(&mut self, i: usize) {
         let t = &self.model.types()[i];
         let b = &self.model.buildings[i];
-        let code = std::fs::read(&t.file).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_else(|e| format!("// unable to read: {e}"));
+        let unreadable = || format!("// unable to read {}", b.file);
+        let code = match std::fs::symlink_metadata(&t.file) {
+            Ok(m) if !m.is_file() => unreadable(),
+            Ok(m) if m.len() > 4 * 1024 * 1024 => "// file too large to display".to_string(),
+            Ok(_) => std::fs::read(&t.file).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()).unwrap_or_else(|_| unreadable()),
+            Err(_) => unreadable(),
+        };
         self.source = Some(SourceView {
             title: format!("{}:{}", b.file, t.line),
             lines: source::highlight(&code, t.language),
@@ -1047,7 +1055,10 @@ impl App {
             self.open_source(i);
         }
         if let Some(url) = &a.open_url {
-            if let Err(e) = webbrowser::open(url) {
+            // Only https:// links go to the browser (see look::is_web_link): PR URLs come from the GitHub API.
+            if !look::is_web_link(url) {
+                self.toast("Not opening a link that is not https://".into());
+            } else if let Err(e) = webbrowser::open(url) {
                 self.toast(format!("Could not open browser: {e}"));
             }
         }

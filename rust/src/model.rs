@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Supported source languages and how each one names its "packages" (the districts of the city).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -90,9 +91,10 @@ pub struct TypeInfo {
     /// Raw names referenced in the body, resolved later against the project.
     pub references: HashSet<String>,
     /// Java only (empty for the other languages): single-type imports (`import a.b.C;`) and on-demand imports
-    /// (`import a.b.*;`), used by the Java linker to resolve `references`.
-    pub explicit_imports: Vec<String>,
-    pub wildcard_imports: Vec<String>,
+    /// (`import a.b.*;`), used by the Java linker to resolve `references`. Shared by the types of a file, so a file
+    /// with many types and many imports does not hold a copy of its imports per type.
+    pub explicit_imports: Arc<[String]>,
+    pub wildcard_imports: Arc<[String]>,
 }
 
 impl TypeInfo {
