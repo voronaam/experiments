@@ -1,0 +1,17 @@
+[
+[["keyword","import"],["plain"," { "],["type","Thing"],["plain"," } "],["keyword","from"],["plain"," "],["string","'./thing'"],["plain",";"]],
+[],
+[["keyword","export"],["plain"," "],["keyword","const"],["plain"," "],["constant","MAX_ITEMS"],["plain"," = "],["number","1_000"],["plain",";"]],
+[["keyword","type"],["plain"," "],["type","Id"],["plain"," = "],["keyword","string"],["plain"," | "],["keyword","number"],["plain",";"]],
+[],
+[["annotation","@Component"],["plain","({ selector: "],["string","'app'"],["plain"," })"]],
+[["keyword","export"],["plain"," "],["keyword","class"],["plain"," "],["type","Widget"],["plain","<"],["type","T"],["plain","> "],["keyword","extends"],["plain"," "],["type","Thing"],["plain"," "],["keyword","implements"],["plain"," "],["type","Base"],["plain"," {"]],
+[["plain","  "],["annotation","#secret"],["plain"," = "],["number","42n"],["plain",";"]],
+[["plain","  "],["keyword","private"],["plain"," "],["keyword","readonly"],["plain"," label: "],["keyword","string"],["plain"," = "],["string","`"],["string","hello ${name}"]],
+[["string","world`"],["plain",";"]],
+[["plain","  "],["keyword","constructor"],["plain","("],["keyword","private"],["plain"," id: "],["type","Id"],["plain",") { "],["keyword","super"],["plain","(); }"]],
+[["plain","  "],["comment","/*"],["comment"," block"]],
+[["comment","     comment */"],["plain"," render(): "],["keyword","void"],["plain"," { console.log("],["string","\"it's\""],["plain",", "],["string","'x'"],["plain",", "],["number","3.14"],["plain","); }"]],
+[["plain","}"]],
+[]
+]

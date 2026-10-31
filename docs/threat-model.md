@@ -109,7 +109,7 @@ CodeCity runs `git rev-parse`, `remote`, `branch`, `config`, `log`, `rev-list`, 
 |---|---|
 | A hostile remote URL (`https://github.evil.example/o/r`) collects the user's token | `GH_TOKEN`/`GITHUB_TOKEN` and the `gh` token for github.com are only ever sent to `api.github.com`. For any other host, only `GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` are used, and only when `GH_HOST` names that host; `gh auth token` runs without the token variables and with `--hostname=<host>`. Without such an opt-in the host is not contacted at all. |
 | A redirect forwards the `Authorization` header | Java follows redirects by hand, only to `https` on the same host and port; ureq (Rust) and libcurl (D) strip credentials on cross-host redirects. TLS certificates are always verified. |
-| Huge or deeply nested API responses | Bodies are capped at 10 MB and JSON nesting at 128 levels in all editions. |
+| Huge or deeply nested API responses | Bodies are capped at 10 MB and JSON nesting at 127 levels (128 is refused) in all editions. |
 | A pull-request URL with a `javascript:`, `file:` or custom scheme | PR URLs are kept only if they start with `https://<repository host>/` and contain no control characters or spaces; otherwise they are rebuilt from the repository URL and PR number. Viewers re-check links before use (§5.5). |
 
 ### 5.4 Local HTTP server (I7)

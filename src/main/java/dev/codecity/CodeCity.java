@@ -53,12 +53,12 @@ public final class CodeCity {
               -g, --gui         open a native desktop window instead of the browser viewer
               -p, --port N      port for the local viewer (default: 7070)
               -w, --watch       re-analyse and live-update the viewer when files change
-              --no-tests        leave test classes out of the city
+              --no-tests        leave test code out of the city
               --no-git          skip mining git history (churn, authors, recency)
               --no-github       no GitHub links or pull-request overlay
+              --history[=N]     replay the city's growth over N sampled commits (default 60)
               --no-open         don't open a browser
               --export FILE     write a self-contained HTML file and exit
-              --history[=N]     replay the city's growth over N sampled commits (default 60)
               -h, --help        show this help
 
             Metaphor: packages / directories / modules are districts; classes, interfaces, structs,
@@ -141,7 +141,12 @@ public final class CodeCity {
         }
 
         if (opts.export() != null) {
-            HtmlExporter.export(model, opts.export());
+            try {
+                HtmlExporter.export(model, opts.export());
+            } catch (IOException e) {
+                // Name the file as the user gave it, like the Rust and D editions ("cannot write FILE: reason").
+                throw new IOException("cannot write " + opts.export() + ": " + reason(e), e);
+            }
             System.out.println("Wrote " + printable(opts.export().toAbsolutePath().toString()));
             return;
         }
@@ -205,12 +210,7 @@ public final class CodeCity {
                 case "-h", "--help" -> {
                     return null;
                 }
-                case "-p", "--port" -> {
-                    port = Integer.parseInt(require(rest, a));
-                    if (port < 0 || port > 65535) {
-                        throw new IllegalArgumentException("invalid port");
-                    }
-                }
+                case "-p", "--port" -> port = portNumber(require(rest, a));
                 case "-w", "--watch" -> watch = true;
                 case "-g", "--gui" -> gui = true;
                 case "--no-tests" -> tests = false;
@@ -257,6 +257,22 @@ public final class CodeCity {
             throw new IllegalArgumentException("cannot resolve " + dir + ": " + e.getMessage());
         }
         return new Options(dir, null, port, watch, tests, git, github, open, export, gui, history);
+    }
+
+    /**
+     * The N of {@code --port N}: a whole number from 0 (any free port) to 65535. Anything else, a word or a negative
+     * number included, is reported as {@code invalid port}, like the Rust and D editions do.
+     */
+    private static int portNumber(String value) {
+        try {
+            int port = Integer.parseInt(value);
+            if (port >= 0 && port <= 65535) {
+                return port;
+            }
+        } catch (NumberFormatException ignored) {
+            // reported below
+        }
+        throw new IllegalArgumentException("invalid port");
     }
 
     /** The N of {@code --history=N}: a whole number from 2 to 500. */
@@ -320,6 +336,23 @@ public final class CodeCity {
         System.out.println("  loaded " + pulls.source());
         // A failed fetch should not look like "no open PRs": leave the PR features off instead.
         return pulls.source().equals("unavailable") ? info : info.withPulls(pulls.pulls(), pulls.source());
+    }
+
+    /**
+     * Why a file operation failed, without repeating the file name: the JDK's {@link java.nio.file.FileSystemException}
+     * messages are often just the path, so the common cases get the wording of the operating system's error.
+     */
+    private static String reason(IOException e) {
+        if (e instanceof java.nio.file.NoSuchFileException) {
+            return "No such file or directory";
+        }
+        if (e instanceof java.nio.file.AccessDeniedException) {
+            return "Permission denied";
+        }
+        if (e instanceof java.nio.file.FileSystemException f && f.getReason() != null) {
+            return f.getReason();
+        }
+        return String.valueOf(e.getMessage());
     }
 
     private static String require(List<String> rest, String option) {

@@ -13,6 +13,7 @@
 /// looking up.
 module codecity.gui.walk;
 
+import codecity.city : CityModel;
 import codecity.gui.math : Vec3;
 import std.algorithm : clamp, max, min;
 import std.math : abs, cos, PI, sin, sqrt;
@@ -65,6 +66,32 @@ struct World
 {
     Box[] boxes;
     float halfWidth = 0, halfDepth = 0;
+
+    /// The solids of `model` as the viewer shows it: one box per shown district platform (`districtShown`, from the
+    /// ground up to its top at (depth + 1) × `platform`) and one per visible building at its current, possibly
+    /// animating height and footprint side (`heights` / `sides` by type index; 0 means hidden, and the replay changes
+    /// both). The viewer rebuilds it every walking frame, so growing or hidden buildings take effect on the next step.
+    static World of(const CityModel model, const(float)[] heights, const(float)[] sides, const(bool)[] districtShown)
+    {
+        import codecity.layout : platform;
+        World w;
+        w.halfWidth = cast(float) model.width / 2;
+        w.halfDepth = cast(float) model.depth / 2;
+        w.boxes.reserve(model.districts.length + model.buildings.length);
+        foreach (i, d; model.districts)
+            if (districtShown[i])
+                w.boxes ~= Box(cast(float)(d.x - d.w / 2), cast(float)(d.z - d.d / 2), cast(float)(d.x + d.w / 2),
+                    cast(float)(d.z + d.d / 2), 0, cast(float)((d.depth + 1) * platform));
+        foreach (ref b; model.buildings)
+        {
+            const h = heights[b.index];
+            if (h <= 0.001f || sides[b.index] <= 0.001f) continue;
+            const s = sides[b.index] / 2;
+            w.boxes ~= Box(cast(float) b.lot.x - s, cast(float) b.lot.z - s, cast(float) b.lot.x + s,
+                cast(float) b.lot.z + s, cast(float) b.lot.y, cast(float) b.lot.y + h);
+        }
+        return w;
+    }
 }
 
 /// The movement keys held this frame. `forward` and `right` are -1, 0 or 1 (W/S and D/A, or the arrow keys).

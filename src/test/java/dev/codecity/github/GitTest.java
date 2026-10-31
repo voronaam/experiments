@@ -1,17 +1,22 @@
 package dev.codecity.github;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** The PATH search that finds git and gh (the Rust and D editions test the same cases). */
+/** The PATH search that finds git and gh, and the time limit of short commands (the Rust and D editions test the same cases). */
 class GitTest {
 
     private static Path program(Path dir) throws Exception {
@@ -52,6 +57,44 @@ class GitTest {
             assertEquals(Optional.empty(), Git.find("git", ".::git", ":", List.of(""), false));
         } finally {
             Files.deleteIfExists(planted);
+        }
+    }
+
+    /**
+     * A fake {@code git} in {@code dir} that writes its process id to {@code dir/pid} and then runs {@code body}; found
+     * through {@link Git#lookup} with {@code dir} as the whole PATH.
+     */
+    private static Path fakeGit(Path dir, String body) throws Exception {
+        Path git = Files.writeString(dir.resolve("git"), "#!/bin/sh\necho $$ > '" + dir.resolve("pid") + "'\n" + body + "\n");
+        assertTrue(git.toFile().setExecutable(true));
+        Path found = Git.lookup("git", Map.of("PATH", dir.toString())::get).orElseThrow();
+        assertEquals(git, found);
+        return found;
+    }
+
+    @Test
+    @DisabledOnOs(value = OS.WINDOWS, disabledReason = "the fake git is a shell script")
+    void killsACommandThatOutlivesItsTimeLimit(@TempDir Path dir) throws Exception {
+        // In time (a limit far beyond what the command needs, however busy the machine): the output, stripped; a
+        // failure: nothing.
+        Duration plenty = Duration.ofSeconds(60);
+        assertEquals(Optional.of("ok"), Git.runCommand(new ProcessBuilder(fakeGit(dir, "echo ' ok '").toString()), plenty));
+        assertEquals(Optional.empty(), Git.runCommand(new ProcessBuilder(fakeGit(dir, "echo no; exit 3").toString()), plenty));
+        // Hanging with stdout open (after some output) for ten minutes: nothing is returned once the limit runs out,
+        // and the process is gone. Only the outcome is checked, not how long it took.
+        Path git = fakeGit(dir, "echo partial; exec sleep 600");
+        Files.deleteIfExists(dir.resolve("pid"));
+        long start = System.nanoTime();
+        assertEquals(Optional.empty(), Git.runCommand(new ProcessBuilder(git.toString()), Duration.ofSeconds(3)));
+        assertTrue(System.nanoTime() - start < Duration.ofSeconds(300).toNanos(), "not killed");
+        // The script writes its id first thing; under extreme load it may not have got that far before the kill.
+        if (Files.exists(dir.resolve("pid"))) {
+            long pid = Long.parseLong(Files.readString(dir.resolve("pid")).strip());
+            long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
+            while (ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false) && System.nanoTime() < deadline) {
+                Thread.sleep(50);
+            }
+            assertFalse(ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false), "the command still runs");
         }
     }
 }

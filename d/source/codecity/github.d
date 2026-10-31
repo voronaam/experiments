@@ -9,9 +9,9 @@
 ///
 /// The repository may come from the analysed tree's own (untrusted) git configuration, so the token is guarded: an
 /// environment token for github.com only ever goes to api.github.com, and a GitHub Enterprise host gets a token (or a
-/// request at all) only when the user opted in to that very host (see `token` and `fetchPulls`). libcurl does not send
-/// the Authorization header on to another host when it follows a redirect; responses are capped at
-/// `maxResponseBytes` and JSON at `maxJsonDepth` levels of nesting.
+/// request at all) only when the user opted in to that very host (see `token` and `fetchPulls`). Redirects are followed
+/// only to https on the same host and port, responses are capped at `maxResponseBytes` and JSON at `maxJsonDepth`
+/// levels of nesting (`request`): the same rules as in the other editions.
 module codecity.github;
 
 import codecity.git : executable, output, realPath, run;
@@ -189,8 +189,15 @@ string cacheRoot()
 /// (`codecity.git.gitArgs`). Both sides are compared as real paths.
 bool isCached(string dir)
 {
-    const cache = realPath(cacheRoot());
-    if (!cache.exists) return false;
+    return isCachedIn(dir, cacheRoot());
+}
+
+/// `isCached` for the cache at `root`. Test seam: the tests use a cache in a temporary directory.
+package bool isCachedIn(string dir, string root)
+{
+    const cache = realPath(root);
+    // Like the other editions, a directory that does not exist is not in the cache (realPath would return it as is).
+    if (!cache.exists || !dir.exists) return false;
     const d = realPath(dir);
     return d == cache || d.startsWith(cache ~ "/");
 }
@@ -202,7 +209,22 @@ bool isCached(string dir)
 /// contents only for the checked-out revision. Returns the clone's directory; throws if git fails.
 string cloneOrUpdate(GitHubRepo repo)
 {
-    const dir = buildPath(cacheRoot(), repo.host, repo.owner, repo.name);
+    return cloneInto(repo, cacheRoot(), repo.webUrl ~ ".git");
+}
+
+/// `cloneOrUpdate` with the cache at `root` and the repository cloned from `url` (production: `cacheRoot` and the
+/// repository's HTTPS URL). Test seam: the tests clone local bare repositories (`file://` URLs) into a cache in a
+/// temporary directory, through the same code path.
+package string cloneInto(GitHubRepo repo, string root, string url)
+{
+    import std.array : array;
+    import std.path : buildNormalizedPath, pathSplitter;
+    // Normalised without looking at the file system (like Java's Path.normalize): "." dropped, ".." resolved.
+    const dir = buildNormalizedPath(root, repo.host, repo.owner, repo.name);
+    // Defence in depth: `parse` already rejects "." and "..", but a path escaping the cache must never be cloned into
+    // or hard-reset. Compared component by component, so "cache-other" is not inside "cache".
+    if (!dir.pathSplitter.array.startsWith(buildNormalizedPath(root).pathSplitter.array))
+        throw new Exception("refusing to clone outside the cache: " ~ dir);
     // Runs git with the terminal's stdin/stdout/stderr, so its progress output and any credential prompt are
     // visible to the user.
     void interactive(string[] args)
@@ -229,7 +251,7 @@ string cloneOrUpdate(GitHubRepo repo)
         auto args = ["clone", "--filter=blob:none"];
         if (repo.branch.length) args ~= ["--branch", repo.branch];
         // "--" ends the options, so nothing in the URL or path can be taken for one.
-        interactive(args ~ ["--", repo.webUrl ~ ".git", dir]);
+        interactive(args ~ ["--", url, dir]);
     }
     return dir;
 }
@@ -240,24 +262,24 @@ string cloneOrUpdate(GitHubRepo repo)
 /// (one per PR and 100 files) are made at most, out of the 60 requests per hour GitHub allows unauthenticated
 /// clients.
 private enum pageSize = 50, maxPages = 6, anonymousFileLookups = 30;
-/// Largest response body read (a larger one fails the fetch), and deepest JSON nesting accepted: the limits of the
-/// Rust edition's HTTP client and JSON parser.
-private enum maxResponseBytes = 10 * 1024 * 1024, maxJsonDepth = 128;
+/// Largest response body read (exactly this many bytes are accepted, one more fails the fetch), and deepest nesting
+/// of arrays and objects accepted (`jsonDepth`): the same limits in every edition.
+private enum maxResponseBytes = 10 * 1024 * 1024, maxJsonDepth = 127;
 /// Environment variables that may hold a token; `gh` runs without them (see `token`).
 private immutable tokenVariables = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
 
 /// An API token for the repository's host, or null: the environment first (`envToken`), else `gh auth token` for the
 /// host: the token of a login the user made to exactly that host. `gh` runs without the token variables, since it
 /// would otherwise answer with `GH_ENTERPRISE_TOKEN` for any host; the host is passed as `--hostname=<host>`, so it
-/// can never be read as another option.
-private string token(ref const GitHubRepo repo)
+/// can never be read as another option. `gh` is found by `env.programs` (`executable` in production).
+package string token(ref const GitHubRepo repo, ref const Env env)
 {
-    if (auto t = envToken(repo, (string v) => environment.get(v))) return t;
-    auto env = environment.toAA;
-    foreach (v; tokenVariables) env.remove(v);
-    auto gh = executable("gh");
+    if (auto t = envToken(repo, env.vars)) return t;
+    auto vars = environment.toAA;
+    foreach (v; tokenVariables) vars.remove(v);
+    auto gh = env.programs("gh");
     if (gh is null) return null;
-    auto t = output([gh, "auth", "token", "--hostname=" ~ repo.host], env, Config.newEnv);
+    auto t = output([gh, "auth", "token", "--hostname=" ~ repo.host], vars, Config.newEnv);
     return t.length ? t : null;
 }
 
@@ -265,7 +287,7 @@ private string token(ref const GitHubRepo repo)
 /// `GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN` for any other host, but only when `GH_HOST` names that host
 /// (`optedIn`); null when there is none. Without that opt-in, a crafted remote URL such as
 /// `https://github.attacker.example/o/r` in an analysed repository would receive the user's token.
-private string envToken(ref const GitHubRepo repo, scope string delegate(string) env)
+package string envToken(ref const GitHubRepo repo, scope string delegate(string) env)
 {
     const string[] vars = repo.isPublic ? ["GH_TOKEN", "GITHUB_TOKEN"]
         : optedIn(repo, env) ? ["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"] : [];
@@ -278,7 +300,7 @@ private string envToken(ref const GitHubRepo repo, scope string delegate(string)
 }
 
 /// Whether `GH_HOST` names the repository's host (case-insensitively): the opt-in for an Enterprise host.
-private bool optedIn(ref const GitHubRepo repo, scope string delegate(string) env)
+package bool optedIn(ref const GitHubRepo repo, scope string delegate(string) env)
 {
     import std.uni : sicmp;
     auto host = env("GH_HOST");
@@ -288,7 +310,7 @@ private bool optedIn(ref const GitHubRepo repo, scope string delegate(string) en
 /// The link of PR `number`: `url` from the response when it is an https URL on the repository's host, otherwise the
 /// PR's page built from the repository. The URL ends up in the viewers' links and in the desktop viewers' browser
 /// launcher, which must only ever be handed a web page (not, say, a `file:` URL).
-private string pullUrl(ref const GitHubRepo repo, string url, long number)
+package string pullUrl(ref const GitHubRepo repo, string url, long number)
 {
     import std.algorithm : any;
     if (url.startsWith("https://" ~ repo.host ~ "/") && !url.any!(c => c <= ' ')) return url;
@@ -302,55 +324,167 @@ private struct Response
     long remaining = -1;
 }
 
+/// Redirect statuses that are followed (by `mayFollow`), and how many of them in a row.
+private immutable int[] redirects = [301, 302, 307, 308];
+private enum maxRedirects = 5;
+
 /// Performs one API call with libcurl and parses the JSON response. `body_` is sent only for POST (GraphQL). Throws
 /// on any non-2xx status, with a readable message for the common failures (see `failure`).
+///
+/// A redirect (GitHub uses them for renamed repositories) is followed only to an https URL on the same host and port
+/// (`mayFollow`), with the same method, headers (the token included) and body; a redirect elsewhere fails the
+/// request, so the token cannot be sent on. libcurl's own redirect handling is off. The body is read up to
+/// `maxResponseBytes` and parsed by `parseResponse`.
 private Response request(string method, string url, string tok, string body_ = null)
 {
+    import etc.c.curl : CurlOption;
     import std.net.curl : HTTP;
     import std.array : appender;
-    auto http = HTTP(url);
-    http.operationTimeout = 30.seconds;
-    http.addRequestHeader("Accept", "application/vnd.github+json");
-    http.addRequestHeader("X-GitHub-Api-Version", "2022-11-28");
-    http.setUserAgent("codecity");
-    if (tok.length) http.addRequestHeader("Authorization", "Bearer " ~ tok);
-    if (method == "POST") http.postData = body_;
-    auto data = appender!(ubyte[]);
-    Response r;
-    string remainingHeader;
-    bool retryAfter;
-    http.onReceiveHeader = (in char[] key, in char[] value) {
-        if (key.toLower == "x-ratelimit-remaining")
+    for (int hops = 0;; hops++)
+    {
+        auto http = HTTP(url);
+        // No redirects followed by libcurl (std.net.curl's maxRedirects = uint.max means the same, confusingly).
+        http.handle.set(CurlOption.followlocation, 0);
+        http.operationTimeout = 30.seconds;
+        http.addRequestHeader("Accept", "application/vnd.github+json");
+        http.addRequestHeader("X-GitHub-Api-Version", "2022-11-28");
+        http.setUserAgent("codecity");
+        if (tok.length) http.addRequestHeader("Authorization", "Bearer " ~ tok);
+        if (method == "POST") http.postData = body_;
+        auto data = appender!(ubyte[]);
+        Response r;
+        string remainingHeader, location;
+        bool retryAfter;
+        http.onReceiveHeader = (in char[] key, in char[] value) {
+            if (key.toLower == "x-ratelimit-remaining")
+            {
+                remainingHeader = value.idup;
+                // A malformed value counts as missing (an exception must not escape into libcurl's callback).
+                try r.remaining = value.to!long;
+                catch (Exception) r.remaining = -1;
+            }
+            if (key.toLower == "retry-after") retryAfter = true;
+            if (key.toLower == "location") location = value.idup;
+        };
+        bool tooLarge;
+        http.onReceive = (ubyte[] chunk) {
+            if (data.data.length + chunk.length > maxResponseBytes)
+            {
+                tooLarge = true;
+                return 0; // anything but chunk.length aborts the transfer
+            }
+            data.put(chunk);
+            return chunk.length;
+        };
+        try http.perform();
+        catch (Exception e)
+            throw new Exception(tooLarge ? format("response larger than %d bytes", maxResponseBytes) : e.msg);
+        const status = http.statusLine.code;
+        if (redirects.canFind(status) && location.length && hops < maxRedirects)
         {
-            remainingHeader = value.idup;
-            // A malformed value counts as missing (an exception must not escape into libcurl's callback).
-            try r.remaining = value.to!long;
-            catch (Exception) r.remaining = -1;
+            const next = resolve(url, location);
+            if (!mayFollow(url, next)) throw new Exception("redirect to another host refused");
+            url = next;
+            continue;
         }
-        if (key.toLower == "retry-after") retryAfter = true;
-    };
-    bool tooLarge;
-    http.onReceive = (ubyte[] chunk) {
-        if (data.data.length + chunk.length > maxResponseBytes)
+        if (auto msg = failure(status, remainingHeader, retryAfter)) throw new Exception(msg);
+        r.json = parseResponse(cast(string) data.data);
+        return r;
+    }
+}
+
+/// `location` (a redirect's Location header) resolved against `base`: an absolute URL as it is, `//host/…` with the
+/// scheme of `base`, `/path` on the origin of `base`, anything else relative to the directory of `base`'s path.
+package string resolve(string base, string location)
+{
+    import std.string : indexOf, indexOfAny, lastIndexOf;
+    if (location.canFind("://")) return location;
+    const schemeEnd = base.indexOf("://") < 0 ? 0 : base.indexOf("://") + 3;
+    if (location.startsWith("//")) return base[0 .. schemeEnd] ~ location[2 .. $];
+    const slash = base[schemeEnd .. $].indexOf('/');
+    const originEnd = slash < 0 ? base.length : schemeEnd + slash;
+    if (location.startsWith("/")) return base[0 .. originEnd] ~ location;
+    const query = base.indexOfAny("?#");
+    const pathEnd = query < 0 ? base.length : query;
+    const dir = base[0 .. pathEnd].lastIndexOf('/');
+    const dirEnd = dir >= cast(long) originEnd ? dir : originEnd;
+    return base[0 .. dirEnd] ~ "/" ~ location;
+}
+
+/// Scheme, host and port (-1 for none) of an absolute URL; null scheme when `url` has no `://` or no host.
+private void origin(string url, out string scheme, out string host, out long port)
+{
+    import std.string : indexOf, indexOfAny, lastIndexOf;
+    port = -1;
+    const i = url.indexOf("://");
+    if (i <= 0) return;
+    auto authority = url[i + 3 .. $];
+    const end = authority.indexOfAny("/?#");
+    if (end >= 0) authority = authority[0 .. end];
+    const at = authority.lastIndexOf('@');
+    if (at >= 0) authority = authority[at + 1 .. $];
+    const colon = authority.lastIndexOf(':');
+    if (colon >= 0)
+    {
+        try port = authority[colon + 1 .. $].to!long;
+        catch (Exception) return;
+        authority = authority[0 .. colon];
+    }
+    if (authority.length == 0) return;
+    scheme = url[0 .. i];
+    host = authority;
+}
+
+/// Whether a redirect from `from` to `to` is followed (with the same headers, the token included): only to an https
+/// URL on the same host (compared case-insensitively) and port (an explicit port differs from none). The rule of all
+/// editions.
+package bool mayFollow(string from, string to)
+{
+    import std.uni : sicmp;
+    string fs, fh, ts, th;
+    long fp, tp;
+    origin(from, fs, fh, fp);
+    origin(to, ts, th, tp);
+    return ts !is null && fs !is null && sicmp(ts, "https") == 0 && sicmp(fh, th) == 0 && fp == tp;
+}
+
+/// The deepest nesting of arrays and objects in the JSON text `text`; brackets inside strings do not count.
+package size_t jsonDepth(string text)
+{
+    size_t depth, deepest;
+    bool inString, escaped;
+    foreach (char c; text)
+    {
+        if (inString)
         {
-            tooLarge = true;
-            return 0; // anything but chunk.length aborts the transfer
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"') inString = false;
+            continue;
         }
-        data.put(chunk);
-        return chunk.length;
-    };
-    try http.perform();
-    catch (Exception e)
-        throw new Exception(tooLarge ? format("response larger than %d bytes", maxResponseBytes) : e.msg);
-    if (auto msg = failure(http.statusLine.code, remainingHeader, retryAfter)) throw new Exception(msg);
-    r.json = parseJSON(cast(string) data.data, maxJsonDepth);
-    return r;
+        if (c == '"') inString = true;
+        else if (c == '[' || c == '{')
+        {
+            depth++;
+            if (depth > deepest) deepest = depth;
+        }
+        else if ((c == ']' || c == '}') && depth > 0) depth--;
+    }
+    return deepest;
+}
+
+/// One JSON document. Nesting is checked first (`jsonDepth` at most `maxJsonDepth`), the same rule as in the other
+/// editions; std.json's own depth limit counts the innermost value too, so it is not used.
+private JSONValue parseResponse(string text)
+{
+    if (jsonDepth(text) > maxJsonDepth) throw new Exception("JSON nested too deeply");
+    return parseJSON(text);
 }
 
 /// The message for a failed request, or null for a 2xx status. GitHub answers an exhausted rate limit with 429, or
 /// with 403 and either `x-ratelimit-remaining: 0` (primary limit) or a `retry-after` header (secondary limit); any
 /// other 403 means the token or anonymous client may not access the repository.
-private string failure(int status, string rateLimitRemaining, bool retryAfter)
+package string failure(int status, string rateLimitRemaining, bool retryAfter)
 {
     if (status >= 200 && status <= 299) return null;
     if (status == 429 || (status == 403 && (rateLimitRemaining == "0" || retryAfter)))
@@ -362,10 +496,10 @@ private string failure(int status, string rateLimitRemaining, bool retryAfter)
 
 /// Sends one GraphQL query and returns its `data`. GraphQL reports errors (bad token scope, unknown repository, …)
 /// with HTTP 200 and an "errors" array.
-private JSONValue query(ref const GitHubRepo repo, string tok, string text, JSONValue variables)
+private JSONValue query(string url, string tok, string text, JSONValue variables)
 {
     JSONValue body_ = ["query": JSONValue(text), "variables": variables];
-    auto json = request("POST", repo.graphqlApi, tok, body_.toString).json;
+    auto json = request("POST", url, tok, body_.toString).json;
     if (auto errors = "errors" in json)
         if (errors.type == JSONType.array && errors.array.length)
             throw new Exception(str(errors.array[0], "message"));
@@ -395,16 +529,8 @@ bool fetchPulls(ref const GitHubRepo repo, out PullRequest[] pulls, out string s
 {
     try
     {
-        auto tok = token(repo);
-        if (!tok.length && !repo.isPublic && !optedIn(repo, (string v) => environment.get(v)))
-        {
-            stderr.writefln("  GitHub: not contacting %1$s (for a GitHub Enterprise host, set GH_HOST=%1$s or log in with `gh auth login --hostname %1$s`)",
-                repo.host);
-            return false;
-        }
-        if (tok.length) graphql(repo, tok, pulls, source);
-        else rest(repo, pulls, source);
-        return true;
+        auto env = Env((string v) => environment.get(v), (string n) => executable(n), repo.restApi, repo.graphqlApi);
+        return fetchWith(repo, env, pulls, source);
     }
     catch (Exception e)
     {
@@ -413,11 +539,39 @@ bool fetchPulls(ref const GitHubRepo repo, out PullRequest[] pulls, out string s
     }
 }
 
+/// What `fetchPulls` reads from outside: environment variables (`vars`, null for an unset one), the programs on the
+/// `PATH` (`programs`, for `gh`; null when not found) and the API endpoints (`restApi`, the REST base URL, and
+/// `graphqlApi`). Production uses the process environment, `executable` and the repository's real endpoints. Test
+/// seam: the tests inject an environment of their own, a fake `gh`, and a fake API server on the loopback interface.
+package struct Env
+{
+    string delegate(string) vars;
+    string delegate(string) programs;
+    string restApi, graphqlApi;
+}
+
+/// `fetchPulls` in the environment `env`, with failures thrown (the message is what the user is shown). False: the
+/// host was not contacted.
+package bool fetchWith(ref const GitHubRepo repo, ref const Env env, out PullRequest[] pulls, out string source)
+{
+    auto tok = token(repo, env);
+    if (!tok.length && !repo.isPublic && !optedIn(repo, env.vars))
+    {
+        stderr.writefln("  GitHub: not contacting %1$s (for a GitHub Enterprise host, set GH_HOST=%1$s or log in with `gh auth login --hostname %1$s`)",
+            repo.host);
+        return false;
+    }
+    if (tok.length) graphql(repo, env.graphqlApi, tok, pulls, source);
+    else rest(repo, env.restApi, pulls, source);
+    return true;
+}
+
 /// With a token: the GraphQL API returns each PR together with its changed files, 50 PRs per request, so all open
 /// PRs (up to `maxPages` pages) cost only a few requests. PRs are ordered by last update, newest first, so when the
 /// page limit cuts the list off, the most recently active PRs are the ones kept. Each PR comes with its first 100
-/// files; a PR with more is completed 100 files per extra request, paged by cursor like the PRs.
-private void graphql(ref const GitHubRepo repo, string tok, out PullRequest[] pulls, out string source)
+/// files; a PR with more is completed 100 files per extra request, paged by cursor like the PRs. `url` is the GraphQL
+/// endpoint.
+private void graphql(ref const GitHubRepo repo, string url, string tok, out PullRequest[] pulls, out string source)
 {
     const pullsQuery = format("query($owner: String!, $name: String!, $cursor: String) { repository(owner: $owner, name: $name) { "
         ~ "pullRequests(states: OPEN, first: %d, after: $cursor, orderBy: {field: UPDATED_AT, direction: DESC}) { "
@@ -433,7 +587,7 @@ private void graphql(ref const GitHubRepo repo, string tok, out PullRequest[] pu
     {
         if (!more) break;
         JSONValue variables = ["owner": JSONValue(repo.owner), "name": JSONValue(repo.name), "cursor": cursor];
-        auto data = query(repo, tok, pullsQuery, variables);
+        auto data = query(url, tok, pullsQuery, variables);
         auto repository = data.type == JSONType.object ? "repository" in data : null;
         if (repository is null || repository.type != JSONType.object) throw new Exception("repository not found or not accessible");
         auto prs = (*repository)["pullRequests"];
@@ -455,12 +609,14 @@ private void graphql(ref const GitHubRepo repo, string tok, out PullRequest[] pu
                 if (!flag(connection["pageInfo"], "hasNextPage")) break;
                 JSONValue next = ["owner": JSONValue(repo.owner), "name": JSONValue(repo.name),
                     "number": JSONValue(pr.number), "cursor": connection["pageInfo"]["endCursor"]];
-                connection = query(repo, tok, filesQuery, next)["repository"]["pullRequest"]["files"];
+                connection = query(url, tok, filesQuery, next)["repository"]["pullRequest"]["files"];
             }
             pulls ~= pr;
         }
         more = flag(prs["pageInfo"], "hasNextPage");
-        cursor = prs["pageInfo"]["endCursor"];
+        // A missing endCursor counts as null, as in the other editions (it only matters when more pages follow).
+        auto end = "endCursor" in prs["pageInfo"];
+        cursor = end ? *end : JSONValue(null);
     }
     source = more ? format("latest %d open PRs", pulls.length) : "all open PRs";
 }
@@ -469,10 +625,10 @@ private void graphql(ref const GitHubRepo repo, string tok, out PullRequest[] pu
 /// request (up to 100 PRs, most recently updated first) is followed by file requests (100 files each, until a page
 /// comes back short) PR by PR until the budget is used up: `anonymousFileLookups`, or fewer if the rate limit left
 /// after the listing is lower, keeping one request in reserve. A PR whose files do not fit in what is left is left
-/// out, like the PRs after it, rather than shown with only some of its files.
-private void rest(ref const GitHubRepo repo, out PullRequest[] pulls, out string source)
+/// out, like the PRs after it, rather than shown with only some of its files. `api` is the REST base URL.
+private void rest(ref const GitHubRepo repo, string api, out PullRequest[] pulls, out string source)
 {
-    const base = format("%s/repos/%s/%s", repo.restApi, repo.owner, repo.name);
+    const base = format("%s/repos/%s/%s", api, repo.owner, repo.name);
     auto listing = request("GET", base ~ "/pulls?state=open&sort=updated&direction=desc&per_page=100", null);
     // Without the header, assume the full budget is available.
     const remaining = listing.remaining < 0 ? anonymousFileLookups + 1 : listing.remaining;

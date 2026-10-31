@@ -72,20 +72,34 @@ public final class JsonWriter {
 
     /**
      * Writes a number rounded to three decimals. Whole numbers below 10^15 are written without a fraction
-     * ({@code 3}, not {@code 3.0}); larger ones use {@link Double#toString} (e.g. {@code 1.0E15}), which is still valid
-     * JSON. {@link Math#round(double)} rounds halves up (towards positive infinity), which the other editions copy
-     * exactly. JSON has no NaN or infinity, so those are written as {@code 0}.
+     * ({@code 3}, not {@code 3.0}); other numbers in their shortest decimal form that reads back as the same double,
+     * never with an exponent ({@code 12345678.5}, {@code 1000000000000000}), as Rust's {@code {}} formatting and the
+     * D edition write them. Halves are rounded up (towards positive infinity), which the other
+     * editions copy exactly; it is computed on doubles ({@link #roundHalfUp}), as {@code Math.round} would clamp
+     * values beyond the {@code long} range. JSON has no NaN or infinity, so those are written as {@code 0}.
      */
     public JsonWriter value(double v) {
         comma();
-        double r = Double.isFinite(v) ? Math.round(v * 1000) / 1000.0 : 0;
+        double r = Double.isFinite(v) ? roundHalfUp(v * 1000) / 1000 : 0;
         if (r == Math.rint(r) && Math.abs(r) < 1e15) {
             out.append((long) r);
         } else {
-            out.append(r);
+            // Double.toString gives the shortest digits but switches to an exponent from 10^7 on; the plain string of
+            // the same digits matches the other editions.
+            out.append(java.math.BigDecimal.valueOf(r).toPlainString());
         }
         needComma = true;
         return this;
+    }
+
+    /**
+     * Nearest whole number, halves rounded up (towards positive infinity), like {@link Math#round(double)} but without
+     * its clamping to the {@code long} range; the Rust and D editions use the same function. {@code x - floor(x)} is
+     * exact for every finite double, so the comparison with 0.5 is too.
+     */
+    static double roundHalfUp(double x) {
+        double f = Math.floor(x);
+        return x - f >= 0.5 ? f + 1 : f;
     }
 
     public JsonWriter value(boolean v) {

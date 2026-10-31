@@ -143,6 +143,7 @@ pub fn layout(city_name: &str, types: &[TypeInfo]) -> Layout {
 
 /// [`layout`], with each footprint sized for the attribute count `noa(t)` instead of `t.noa`. The history replay
 /// passes a type's largest count over the present and every snapshot, so the lot fits the building at its widest.
+/// A [`Lot`] still has the type's own footprint side, centred in the larger lot.
 pub fn layout_with_noa(city_name: &str, types: &[TypeInfo], noa: impl Fn(&TypeInfo) -> u32) -> Layout {
     let mut root = build_tree(city_name, types, &noa);
     measure(&mut root);
@@ -281,8 +282,10 @@ fn place(node: &Node, left: f64, top: f64, depth: u32, districts: &mut Vec<Distr
             Ref::Type(i) => {
                 // The item is the footprint plus the street; the building sits in its top-left corner, and the lot
                 // stores the footprint's centre. It stands on this district's platform, one level above depth.
+                // With a larger lot (history replay), the building keeps its own side, centred in the lot, as in the
+                // Java and D editions.
                 let (t, s) = node.types[i];
-                lots.insert(t.fqn.clone(), Lot { x: x + s / 2.0, z: z + s / 2.0, side: s, y: (depth + 1) as f64 * PLATFORM, district: index });
+                lots.insert(t.fqn.clone(), Lot { x: x + s / 2.0, z: z + s / 2.0, side: side_of_noa(t.noa), y: (depth + 1) as f64 * PLATFORM, district: index });
             }
         }
     }
@@ -448,17 +451,21 @@ fn skyline(items: &[Item], width: f64, xs: &mut [f64], zs: &mut [f64]) -> (f64, 
 
 #[cfg(test)]
 mod tests {
+    //! Layout rules, one per test. The Java (`CityLayoutTest`) and D (`layout.d`) editions run the same scenarios on
+    //! the same synthetic fixtures with the same expectations.
+
     use super::*;
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    fn ty(pkg: &str, name: &str, noa: u32) -> TypeInfo {
+    /// A type of the given language in package `pkg` and build module `module`.
+    fn ty_in(language: Language, module: &str, pkg: &str, name: &str, noa: u32) -> TypeInfo {
         TypeInfo {
-            language: Language::Java,
-            fqn: format!("{pkg}.{name}"),
+            language,
+            fqn: if pkg.is_empty() { name.to_string() } else { format!("{pkg}{}{name}", language.separator()) },
             name: name.into(),
             package: pkg.into(),
-            module: String::new(),
+            module: module.into(),
             kind: "class",
             file: PathBuf::from(format!("{name}.java")),
             line: 1,
@@ -473,33 +480,266 @@ mod tests {
         }
     }
 
+    fn ty(pkg: &str, name: &str, noa: u32) -> TypeInfo {
+        ty_in(Language::Java, "", pkg, name, noa)
+    }
+
+    /// The shared fixture of all three editions: 300 Java types spread evenly over six packages (two of them only
+    /// reachable through empty chains), mostly small, every fifth one larger.
     fn city() -> Vec<TypeInfo> {
         let pkgs = ["a", "a.b", "a.b.c", "a.d", "e", "e.f.g"];
         (0..300).map(|i| ty(pkgs[(i * 7) % pkgs.len()], &format!("T{i}"), ((i * 13) % 9) as u32 * if i % 5 == 0 { 9 } else { 1 })).collect()
     }
 
+    fn labels(l: &Layout) -> Vec<&str> {
+        l.districts.iter().map(|d| d.label.as_str()).collect()
+    }
+
+    fn ids(l: &Layout) -> Vec<&str> {
+        l.districts.iter().map(|d| d.id.as_str()).collect()
+    }
+
+    fn depths(l: &Layout) -> Vec<u32> {
+        l.districts.iter().map(|d| d.depth).collect()
+    }
+
+    /// Rounds to 9 decimals, so exact expectations are not upset by floating-point noise.
+    fn round(v: f64) -> f64 {
+        (v * 1e9).round() / 1e9
+    }
+
+    /// Every type of the input gets exactly one lot, keyed by its fqn.
     #[test]
-    fn buildings_never_overlap_and_stay_inside_their_district() {
+    fn every_type_gets_a_lot() {
         let types = city();
         let l = layout("city", &types);
         assert_eq!(l.lots.len(), types.len());
+        assert!(types.iter().all(|t| l.lots.contains_key(&t.fqn)));
+    }
+
+    /// Buildings never overlap: any two lots are at least a street (GAP) apart along x or z.
+    #[test]
+    fn buildings_in_the_same_district_do_not_overlap() {
+        let l = layout("city", &city());
         let lots: Vec<&Lot> = l.lots.values().collect();
         for (i, a) in lots.iter().enumerate() {
-            let dd = &l.districts[a.district];
-            assert!(a.x - a.side / 2.0 >= dd.x - dd.w / 2.0 - 1e-6 && a.x + a.side / 2.0 <= dd.x + dd.w / 2.0 + 1e-6);
-            assert!(a.z - a.side / 2.0 >= dd.z - dd.d / 2.0 - 1e-6 && a.z + a.side / 2.0 <= dd.z + dd.d / 2.0 + 1e-6);
             for b in &lots[i + 1..] {
                 let gx = (a.x - b.x).abs() - (a.side + b.side) / 2.0;
                 let gz = (a.z - b.z).abs() - (a.side + b.side) / 2.0;
-                assert!(gx >= GAP - 1e-6 || gz >= GAP - 1e-6);
+                assert!(gx >= GAP - 1e-6 || gz >= GAP - 1e-6, "{a:?} and {b:?} overlap");
             }
         }
     }
 
+    /// A building stands inside its district with at least the kerb (PAD) to every edge, on top of the district's
+    /// platform: `y = (depth + 1) * PLATFORM`.
     #[test]
-    fn single_child_chains_collapse() {
+    fn buildings_stand_inside_their_district() {
+        let l = layout("city", &city());
+        let pad = PAD - 1e-6;
+        for a in l.lots.values() {
+            let d = &l.districts[a.district];
+            assert!(a.x - a.side / 2.0 >= d.x - d.w / 2.0 + pad && a.x + a.side / 2.0 <= d.x + d.w / 2.0 - pad);
+            assert!(a.z - a.side / 2.0 >= d.z - d.d / 2.0 + pad && a.z + a.side / 2.0 <= d.z + d.d / 2.0 - pad);
+            assert!((a.y - (d.depth + 1) as f64 * PLATFORM).abs() < 1e-9);
+        }
+    }
+
+    /// The parent of every district: the closest earlier district one level up (they are in pre-order).
+    fn parents(ds: &[District]) -> Vec<usize> {
+        let mut parent = vec![usize::MAX; ds.len()];
+        for i in 1..ds.len() {
+            let mut p = i - 1;
+            while ds[p].depth + 1 != ds[i].depth {
+                p -= 1;
+            }
+            parent[i] = p;
+        }
+        parent
+    }
+
+    /// A sub-district lies inside its parent with at least the kerb to every edge, and sibling districts are at
+    /// least a street apart.
+    #[test]
+    fn sub_districts_stand_inside_their_parent_with_streets_between() {
+        let l = layout("city", &city());
+        let ds = &l.districts;
+        let parent = parents(ds);
+        let pad = PAD - 1e-6;
+        for i in 1..ds.len() {
+            let (c, p) = (&ds[i], &ds[parent[i]]);
+            assert!(c.x - c.w / 2.0 >= p.x - p.w / 2.0 + pad && c.x + c.w / 2.0 <= p.x + p.w / 2.0 - pad, "{}", c.label);
+            assert!(c.z - c.d / 2.0 >= p.z - p.d / 2.0 + pad && c.z + c.d / 2.0 <= p.z + p.d / 2.0 - pad, "{}", c.label);
+            for j in i + 1..ds.len() {
+                if parent[j] == parent[i] {
+                    let s = &ds[j];
+                    let gx = (c.x - s.x).abs() - (c.w + s.w) / 2.0;
+                    let gz = (c.z - s.z).abs() - (c.d + s.d) / 2.0;
+                    assert!(gx >= GAP - 1e-6 || gz >= GAP - 1e-6, "{} and {} overlap", c.label, s.label);
+                }
+            }
+        }
+    }
+
+    /// An empty package chain above the only package collapses into one district named like the package.
+    #[test]
+    fn single_child_package_chains_are_collapsed() {
         let l = layout("city", &[ty("com.acme.shop", "Cart", 2)]);
-        let labels: Vec<&str> = l.districts.iter().map(|d| d.label.as_str()).collect();
-        assert_eq!(labels, vec!["city", "com.acme.shop"]);
+        assert_eq!(labels(&l), ["city", "com.acme.shop"]);
+        assert_eq!(ids(&l), ["", "com.acme.shop"]);
+    }
+
+    /// A packed district comes out roughly square, not as a long row or column.
+    #[test]
+    fn city_is_roughly_square() {
+        // A fixed permutation of 0..399 (37 is coprime with 400), so the input is not in size order.
+        let types: Vec<TypeInfo> = (0..400).map(|i| i * 37 % 400).map(|k| ty("p", &format!("T{k}"), k % 7)).collect();
+        let l = layout("city", &types);
+        let aspect = l.width / l.depth;
+        assert!((0.5..=2.0).contains(&aspect), "aspect {aspect}");
+    }
+
+    /// The lots as "x z side district" strings, sorted: the set of places regardless of which type got which.
+    fn sorted_lots(l: &Layout) -> Vec<String> {
+        let mut v: Vec<String> = l.lots.values().map(|a| format!("{} {} {} {}", a.x, a.z, a.side, a.district)).collect();
+        v.sort();
+        v
+    }
+
+    fn district_key(l: &Layout) -> Vec<String> {
+        l.districts.iter().map(|d| format!("{:?}", d)).collect()
+    }
+
+    /// The same input always gives exactly the same city. Another input order gives the same districts and the same
+    /// set of lots; only equally sized buildings may swap places, as the packer keeps their input order (the analysis
+    /// always hands the types over sorted by fqn).
+    #[test]
+    fn layout_is_deterministic() {
+        let a = layout("city", &city());
+        let again = layout("city", &city());
+        assert_eq!(district_key(&a), district_key(&again));
+        let mut fqns: Vec<&String> = a.lots.keys().collect();
+        fqns.sort();
+        for f in fqns {
+            assert_eq!(format!("{:?}", a.lots[f]), format!("{:?}", again.lots[f]));
+        }
+        let mut reversed = city();
+        reversed.reverse();
+        let b = layout("city", &reversed);
+        assert_eq!(district_key(&a), district_key(&b));
+        assert_eq!((a.width, a.depth), (b.width, b.depth));
+        assert_eq!(sorted_lots(&a), sorted_lots(&b));
+    }
+
+    /// The footprint side is `1.2 + 0.8 * sqrt(noa)`: 1.2 without attributes.
+    #[test]
+    fn footprint_grows_with_the_square_root_of_the_attributes() {
+        for (noa, side) in [(0, 1.2), (1, 2.0), (4, 2.8), (9, 3.6)] {
+            assert!((side_of_noa(noa) - side).abs() < 1e-12, "{noa}");
+        }
+    }
+
+    /// Without types the city is a single bare platform: just the kerb on both sides, centred on the origin.
+    #[test]
+    fn empty_city_is_one_bare_district() {
+        let l = layout("city", &[]);
+        assert_eq!(l.districts.len(), 1);
+        let d = &l.districts[0];
+        assert_eq!((d.id.as_str(), d.label.as_str(), d.depth, d.x, d.z, d.w, d.d, d.types), ("", "city", 0, 0.0, 0.0, 2.0 * PAD, 2.0 * PAD, 0));
+        assert!(l.lots.is_empty());
+        assert_eq!((l.width, l.depth), (2.0 * PAD, 2.0 * PAD));
+    }
+
+    /// Districts come in pre-order (each after its parent, siblings in packing order: larger first), with their
+    /// depth, their package as id and the number of types in their whole subtree. `e.f.g` has an empty `f` in
+    /// between, which is folded into `f.g`.
+    #[test]
+    fn districts_are_pre_order_with_depths_ids_and_subtree_type_counts() {
+        let l = layout("city", &city());
+        assert_eq!(labels(&l), ["city", "a", "b", "c", "d", "e", "f.g"]);
+        assert_eq!(ids(&l), ["", "a", "a.b", "a.b.c", "a.d", "e", "e.f.g"]);
+        assert_eq!(depths(&l), [0, 1, 2, 3, 2, 1, 2]);
+        assert_eq!(l.districts.iter().map(|d| d.types).collect::<Vec<_>>(), [300, 200, 100, 50, 50, 100, 50]);
+    }
+
+    /// A collapsed chain is joined with its language's own separator: "/" for TypeScript, "::" for Rust.
+    #[test]
+    fn collapsed_chains_join_with_their_language_separator() {
+        let ts = layout("city", &[ty_in(Language::TypeScript, "", "src/ui/forms", "F", 0)]);
+        assert_eq!(labels(&ts), ["city", "src/ui/forms"]);
+        assert_eq!(ids(&ts), ["", "src/ui/forms"]);
+        let rust = layout("city", &[ty_in(Language::Rust, "", "net::http", "Get", 0)]);
+        assert_eq!(labels(&rust), ["city", "net::http"]);
+        assert_eq!(ids(&rust), ["", "net::http"]);
+    }
+
+    /// A package that holds types itself is not folded into its only sub-package.
+    #[test]
+    fn district_with_own_types_is_not_folded() {
+        let l = layout("city", &[ty("a", "A", 0), ty("a.b", "B", 0)]);
+        assert_eq!(labels(&l), ["city", "a", "b"]);
+        assert_eq!(ids(&l), ["", "a", "a.b"]);
+        assert_eq!((l.lots["a.A"].district, l.lots["a.b.B"].district), (1, 2));
+    }
+
+    /// With several build modules, each gets a district on the first level ("(root)" for the root module ""), whose
+    /// id starts with `module:`; a module is never folded into its parent nor with its only child, though the chains
+    /// below it are.
+    #[test]
+    fn modules_get_their_own_district_and_are_never_folded() {
+        let l = layout("city", &[ty_in(Language::Java, "core", "x.y", "X", 0), ty_in(Language::Java, "", "z", "Z", 0)]);
+        assert_eq!(labels(&l), ["city", "(root)", "z", "core", "x.y"]);
+        assert_eq!(ids(&l), ["", "module:(root)", "module:(root)/z", "module:core", "module:core/x.y"]);
+        assert_eq!(depths(&l), [0, 1, 2, 1, 2]);
+        assert_eq!(l.lots["x.y.X"].district, 4);
+    }
+
+    /// With a single build module there is no module level: the packages sit directly on the city.
+    #[test]
+    fn single_module_has_no_module_level() {
+        let l = layout("city", &[ty_in(Language::Java, "core", "x.y", "X", 0), ty_in(Language::Java, "core", "x.w", "W", 0)]);
+        assert_eq!(labels(&l), ["city", "x", "w", "y"]);
+        assert_eq!(ids(&l), ["", "x", "x.w", "x.y"]);
+    }
+
+    /// Types outside any package stand in "(default)" (Java's default package) or "(root)" (TypeScript, Rust).
+    #[test]
+    fn types_outside_a_package_stand_in_a_default_district() {
+        let l = layout("city", &[ty_in(Language::Java, "", "", "J", 0), ty_in(Language::TypeScript, "", "", "T", 0), ty_in(Language::Rust, "", "", "R", 0)]);
+        // "(root)" holds two buildings, so it is packed (and listed) first.
+        assert_eq!(labels(&l), ["city", "(root)", "(default)"]);
+        assert_eq!(ids(&l), ["", "(root)", "(default)"]);
+        assert_eq!((l.lots["J"].district, l.lots["T"].district, l.lots["R"].district), (2, 1, 1));
+    }
+
+    /// Lots sized for a larger attribute count (as the history replay does with a type's largest count) are placed
+    /// exactly as if the types had that count, but each building keeps its own footprint, centred in its lot.
+    #[test]
+    fn larger_lots_centre_the_buildings_own_footprint() {
+        let own = [ty("p", "A", 0), ty("p", "B", 1), ty("q", "C", 4)];
+        let grown = [ty("p", "A", 9), ty("p", "B", 4), ty("q", "C", 4)];
+        let wide = layout_with_noa("city", &own, |t| match t.noa { 0 => 9, 1 => 4, n => n });
+        let reference = layout("city", &grown);
+        assert_eq!(district_key(&wide), district_key(&reference));
+        for t in &own {
+            let (w, g) = (&wide.lots[&t.fqn], &reference.lots[&t.fqn]);
+            assert!((w.x - g.x).abs() < 1e-9 && (w.z - g.z).abs() < 1e-9, "{}", t.fqn);
+            assert!((w.side - side_of_noa(t.noa)).abs() < 1e-12, "{}", t.fqn);
+            assert_eq!(w.district, g.district);
+        }
+    }
+
+    /// Pins the packer on a tiny case: the bigger building goes first at the back-left corner, the smaller one in
+    /// front of it (a wider strip would put it beside, but the score ties and the narrower strip wins), and the city
+    /// is centred on the origin.
+    #[test]
+    fn two_buildings_have_exact_coordinates() {
+        let l = layout("city", &[ty("p", "A", 0), ty("p", "B", 9)]);
+        assert_eq!((round(l.width), round(l.depth)), (7.6, 9.6));
+        let p = &l.districts[1];
+        assert_eq!([round(p.x), round(p.z), round(p.w), round(p.d)], [0.0, 0.0, 5.6, 7.6]);
+        let (b, a) = (&l.lots["p.B"], &l.lots["p.A"]);
+        assert_eq!([round(b.x), round(b.z), round(b.side), round(b.y)], [0.0, -1.0, 3.6, 0.8]);
+        assert_eq!([round(a.x), round(a.z), round(a.side), round(a.y)], [-1.2, 2.2, 1.2, 0.8]);
     }
 }

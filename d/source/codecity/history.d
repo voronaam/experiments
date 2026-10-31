@@ -290,8 +290,9 @@ private Snapshot[] readSnapshots(string top, string[] shas)
 ///
 /// `rev-list --missing=print` lists the missing objects (lines starting with `?`) without fetching them; they are
 /// passed to one `git fetch --stdin` (which takes object names as refspecs). The noop negotiation skips the
-/// have/want exchange, which is pointless here. Errors are ignored: git can still fetch lazily afterwards.
-private void prefetchMissing(string top)
+/// have/want exchange, which is pointless here. Errors are ignored: git can still fetch lazily afterwards. Package
+/// visibility for the tests (`codecity.github_tests`).
+package void prefetchMissing(string top)
 {
     import std.process : Config, pipe, spawnProcess, wait;
     import std.stdio : File;
@@ -376,50 +377,85 @@ unittest
     foreach (i; 1 .. s.length) assert(s[i] > s[i - 1]);
 }
 
-unittest
+version (unittest)
 {
-    // The shared replay scenario of all three editions: three commits with fixed names, e-mails and dates.
-    //   1. src/A.java: class A with one method
-    //   2. adds src/B.java (class B, two methods); A gets a second method
-    //   3. deletes B; A gets a field
-    import codecity.city : CityModel;
-    import codecity.github : GitHubInfo;
+    /// Runs one of the shared fixture scripts of `src/test/resources` (next to the Java edition's tests, three levels
+    /// above this file) in a new temporary directory and returns its real path; the caller removes it.
+    /// `history-three-commits.sh`: A appears, B appears and A grows a method, B is deleted and A gains a field.
+    private string fixtureRepo(string script)
+    {
+        import std.path : buildNormalizedPath;
+        import std.process : Config, execute;
+        import std.uuid : randomUUID;
+        const dir = buildPath(tempDir, "codecity-history-test-" ~ randomUUID.toString);
+        mkdirRecurse(dir);
+        const path = buildNormalizedPath(__FILE_FULL_PATH__.dirName, "..", "..", "..", "src", "test", "resources", script);
+        const r = execute(["sh", path], null, Config.none, size_t.max, dir);
+        assert(r.status == 0, r.output);
+        return realPath(dir);
+    }
+
+    /// Author time of commit `n` of history-replay-repo.sh: midnight UTC, one day apart from 2020-01-01.
+    private long day(long n) { return 1_577_836_800 + (n - 1) * 86_400; }
+
+    /// The JSON text of the entry with this id in the model's `"districts"` or `"buildings"` array: from its opening
+    /// brace up to the next entry. Every edition slices the JSON the same way, so the assertions read alike.
+    private string entry(string json, string array, string id)
+    {
+        const from = json.indexOf(`"` ~ array ~ `":[`);
+        assert(from >= 0, array);
+        const at = json.indexOf(`{"id":"` ~ id ~ `",`, from);
+        assert(at >= 0, "no entry " ~ id);
+        const next = json.indexOf(`{"id":`, at + 1);
+        return json[at .. next < 0 ? $ : next];
+    }
+
+    private CityModel replay(string root, bool includeTests, uint samples)
+    {
+        import codecity.city : CityModel;
+        import codecity.github : GitHubInfo;
+        auto model = CityModel.build(new SourceAnalyzer, root, includeTests, true, false, GitHubInfo.init, samples);
+        assert(model.snapshots.length > 0);
+        return model;
+    }
+
+    private string[] ids(CityModel model)
+    {
+        import std.algorithm : sort;
+        string[] result;
+        foreach (ref b; model.buildings) result ~= model.analysis.types[b.index].fqn;
+        result.sort();
+        return result;
+    }
+
+    private size_t[] snapshotTypes(CityModel model)
+    {
+        size_t[] result;
+        foreach (s; model.snapshots) result ~= s.types;
+        return result;
+    }
+}
+
+version (unittest) import codecity.city : Building, CityModel;
+
+unittest // replaysThreeCommits: the shared scenario (the Java and Rust editions assert the same)
+{
     import codecity.layout : side;
-    import std.process : Config, execute;
-    import std.uuid : randomUUID;
-    const dir = buildPath(tempDir, "codecity-history-test-" ~ randomUUID.toString);
-    mkdirRecurse(dir);
-    scope (exit) rmdirRecurse(dir);
-    const script = `set -e
-export GIT_AUTHOR_NAME=Ada GIT_AUTHOR_EMAIL=ada@example.com GIT_COMMITTER_NAME=Ada GIT_COMMITTER_EMAIL=ada@example.com
-commit() { GIT_AUTHOR_DATE="$1 +0000" GIT_COMMITTER_DATE="$1 +0000" git -c commit.gpgsign=false commit -q -m "$2"; }
-git init -q .
-mkdir src
-echo 'class A { void a() {} }' > src/A.java
-git add -A; commit 2020-01-01T00:00:00 "add A"
-echo 'class A { void a() {} void b() {} }' > src/A.java
-echo 'class B { void x() {} void y() {} }' > src/B.java
-git add -A; commit 2020-01-02T00:00:00 "add B"
-echo 'class A { int f; void a() {} void b() {} }' > src/A.java
-git rm -q src/B.java
-git add -A; commit 2020-01-03T00:00:00 "drop B"
-`;
-    assert(execute(["sh", "-c", script], null, Config.none, size_t.max, dir).status == 0);
-    const root = realPath(dir);
-    auto model = CityModel.build(new SourceAnalyzer, root, true, true, false, GitHubInfo.init, defaultSamples);
+    const root = fixtureRepo("history-three-commits.sh");
+    scope (exit) rmdirRecurse(root);
+    auto model = replay(root, true, defaultSamples);
 
     // three commits, fewer than 60: all of them, oldest first
     assert(model.snapshots.length == 3);
     const shas = (cast(string) bytes(root, "rev-list", "--reverse", "HEAD")).strip.split('\n');
     foreach (k, s; model.snapshots)
     {
-        assert(s.commit == shas[k] && s.author == "Ada");
+        assert(s.commit == shas[k] && s.author == "Ann Author");
         assert(s.time == 1_577_836_800 + 86_400 * k);
     }
-    assert(model.snapshots[0].subject == "add A" && model.snapshots[2].subject == "drop B");
-    size_t[] typeCounts;
-    foreach (s; model.snapshots) typeCounts ~= s.types;
-    assert(typeCounts == [1, 2, 1]);
+    assert(model.snapshots[0].subject == "add A" && model.snapshots[1].subject == "add B"
+        && model.snapshots[2].subject == "drop B");
+    assert(snapshotTypes(model) == [1, 2, 1]);
 
     // A exists today; B only in the second snapshot, so it is gone but still part of the city
     assert(model.buildings.length == 2);
@@ -431,6 +467,8 @@ git add -A; commit 2020-01-03T00:00:00 "drop B"
     assert(a.hist.last == [1_577_836_800, 1_577_923_200, 1_578_009_600]);
     // B's file was touched by commits 2 and 3 (its deletion), but only commit 2 is at or before snapshot 2
     assert(b.hist.commits == [0, 1, 0] && b.hist.last == [-1, 1_577_923_200, -1]);
+    // the gone type keeps its last version's file, mapped back into the analysed root
+    assert(b.file == "src/B.java");
     // the stats count only today's types
     assert(model.stats.types == 1);
     // the building has its actual size: today's side(1) for A, side(0) as last seen for B
@@ -441,11 +479,184 @@ git add -A; commit 2020-01-03T00:00:00 "drop B"
     assert(model.districts.length == 2);
     foreach (d; model.districtHist) assert(d == [true, true, true]);
 
-    import std.algorithm : canFind;
     const json = model.json;
+    assert(json.canFind(`"hist":{"nom":[1,2,2],"noa":[0,0,1],"loc":[1,1,1],"cx":[1,2,2],"commits":[1,2,3],"authors":[1,1,1],"last":[1577836800,1577923200,1578009600]}`));
     assert(json.canFind(`"hist":{"nom":[-1,2,-1],"noa":[-1,0,-1],"loc":[-1,1,-1],"cx":[-1,2,-1],"commits":[0,1,0],"authors":[0,1,0],"last":[-1,1577923200,-1]},"gone":true}`));
-    assert(json.canFind(`"hist":[1,1,1]}`));
-    assert(json.canFind(`"history":{"snapshots":[{"commit":"` ~ shas[0] ~ `","time":1577836800,"author":"Ada","subject":"add A","types":1}`));
+    assert(json.canFind(`"history":{"snapshots":[{"commit":"` ~ shas[0] ~ `","time":1577836800,"author":"Ann Author","subject":"add A","types":1}`));
+    assert(json.canFind(`"types":1,"hist":[1,1,1]}`));
+    // "gone" only on B
+    import std.algorithm : count;
+    assert(json.count(`"gone":true`) == 1);
+}
+
+unittest // noHistoryWithoutGit: with git turned off (--no-git) there is no history, even in a repository
+{
+    import codecity.github : GitHubInfo;
+    const root = fixtureRepo("history-three-commits.sh");
+    scope (exit) rmdirRecurse(root);
+    auto model = CityModel.build(new SourceAnalyzer, root, true, false, false, GitHubInfo.init, defaultSamples);
+    assert(model.snapshots.length == 0 && !model.json.canFind(`"hist"`));
+}
+
+unittest // noHistoryOutsideGit: without a work tree there is no history, and the city is the normal one
+{
+    import codecity.github : GitHubInfo;
+    import std.uuid : randomUUID;
+    const dir = buildPath(tempDir, "codecity-history-test-" ~ randomUUID.toString);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    write(buildPath(dir, "A.java"), "class A {}");
+    auto model = CityModel.build(new SourceAnalyzer, realPath(dir), true, true, false, GitHubInfo.init, defaultSamples);
+    assert(model.snapshots.length == 0 && !model.json.canFind(`"hist"`));
+    assert(model.buildings.length == 1);
+}
+
+unittest // noHistoryWithoutCommits: a repository without any commit has nothing to replay either
+{
+    import codecity.github : GitHubInfo;
+    import std.process : Config, execute;
+    import std.uuid : randomUUID;
+    const dir = buildPath(tempDir, "codecity-history-test-" ~ randomUUID.toString);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    assert(execute(["git", "init", "-q", "--template=", "."], null, Config.none, size_t.max, dir).status == 0);
+    write(buildPath(dir, "A.java"), "class A {}");
+    auto model = CityModel.build(new SourceAnalyzer, realPath(dir), true, true, false, GitHubInfo.init, defaultSamples);
+    assert(model.snapshots.length == 0 && !model.json.canFind(`"hist"`));
+}
+
+unittest // samplingFormulaEdgeCases: one commit, M = N, N = 2, a true half rounds up, M = N + 1, a long history
+{
+    assert(sampleIndices(0, 60) == []);
+    assert(sampleIndices(1, 60) == [0]);
+    assert(sampleIndices(2, 2) == [0, 1]);
+    assert(sampleIndices(3, 2) == [0, 2]);
+    assert(sampleIndices(100_000, 2) == [0, 99_999]);
+    // k(m-1)/(n-1) = 1.5 rounds up to 2
+    assert(sampleIndices(4, 3) == [0, 2, 3]);
+    assert(sampleIndices(6, 4) == [0, 2, 3, 5]);
+    // one commit more than snapshots: exactly one is skipped, in the middle
+    auto oneMore = sampleIndices(61, 60);
+    assert(oneMore.length == 60 && oneMore[59] == 60 && !oneMore.canFind(30));
+    auto most = sampleIndices(100_000, maxSamples);
+    assert(most.length == 500 && most[0] == 0 && most[499] == 99_999);
+    foreach (i; 1 .. most.length) assert(most[i] > most[i - 1]);
+    assert(defaultSamples == 60 && minSamples == 2 && maxSamples == 500);
+}
+
+// ------------------------------------------------------------------ rules, on history-replay-repo.sh
+
+unittest // theCityIsTheUnionOfAllSnapshots: gone types, a type that comes back, stats of today's types
+{
+    const root = fixtureRepo("history-replay-repo.sh");
+    scope (exit) rmdirRecurse(root);
+    auto model = replay(root, true, defaultSamples);
+    assert(snapshotTypes(model) == [4, 5, 3, 4]);
+    assert(ids(model) == ["A", "ATest", "C", "D", "O", "p.P"]);
+    const json = model.json;
+    const c = entry(json, "buildings", "C");
+    assert(c.canFind(`"hist":{"nom":[-1,0,-1,1],"noa":[-1,0,-1,0],`), c);
+    assert(!c.canFind(`"gone"`));
+    const d = entry(json, "buildings", "D");
+    assert(d.canFind(`"nom":[-1,0,-1,-1]`) && d.canFind(`"gone":true`), d);
+    const p = entry(json, "buildings", "p.P");
+    assert(p.canFind(`"file":"src/p/P.java"`) && p.canFind(`"nom":[0,-1,-1,-1]`) && p.canFind(`"gone":true`), p);
+    assert(model.stats.types == 4);
+}
+
+unittest // gitActivityIsCountedUpToEachSnapshot: by author time; 0, 0, -1 where the type does not exist
+{
+    const root = fixtureRepo("history-replay-repo.sh");
+    scope (exit) rmdirRecurse(root);
+    auto model = replay(root, true, defaultSamples);
+    long[] times;
+    string[] authors;
+    foreach (s; model.snapshots)
+    {
+        times ~= s.time;
+        authors ~= s.author;
+    }
+    assert(times == [day(1), day(2), day(3), day(4)]);
+    assert(authors == ["Ann Author", "Bob Builder", "Ann Author", "Cid Coder"]);
+    const json = model.json;
+    assert(entry(json, "buildings", "A").canFind(`"commits":[1,2,2,2],"authors":[1,2,2,2],"last":[`
+        ~ day(1).to!string ~ "," ~ day(2).to!string ~ "," ~ day(2).to!string ~ "," ~ day(2).to!string ~ "]}"));
+    assert(entry(json, "buildings", "C").canFind(`"commits":[0,1,0,3],"authors":[0,1,0,3],"last":[-1,`
+        ~ day(2).to!string ~ ",-1," ~ day(4).to!string ~ "]}"));
+}
+
+unittest // districtHistoryFollowsItsBuildings: "p" holds an existing building in the first snapshot only
+{
+    const root = fixtureRepo("history-replay-repo.sh");
+    scope (exit) rmdirRecurse(root);
+    const json = replay(root, true, defaultSamples).json;
+    assert(entry(json, "districts", "p").canFind(`"types":0,"hist":[1,0,0,0]}`));
+    assert(entry(json, "districts", "(default)").canFind(`"types":4,"hist":[1,1,1,1]}`));
+    assert(entry(json, "districts", "").canFind(`"types":4,"hist":[1,1,1,1]}`));
+}
+
+unittest // lotsFitTheWidestVersion: A shrinks from 3 attributes to 1; its lot is reserved for side(3)
+{
+    import codecity.layout : gap, side;
+    import std.algorithm : max;
+    import std.math : abs;
+    const root = fixtureRepo("history-replay-repo.sh");
+    scope (exit) rmdirRecurse(root);
+    auto model = replay(root, true, defaultSamples);
+    const(Building)* a;
+    foreach (ref b; model.buildings) if (model.analysis.types[b.index].fqn == "A") a = &b;
+    assert(a.hist.noa == [3, 1, 1, 1]);
+    assert(abs(a.lot.side - side(1)) < 1e-9);
+    const reserved = side(3);
+    bool touches;
+    foreach (ref b; model.buildings)
+    {
+        if (b.index == a.index || b.lot.district != a.lot.district) continue;
+        const gapX = abs(a.lot.x - b.lot.x) - (reserved + b.lot.side) / 2;
+        const gapZ = abs(a.lot.z - b.lot.z) - (reserved + b.lot.side) / 2;
+        assert(max(gapX, gapZ) >= gap - 1e-6, model.analysis.types[b.index].fqn);
+        // some neighbour must stand closer than the reserved margin, or the test could not tell the lots apart
+        touches |= max(gapX, gapZ) < gap + (reserved - side(1)) / 2 - 1e-6;
+    }
+    assert(touches, "a neighbour stands next to A's reserved lot");
+}
+
+unittest // samplingKeepsBothEndsAndDropsTypesInBetween: two snapshots; D, only in between, is not in the city
+{
+    const root = fixtureRepo("history-replay-repo.sh");
+    scope (exit) rmdirRecurse(root);
+    auto model = replay(root, true, 2);
+    assert(model.snapshots.length == 2);
+    assert(model.snapshots[0].subject == "one" && model.snapshots[1].subject == "four");
+    assert(model.snapshots[0].commit == (cast(string) bytes(root, "rev-list", "--max-parents=0", "HEAD")).strip);
+    assert(model.snapshots[1].commit == (cast(string) bytes(root, "rev-parse", "HEAD")).strip);
+    assert(ids(model) == ["A", "ATest", "C", "O", "p.P"]);
+    const json = model.json;
+    assert(entry(json, "buildings", "C").canFind(`"nom":[-1,1],`));
+    assert(entry(json, "buildings", "C").canFind(`"commits":[0,3],`));
+    assert(entry(json, "buildings", "p.P").canFind(`"nom":[0,-1],`));
+    assert(entry(json, "buildings", "A").canFind(`"commits":[1,2],`));
+}
+
+unittest // testsAreLeftOutOfEverySnapshot: ATest, in a test directory, is in no snapshot without tests
+{
+    const root = fixtureRepo("history-replay-repo.sh");
+    scope (exit) rmdirRecurse(root);
+    auto model = replay(root, false, defaultSamples);
+    assert(snapshotTypes(model) == [3, 4, 2, 3]);
+    assert(ids(model) == ["A", "C", "D", "O", "p.P"]);
+}
+
+unittest // aSubDirectoryReplaysOnlyItsFiles: other/O.java never appears; paths relative to the sub-directory
+{
+    const top = fixtureRepo("history-replay-repo.sh");
+    scope (exit) rmdirRecurse(top);
+    auto model = replay(buildPath(top, "src"), true, defaultSamples);
+    assert(snapshotTypes(model) == [3, 4, 2, 3]);
+    assert(ids(model) == ["A", "ATest", "C", "D", "p.P"]);
+    const json = model.json;
+    assert(entry(json, "buildings", "p.P").canFind(`"file":"p/P.java"`));
+    assert(entry(json, "buildings", "A").canFind(`"commits":[1,2,2,2],`));
 }
 
 unittest

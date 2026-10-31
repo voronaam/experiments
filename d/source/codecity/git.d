@@ -10,7 +10,7 @@
 module codecity.git;
 
 import codecity.model : FileHistory;
-import core.time : seconds;
+import core.time : Duration, seconds;
 import std.conv : to;
 import std.path : buildNormalizedPath;
 import std.process : Config, kill, pipe, Pid, spawnProcess, tryWait, wait;
@@ -79,6 +79,26 @@ string executable(string name)
     }
 }
 
+/// `executable` without the cache, with `PATH` and `PATHEXT` (Windows) read from `env`. Test seam: the tests resolve
+/// fake programs (`gh`, a hanging `git`) on a `PATH` of their own with the production rules, without touching the
+/// process environment or the cache.
+package string lookup(string name, scope string delegate(string) env)
+{
+    import std.array : split;
+    version (Windows)
+    {
+        auto pathext = env("PATHEXT").strip;
+        const extensions = (pathext.length ? pathext : ".COM;.EXE;.BAT;.CMD").split(";");
+        enum windows = true;
+    }
+    else
+    {
+        const string[] extensions = [""];
+        enum windows = false;
+    }
+    return findProgram(name, env("PATH"), extensions, windows);
+}
+
 /// The first `<dir>/<name><extension>` that is a regular file (and, unless `windows`, executable), for the entries
 /// `dir` of `path` (split at the system's path separator) in order and each of `extensions`; null when there is none.
 /// Empty and relative entries (".", "bin", "") are skipped, so the current directory is never searched. The other
@@ -141,8 +161,10 @@ string run(string dir, string[] args...)
 /// it cannot be started, exits with an error or takes longer than `timeout`. stderr is discarded, so it can neither
 /// fill an unread pipe nor end up in the result. stdout is read with `poll` against the deadline, so the limit also
 /// covers a command that hangs while keeping stdout open: it is then killed. `env` and `config` are passed on to
-/// `spawnProcess` (added variables, or with `Config.newEnv` the whole environment).
-string output(string[] cmd, const string[string] env = null, Config config = Config.none)
+/// `spawnProcess` (added variables, or with `Config.newEnv` the whole environment). `limit` replaces `timeout` (test
+/// seam: the tests check the kill with a limit of a fraction of a second).
+string output(string[] cmd, const string[string] env = null, Config config = Config.none,
+    Duration limit = timeout)
 {
     import core.stdc.errno : errno, EINTR;
     import core.sys.posix.poll : poll, pollfd, POLLIN;
@@ -154,7 +176,7 @@ string output(string[] cmd, const string[string] env = null, Config config = Con
     {
         auto p = pipe();
         pid = spawn(cmd, p.writeEnd, env, config);
-        const deadline = MonoTime.currTime + timeout;
+        const deadline = MonoTime.currTime + limit;
         bool timedOut()
         {
             if (MonoTime.currTime < deadline) return false;
@@ -532,4 +554,119 @@ git -c commit.gpgsign=false commit -q -m b --author="$(printf 'x <x\377@example.
     assert(history.length == 2);
     assert(history[buildNormalizedPath(top, "A.java")].commits == 1);
     assert(history[buildNormalizedPath(top, "B\uFFFD.java")].authors == 1);
+}
+
+// ------------------------------------------------------------------ mining, on git-log-repo.sh (shared with the Java
+// GitHistoryTest and the Rust git.rs tests, with the same expectations)
+
+version (unittest)
+{
+    /// Author time of commit `n` (1-based) of git-log-repo.sh: midnight UTC, one day apart from 2020-01-01.
+    private long day(long n) { return 1_577_836_800 + (n - 1) * 86_400; }
+
+    /// Builds the shared git-log-repo.sh history (next to the Java edition's tests, three levels above this file) in a
+    /// new temporary directory and returns its real path; the caller removes it.
+    private string mined()
+    {
+        import std.file : mkdirRecurse, tempDir;
+        import std.path : buildPath, dirName;
+        import std.process : Config, execute;
+        import std.uuid : randomUUID;
+        const dir = buildPath(tempDir, "codecity-git-" ~ randomUUID.toString);
+        mkdirRecurse(dir);
+        const script = buildNormalizedPath(__FILE_FULL_PATH__.dirName, "..", "..", "..", "src", "test", "resources",
+            "git-log-repo.sh");
+        const r = execute(["sh", script], null, Config.none, size_t.max, dir);
+        assert(r.status == 0, r.output);
+        return realPath(dir);
+    }
+
+    /// (commits, authors, last commit, first commit) of one file, to compare in one assertion.
+    private long[4] stats(FileHistory h) { return [h.commits, h.authors, h.lastCommit, h.firstCommit]; }
+}
+
+unittest // countsCommitsAuthorsAndFirstAndLastAuthorTime: four commits by three authors on A.java; merges do not count
+{
+    import std.file : rmdirRecurse;
+    const top = mined();
+    scope (exit) rmdirRecurse(top);
+    auto h = load(top);
+    assert(stats(h[buildNormalizedPath(top, "A.java")]) == [4, 3, day(4), day(1)]);
+    assert(stats(h[buildNormalizedPath(top, "r/lib.rs")]) == [3, 2, day(5), day(1)]);
+}
+
+unittest // mailmapMergesAnAuthorsAddresses: %aE applies .mailmap, so Ann's old address counts as Ann
+{
+    import std.algorithm : map, sort;
+    import std.array : array;
+    import std.file : rmdirRecurse;
+    const top = mined();
+    scope (exit) rmdirRecurse(top);
+    Touch[][string] touches;
+    auto h = load(top, &touches);
+    assert(h[buildNormalizedPath(top, "A.java")].authors == 3);
+    auto list = touches[buildNormalizedPath(top, "A.java")].dup;
+    auto times = list.map!(t => t.time).array.sort.array;
+    assert(times == [day(1), day(2), day(3), day(4)]);
+    auto authors = list.map!(t => t.author).array.sort.array;
+    assert(authors == ["ann@example.com", "ann@example.com", "bob@example.com", "cid@example.com"]);
+}
+
+unittest // mergeCommitsAreExcluded: M.java is changed only by the merge commit, which does not count
+{
+    import std.file : rmdirRecurse;
+    const top = mined();
+    scope (exit) rmdirRecurse(top);
+    assert(stats(load(top)[buildNormalizedPath(top, "M.java")]) == [1, 1, day(1), day(1)]);
+}
+
+unittest // renamesStartAFreshHistory: the old path keeps its commits, the new one starts with the rename
+{
+    import std.file : rmdirRecurse;
+    const top = mined();
+    scope (exit) rmdirRecurse(top);
+    auto h = load(top);
+    assert(stats(h[buildNormalizedPath(top, "web/c.ts")]) == [2, 2, day(7), day(1)]);
+    assert(stats(h[buildNormalizedPath(top, "web/d.ts")]) == [1, 1, day(7), day(7)]);
+}
+
+unittest // onlySourceFilesAreListed: notes.txt and .mailmap are not
+{
+    import std.algorithm : map, sort;
+    import std.array : array;
+    import std.file : rmdirRecurse;
+    const top = mined();
+    scope (exit) rmdirRecurse(top);
+    auto keys = load(top).keys.sort.array;
+    assert(keys == ["A.java", "M.java", "r/lib.rs", "web/c.ts", "web/d.ts"].map!(p => buildNormalizedPath(top, p)).array);
+}
+
+unittest // aSubDirectoryLogsOnlyItsOwnFiles: keyed below the top of the work tree; author times, not committer times
+{
+    import std.algorithm : sort;
+    import std.array : array;
+    import std.file : rmdirRecurse;
+    const top = mined();
+    scope (exit) rmdirRecurse(top);
+    auto h = load(buildNormalizedPath(top, "web"));
+    assert(h.keys.sort.array == [buildNormalizedPath(top, "web/c.ts"), buildNormalizedPath(top, "web/d.ts")]);
+    assert(h[buildNormalizedPath(top, "web/d.ts")].lastCommit == day(7));
+}
+
+unittest // noHistoryOutsideGitOrWithoutCommits: no history, and no error
+{
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, write;
+    import std.path : buildPath;
+    import std.process : Config, execute;
+    import std.uuid : randomUUID;
+    const dir = buildPath(tempDir, "codecity-git-" ~ randomUUID.toString);
+    scope (exit) rmdirRecurse(dir);
+    const plain = buildPath(dir, "plain"), empty = buildPath(dir, "empty");
+    mkdirRecurse(plain);
+    mkdirRecurse(empty);
+    write(buildPath(plain, "A.java"), "class A {}");
+    assert(load(realPath(plain)).length == 0);
+    assert(execute(["git", "init", "-q", "--template=", "."], null, Config.none, size_t.max, empty).status == 0);
+    write(buildPath(empty, "A.java"), "class A {}");
+    assert(load(realPath(empty)).length == 0);
 }

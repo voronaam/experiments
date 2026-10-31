@@ -219,7 +219,7 @@ impl Scene {
     pub fn set_model(&mut self, model: &CityModel, palette: &Palette) {
         self.building_count = model.buildings.len();
         self.district_mask = None;
-        self.radius = ((model.width.hypot(model.depth) / 2.0) as f32).max(20.0);
+        self.radius = super::rules::radius(model.width, model.depth) as f32;
         let r = self.radius;
         // A ground square 14 radii across (7 from the centre to an edge; the app clamps the orbit distance to 6
         // radii). It sits 0.01 below y = 0 so it does not z-fight with the bottom face of the city platform.
@@ -329,7 +329,8 @@ impl Scene {
     /// merged into one mesh of thin tubes (one draw call); each also gets one particle that [`Scene::animate`] moves
     /// from the depending building to its dependency, so the flow shows the direction of the dependency.
     ///
-    /// Only arcs whose both ends are `visible` are kept, and of those at most 200 per direction are drawn.
+    /// Which arcs are drawn is decided by [`super::rules::arcs`]: only those whose both ends are `visible`, and of
+    /// those at most 200 per direction.
     ///
     /// ```text
     ///                 p1
@@ -340,16 +341,15 @@ impl Scene {
     /// ```
     pub fn show_arcs(&mut self, model: &CityModel, selected: Option<usize>, heights: &[f32], visible: impl Fn(usize) -> bool, night: bool) {
         self.clear_arcs();
-        // A hidden selection has no visible arcs at all.
-        let Some(sel) = selected.filter(|&s| visible(s)) else { return };
-        let b = &model.buildings[sel];
+        let Some(b) = selected.map(|s| &model.buildings[s]) else { return };
         // Total edge count before filtering and capping; above 40, thinner tubes are used (below).
         let total = b.deps.len() + b.incoming.len();
         // At night the arc colours are mixed 25% towards white.
         let boost = |c: Srgba| if night { look::mix(c, Srgba::WHITE, 0.25) } else { c };
-        let mut pairs: Vec<(usize, usize, Srgba)> = vec![];
-        pairs.extend(b.deps.iter().filter(|&&j| visible(j)).take(200).map(|&j| (sel, j, boost(look::rgb(look::OUT)))));
-        pairs.extend(b.incoming.iter().filter(|&&j| visible(j)).take(200).map(|&j| (j, sel, boost(look::rgb(look::IN)))));
+        let pairs: Vec<(usize, usize, Srgba)> = super::rules::arcs(Some(b), visible)
+            .into_iter()
+            .map(|a| (a.from, a.to, boost(look::rgb(if a.outgoing { look::OUT } else { look::IN }))))
+            .collect();
         if pairs.is_empty() {
             return;
         }
@@ -362,10 +362,9 @@ impl Scene {
             let p0 = Self::top(model, from, heights);
             let p2 = Self::top(model, to, heights);
             let dist = p0.distance(p2);
-            let mid = (p0 + p2) * 0.5;
-            let p1 = vec3(mid.x, p0.y.max(p2.y) + dist * 0.35 + 2.0, mid.z);
+            let p1 = super::rules::arc_control(p0, p2);
             // Tube "radius" (distance from the centre line to each ring vertex), growing slightly with length.
-            let r = if total > 40 { 0.03 } else { 0.055 } + dist * 0.0005;
+            let r = super::rules::arc_radius(total, dist);
             let base = positions.len() as u32;
             for k in 0..=SEGMENTS {
                 let t = k as f32 / SEGMENTS as f32;
@@ -399,7 +398,7 @@ impl Scene {
             // Speed in curve parameter per second: about 14 / 1.2 ≈ 12 world units per second measured along the
             // straight line, capped for short arcs (dist < 5 / 1.2) at 2.8 trips per second. The start position is a
             // deterministic hash of the pair, so particles on different arcs are not in lock-step.
-            self.arcs.push(Arc { p0, p1, p2, speed: 14.0 / (dist * 1.2).max(5.0), t: rand(from * 31 + to), color });
+            self.arcs.push(Arc { p0, p1, p2, speed: super::rules::particle_speed(dist), t: rand(from * 31 + to), color });
         }
         let mesh = CpuMesh {
             positions: Positions::F32(positions),

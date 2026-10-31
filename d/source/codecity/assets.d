@@ -3,8 +3,18 @@ module codecity.assets;
 
 enum indexHtml = import("index.html");
 enum appJs = import("app.js");
-enum walkJs = import("walk.js");
-enum replayJs = import("replay.js");
+/// The ES modules `app.js` imports (`import … from './name.js'`), as (file name, source): each is served at `/name.js`
+/// and inlined by `codecity.htmlexport` as a `data:` URL in the import map. A new module must be added here (and in
+/// the Java and Rust editions' lists); a unittest in `codecity.htmlexport` checks that every import of app.js is listed.
+immutable string[2][] modules = [
+    ["walk.js", import("walk.js")],
+    ["replay.js", import("replay.js")],
+    ["text.js", import("text.js")],
+    ["metrics.js", import("metrics.js")],
+    ["search.js", import("search.js")],
+    ["city.js", import("city.js")],
+    ["prefs.js", import("prefs.js")],
+];
 enum styleCss = import("style.css");
 enum faviconSvg = import("favicon.svg");
 
@@ -62,10 +72,16 @@ bool asset(string path, out string contentType, out string body_)
     {
     case "/", "/index.html": contentType = "text/html; charset=utf-8"; body_ = servedIndexHtml; return true;
     case "/app.js": contentType = "text/javascript; charset=utf-8"; body_ = appJs; return true;
-    case "/walk.js": contentType = "text/javascript; charset=utf-8"; body_ = walkJs; return true;
-    case "/replay.js": contentType = "text/javascript; charset=utf-8"; body_ = replayJs; return true;
     case "/style.css": contentType = "text/css; charset=utf-8"; body_ = styleCss; return true;
     case "/favicon.svg": contentType = "image/svg+xml"; body_ = faviconSvg; return true;
-    default: return false;
+    default:
+        foreach (m; modules)
+            if (path.length > 1 && path[1 .. $] == m[0])
+            {
+                contentType = "text/javascript; charset=utf-8";
+                body_ = m[1];
+                return true;
+            }
+        return false;
     }
 }

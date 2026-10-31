@@ -38,6 +38,9 @@ import codecity.gui.imgui;
 import codecity.gui.look;
 import codecity.gui.math;
 import codecity.gui.png : encode;
+import codecity.gui.prefs : Prefs;
+import codecity.gui.replay : caption, localDate, metricAt, Replay, replayColorMetric, sideAt;
+import codecity.gui.rules;
 import codecity.gui.renderer;
 import codecity.gui.source;
 import walk = codecity.gui.walk;
@@ -58,7 +61,6 @@ import std.path : buildPath, dirName;
 import std.process : browse, environment;
 import std.stdio : stderr, writeln;
 import std.string : fromStringz, indexOf, toLower, toStringz, strip;
-import std.uri : encodeComponent;
 
 /// Vertical field of view of the orbit camera (42°); `camera` hands it to both the projection and `pick`. Walk mode
 /// uses `walk.fov` instead.
@@ -190,91 +192,7 @@ private ImFont* addFont(ImFontAtlas* atlas, immutable(ubyte)[] data, float size)
     return ImFontAtlas_AddFontFromMemoryTTF(atlas, copy, cast(int) data.length, size, null, null);
 }
 
-// ------------------------------------------------------------------ preferences (shared with the Rust edition)
-
-/// Viewer preferences, saved as JSON to `$XDG_CONFIG_HOME/codecity/desktop.json` (default `~/.config/...`) after
-/// every change. The Rust edition reads and writes the same file with the same keys and value names, so a choice made
-/// in one desktop viewer carries over to the other. A missing or unreadable file, or unknown values, leave the
-/// defaults in place.
-private struct Prefs
-{
-    HeightMetric height = HeightMetric.nom;
-    /// Whether the user ever chose a colour metric. Without one, the default depends on the model (churn when there is
-    /// git history, complexity otherwise; see `App.setModel`).
-    bool hasColor;
-    ColorMetric color;
-    Theme theme = Theme.day;
-    bool tests = true, labels = true, beacons = true, shadows = true;
-
-    // The names stored in the file, in enum order. They are the Rust edition's enum variant names, so do not change
-    // them without changing both editions.
-    static immutable string[4] heightNames = ["Nom", "Loc", "Cx", "Noa"];
-    static immutable string[8] colorNames = ["Commits", "Age", "Authors", "Prs", "Cx", "Density", "Loc", "Kind"];
-
-    static string path()
-    {
-        const xdg = environment.get("XDG_CONFIG_HOME", "");
-        return buildPath(xdg.length ? xdg : buildPath(environment.get("HOME", "."), ".config"), "codecity", "desktop.json");
-    }
-
-    static Prefs load()
-    {
-        Prefs p;
-        try
-        {
-            auto v = parseJSON(readText(path()));
-            string s(string k) { auto x = k in v; return x && x.type == JSONType.string ? x.str : null; }
-            // a present key that is not `true` (false, null, anything else) counts as false
-            bool b(string k, bool d) { auto x = k in v; return x ? x.type == JSONType.true_ : d; }
-            foreach (i, n; heightNames) if (s("height") == n) p.height = cast(HeightMetric) i;
-            foreach (i, n; colorNames)
-                if (s("color") == n)
-                {
-                    p.color = cast(ColorMetric) i;
-                    p.hasColor = true;
-                }
-            p.theme = s("theme") == "night" ? Theme.night : Theme.day;
-            p.tests = b("tests", true);
-            p.labels = b("labels", true);
-            p.beacons = b("beacons", true);
-            p.shadows = b("shadows", true);
-        }
-        catch (Exception) {}
-        return p;
-    }
-
-    void save() const
-    {
-        JSONValue v = [
-            "height": JSONValue(heightNames[height]),
-            "color": hasColor ? JSONValue(colorNames[color]) : JSONValue(null),
-            "theme": JSONValue(theme == Theme.night ? "night" : "day"),
-            "tests": JSONValue(tests), "labels": JSONValue(labels), "beacons": JSONValue(beacons), "shadows": JSONValue(shadows),
-        ];
-        try
-        {
-            mkdirRecurse(path().dirName);
-            write(path(), v.toString);
-        }
-        catch (Exception) {}
-    }
-}
-
 // ------------------------------------------------------------------ the app
-
-/// The orbit camera: it always looks at `target` from `distance` away. `yaw` is the angle around the vertical axis (0
-/// puts the camera on the +z side, i.e. in front of the city) and `pitch` the elevation above the horizon, both in
-/// radians.
-private struct Orbit
-{
-    Vec3 target;
-    float yaw = 0.6f, pitch = 0.62f, distance = 100;
-
-    Vec3 position() const
-    {
-        return target + Vec3(cos(pitch) * sin(yaw), sin(pitch), cos(pitch) * cos(yaw)) * distance;
-    }
-}
 
 /// One dependency arc for the particle animation: the quadratic Bézier's control points, the particle's speed (curve
 /// parameter per second) and its current position `t` in 0..1, and its colour.
@@ -356,7 +274,6 @@ private final class App
     /// Type indices of the buildings with open pull requests (they get a beacon).
     size_t[] beaconBuildings;
     /// A district name drawn as a floating pill at a world position; `district` indexes `model.districts`.
-    struct Label { string text; Vec3 at; size_t district; }
     Label[] labels;
     SourceView source;
     bool sourceShown;
@@ -391,21 +308,18 @@ private final class App
     /// started (for the fading hint). While walking the cursor is captured (`GLFW_CURSOR_DISABLED`) and ImGui ignores
     /// mouse and keyboard (`ConfigFlags_NoMouse` / `NoKeyboard`); `handleWalk` polls GLFW directly instead.
     bool walking;
-    walk.Walker walker;
-    Orbit walkOrbit;
-    double walkStart = 0;
+    Walking session;
+    /// The first-person player of the walk in progress.
+    ref inout(walk.Walker) walker() inout return { return session.walker; }
     /// Cursor position of the previous walking frame (mouse look uses the difference); `walkMouseValid` is false on
     /// the first frame after capturing, whose position jump must not turn the view.
     double walkMouseX, walkMouseY;
     bool walkMouseValid;
 
-    /// History replay: whether it is on and playing, and the playback position `replayPos`, continuous in
-    /// 0..S−1 over the S snapshots (`model.snapshots`); one snapshot per 0.8 s at 1×, times `replaySpeeds[replaySpeed]`.
-    bool replaying, replayPlaying;
-    double replayPos = 0;
-    size_t replaySpeed;
-    static immutable double[4] replaySpeeds = [1, 2, 4, 0.5];
-    static immutable string[4] replaySpeedLabels = ["1×", "2×", "4×", "0.5×"];
+    /// History replay: whether it is on, and the playback state (position, playing, speed; see
+    /// `codecity.gui.replay`) over the snapshots `model.snapshots`.
+    bool replaying;
+    Replay replay;
     /// The present-day height scale (metric units → world units), fixed while replaying so that growth shows as
     /// growth instead of being renormalised per snapshot; recomputed only when the height metric or test toggle
     /// changes.
@@ -457,15 +371,14 @@ private final class App
         selected = hovered = -1;
         // the preferred colour metric if this model supports it (git / GitHub data present), else a sensible default;
         // the preference itself is kept for the next model
-        colorMetric = prefs.hasColor && unavailable(prefs.color, model) is null ? prefs.color
-            : model.hasGit ? ColorMetric.commits : ColorMetric.cx;
+        colorMetric = effectiveColor(prefs.hasColor, prefs.color, model.hasGit, model.hasPulls);
         const n = model.buildings.length;
         heights = new float[n];
         sides = new float[n];
         foreach (i, ref b; model.buildings) sides[i] = cast(float) b.lot.side;
         geometryDirty = true;
         foreach (i; 0 .. n) heights[i] = oldHeights.get(model.analysis.types[model.buildings[i].index].fqn, 0);
-        radius = max(20.0f, cast(float)((model.width ^^ 2 + model.depth ^^ 2) ^^ 0.5 / 2));
+        radius = cast(float) cityRadius(model.width, model.depth);
         beaconBuildings = null;
         foreach (ref b; model.buildings) if (b.prs.length) beaconBuildings ~= b.index;
         applyPalette();
@@ -522,7 +435,7 @@ private final class App
     bool districtShown(size_t i) const
     {
         if (replaying) return model.districtHist[i][replayIndex];
-        return !model.hasHistory || model.districts[i].types > 0;
+        return presentDistrict(model.districts[i], model.hasHistory);
     }
 
     /// Chooses the district labels: the largest districts first (by platform area), only nesting depth 1 and 2 (the
@@ -532,25 +445,7 @@ private final class App
     /// of its platform.
     void buildLabels()
     {
-        double[2][] anchors;
-        labels = null;
-        size_t taken;
-        // sorted by index, so the label can remember its district (for hiding it during the replay)
-        size_t[] order;
-        foreach (i; 0 .. model.districts.length) order ~= i;
-        order.sort!((a, b) => model.districts[a].w * model.districts[a].d > model.districts[b].w * model.districts[b].d, SwapStrategy.stable);
-        foreach (index; order)
-        {
-            const d = model.districts[index];
-            if (d.depth < 1 || d.depth > 2 || d.types == 0) continue;
-            if (taken++ >= 24) break;
-            const front = d.z + d.d / 2;
-            bool crowded = anchors.length >= 16;
-            foreach (a; anchors) if (abs(a[0] - d.x) < 8 && abs(a[1] - front) < 3) crowded = true;
-            if (crowded) continue;
-            anchors ~= [d.x, front];
-            labels ~= Label(d.label, Vec3(cast(float) d.x, cast(float)((d.depth + 1) * platform + 0.2), cast(float) front), index);
-        }
+        labels = chooseLabels(model.districts);
     }
 
     /// Recomputes the target heights for the current height metric and starts the animation towards them: from 0
@@ -586,13 +481,11 @@ private final class App
     {
         double[] values;
         foreach (i, ref t; model.analysis.types) if (visibleToday(i)) values ~= heightValue(prefs.height, t);
-        values.sort();
-        const p95 = max(1.0, values.length ? values[min(cast(size_t)(0.95 * (values.length - 1)), values.length - 1)] : 1.0);
-        return clamp(radius * 0.2, 8.0, 16.0) / p95;
+        return codecity.gui.rules.heightScale(values, radius);
     }
 
     /// The height of a building whose metric value is `value`, on scale `s`.
-    float toHeight(double value, double s) const { return cast(float) min(0.35 + value * s, radius * 0.75); }
+    float toHeight(double value, double s) const { return cast(float) buildingHeight(value, s, radius); }
 
     /// The heights buildings will have once the running animation ends (the current ones if none is running); arcs and
     /// the selection marker use these so they do not need to follow the animation.
@@ -608,27 +501,18 @@ private final class App
     void recolor()
     {
         const replayColors = replaying && model.hasHistory;
-        scale = Scale.of(replayColors && colorMetric == ColorMetric.prs ? ColorMetric.commits : colorMetric, model);
+        scale = Scale.of(replayColors ? replayColorMetric(colorMetric) : colorMetric, model);
         const shown = replayColors ? replayIndex : 0;
         const at = replayColors ? model.snapshots[shown].time : 0;
         const p = palette(prefs.theme);
-        bool[size_t] related;
-        if (selected >= 0)
-        {
-            related[selected] = true;
-            foreach (d; model.buildings[selected].deps) related[d] = true;
-            foreach (d; model.buildings[selected].incoming) related[d] = true;
-        }
+        const(Building)* focus = selected >= 0 ? &model.buildings[selected] : null;
         colors.length = model.buildings.length;
         foreach (ref b; model.buildings)
         {
             auto c = replayColors ? scale.colorAt(model.analysis.types[b.index], b, shown, at)
                 : scale.color(model.analysis.types[b.index], b);
             const outOfSearch = searching && b.index !in matches;
-            const outOfFocus = selected >= 0 && b.index !in related;
-            if (outOfSearch || outOfFocus) c = mix(c, p.dim, 0.8);
-            if (b.index == hovered && b.index != selected) c = mix(c, RGB(255, 255, 255), 0.3);
-            colors[b.index] = c;
+            colors[b.index] = shade(c, p.dim, outOfSearch, !related(focus, b.index), b.index == hovered && b.index != selected);
         }
         buildingsDirty = true;
     }
@@ -693,10 +577,9 @@ private final class App
             {
                 const p0 = top(from), p2 = top(to);
                 const dist = p0.distance(p2);
-                const mid = (p0 + p2) * 0.5f;
-                const p1 = Vec3(mid.x, max(p0.y, p2.y) + dist * 0.35f + 2, mid.z);
+                const p1 = arcControl(p0, p2);
                 // tube radius: thinner when there are many arcs, slightly thicker for long ones so they stay visible
-                const r = (total > 40 ? 0.03f : 0.055f) + dist * 0.0005f;
+                const r = arcRadius(total, dist);
                 enum segments = 24;
                 Vec3[4][segments + 1] rings;
                 foreach (k; 0 .. segments + 1)
@@ -723,15 +606,11 @@ private final class App
                 import std.random : uniform01;
                 // speed in curve parameter per second: about 14 / 1.2 ≈ 12 units of straight-line distance per second
                 // on long arcs, at most 2.8 trips per second on short ones; a random start spreads the particles out
-                arcs ~= Arc(p0, p1, p2, 14 / max(5.0f, dist * 1.2f), uniform01!float, color);
+                arcs ~= Arc(p0, p1, p2, particleSpeed(dist), uniform01!float, color);
             }
-            if (visible(selected))
-            {
-                size_t count;
-                foreach (j; b.deps) if (visible(j) && count++ < 200) add(selected, j, tint(outColor));
-                count = 0;
-                foreach (j; b.incoming) if (visible(j) && count++ < 200) add(j, selected, tint(inColor));
-            }
+            // which arcs: see `codecity.gui.rules.arcs`
+            foreach (a; codecity.gui.rules.arcs(b, (size_t j) => visible(j)))
+                add(a.from, a.to, tint(a.outgoing ? outColor : inColor));
         }
         renderer.setArcs(vertices);
         if (arcs.length == 0) renderer.setParticles(null);
@@ -742,7 +621,7 @@ private final class App
     void frameAll(bool animate)
     {
         if (animate) fly(Vec3(0, 0, 0), radius * 2.6f);
-        else orbit = Orbit(Vec3(0, 0, 0), 0.6f, 0.62f, radius * 2.6f);
+        else orbit = Orbit.framing(radius);
     }
 
     /// Starts a 0.9 s camera flight to `target` / `distance` (see `frame`).
@@ -781,28 +660,17 @@ private final class App
     /// All matches are highlighted in the city; the best 12 are listed in the drop-down.
     void runSearch()
     {
-        const q = search.strip.toLower;
         matches = null;
         results = null;
-        if (q.length < 2)
+        if (utf16Length(search.strip.toLower) < minQuery)
         {
             searching = false;
             recolor();
             return;
         }
-        struct Scored { size_t i; int score; size_t len; }
-        Scored[] scored;
-        foreach (i, ref t; model.analysis.types)
-        {
-            if (!visible(i)) continue;
-            const name = t.name.toLower;
-            int score = name == q ? 0 : name.indexOf(q) == 0 ? 1 : name.canFind(q) ? 2 : t.fqn.toLower.canFind(q) ? 3 : -1;
-            if (score >= 0) scored ~= Scored(i, score, name.length);
-        }
-        // ties keep type order (the sort is not stable by itself), like the stable sorts of the other viewers
-        scored.sort!((a, b) => a.score != b.score ? a.score < b.score : a.len != b.len ? a.len < b.len : a.i < b.i);
-        foreach (s; scored) matches[s.i] = true;
-        foreach (s; scored[0 .. min(12, $)]) results ~= s.i;
+        const hits = codecity.gui.rules.search(search, model.analysis.types, (size_t i) => visible(i));
+        foreach (i; hits.ranked) matches[i] = true;
+        results = hits.ranked[0 .. min(maxResults, $)].dup;
         searching = true;
         recolor();
     }
@@ -842,11 +710,8 @@ private final class App
     /// percent-encoded separately so the slashes survive. File and blame links jump to the type's line range.
     string githubLink(string kind, size_t i)
     {
-        auto gh = &model.github;
         auto t = &model.analysis.types[i];
-        string enc(string p) { string[] parts; foreach (s; p.split("/")) parts ~= encodeComponent(s); return parts.join("/"); }
-        const url = format("%s/%s/%s/%s", gh.repo.webUrl, kind, enc(gh.gitRef), enc(gh.prefix ~ model.buildings[i].file));
-        return kind == "commits" ? url : format("%s#L%d-L%d", url, t.line, t.endLine);
+        return codecity.gui.rules.githubLink(model.github, kind, model.buildings[i].file, t.line, t.endLine);
     }
 
     /// Opens `url` in the default browser; failures become a toast. Only https:// links are opened (see
@@ -886,12 +751,7 @@ private final class App
 
         if (replaying)
         {
-            if (replayPlaying)
-            {
-                const last = model.snapshots.length - 1.0;
-                replayPos = min(replayPos + dt * replaySpeeds[replaySpeed] / 0.8, last);
-                if (replayPos >= last) replayPlaying = false; // stops (paused) at the last snapshot
-            }
+            replay.advance(dt); // stops (paused) at the last snapshot
             applyReplay();
         }
         else if (animationStart >= 0)
@@ -1180,7 +1040,7 @@ private final class App
     /// halves up.
     size_t replayIndex() const
     {
-        return min(cast(size_t) floor(replayPos + 0.5), model.snapshots.length - 1);
+        return replay.snapshot;
     }
 
     void toggleReplay()
@@ -1196,8 +1056,7 @@ private final class App
         if (replaying || !model.hasHistory) return;
         replayHeightScale = heightScale();
         replaying = true;
-        replayPlaying = true;
-        replayPos = 0;
+        replay = Replay.start(model.snapshots.length);
         replayApplied = double.nan;
         replayShown = -1;
         animationStart = -1;
@@ -1210,7 +1069,8 @@ private final class App
     void exitReplay()
     {
         if (!replaying) return;
-        replaying = replayPlaying = false;
+        replaying = false;
+        replay.playing = false;
         foreach (i, ref b; model.buildings) sides[i] = cast(float) b.lot.side;
         uploadDistricts();
         reheight(false);
@@ -1223,15 +1083,13 @@ private final class App
     /// Play / pause; playing from the last snapshot starts over from the first.
     void togglePlay()
     {
-        if (!replayPlaying && replayPos >= model.snapshots.length - 1) replayPos = 0;
-        replayPlaying = !replayPlaying;
+        replay.toggle();
     }
 
     /// Jumps to position `p` and pauses.
     void seek(double p)
     {
-        replayPos = clamp(p, 0.0, model.snapshots.length - 1.0);
-        replayPlaying = false;
+        replay.seek(p);
     }
 
     /// Updates the scene for the playback position, once per frame while replaying (and only when something
@@ -1242,22 +1100,19 @@ private final class App
     /// and arcs, which all show that one snapshot, are refreshed too.
     void applyReplay()
     {
-        if (replayPos == replayApplied) return;
-        replayApplied = replayPos;
-        const last = model.snapshots.length - 1;
-        const a = min(cast(size_t) floor(replayPos), last), b = min(a + 1, last);
-        const f = replayPos - a;
+        if (replay.p == replayApplied) return;
+        replayApplied = replay.p;
+        const at = replay.frame;
         foreach (i, ref bd; model.buildings)
         {
-            const va = heightValueAt(prefs.height, bd, a), vb = heightValueAt(prefs.height, bd, b);
-            if ((va < 0 && vb < 0) || (!prefs.tests && model.analysis.types[i].test))
+            double v;
+            if (!metricAt(bd.hist, prefs.height, at, v) || (!prefs.tests && model.analysis.types[i].test))
             {
                 heights[i] = sides[i] = 0;
                 continue;
             }
-            heights[i] = toHeight(max(va, 0.0) + (max(vb, 0.0) - max(va, 0.0)) * f, replayHeightScale);
-            const sa = bd.hist.exists(a) ? side(bd.hist.noa[a]) : 0, sb = bd.hist.exists(b) ? side(bd.hist.noa[b]) : 0;
-            sides[i] = cast(float)(sa + (sb - sa) * f);
+            heights[i] = toHeight(v, replayHeightScale);
+            sides[i] = cast(float) sideAt(bd.hist, at);
         }
         buildingsDirty = geometryDirty = true;
         if (replayShown != replayIndex)
@@ -1271,12 +1126,6 @@ private final class App
         else updateMarker();
     }
 
-    /// The local calendar date of a Unix time as YYYY-MM-DD.
-    static string localDate(long epoch)
-    {
-        const t = SysTime.fromUnixTime(epoch);
-        return format("%04d-%02d-%02d", t.year, cast(int) t.month, t.day);
-    }
 
     // -------------------------------------------------------------- walk mode
 
@@ -1285,23 +1134,9 @@ private final class App
     /// height and footprint (the replay changes both); districts hidden by the replay are left out. Rebuilt every walking frame, so growing or hidden buildings take effect on the next step.
     walk.World walkWorld()
     {
-        walk.World w;
-        w.halfWidth = cast(float) model.width / 2;
-        w.halfDepth = cast(float) model.depth / 2;
-        w.boxes.reserve(model.districts.length + model.buildings.length);
-        foreach (i, d; model.districts)
-            if (districtShown(i))
-                w.boxes ~= walk.Box(cast(float)(d.x - d.w / 2), cast(float)(d.z - d.d / 2), cast(float)(d.x + d.w / 2),
-                cast(float)(d.z + d.d / 2), 0, cast(float)((d.depth + 1) * platform));
-        foreach (ref b; model.buildings)
-        {
-            const h = heights[b.index];
-            if (h <= 0.001f || sides[b.index] <= 0.001f) continue;
-            const s = sides[b.index] / 2;
-            w.boxes ~= walk.Box(cast(float) b.lot.x - s, cast(float) b.lot.z - s, cast(float) b.lot.x + s,
-                cast(float) b.lot.z + s, cast(float) b.lot.y, cast(float) b.lot.y + h);
-        }
-        return w;
+        auto shown = new bool[model.districts.length];
+        foreach (i; 0 .. shown.length) shown[i] = districtShown(i);
+        return walk.World.of(model, heights, sides, shown);
     }
 
     void toggleWalk()
@@ -1319,16 +1154,9 @@ private final class App
         if (walking || window is null) return;
         flying = false;
         pressed = dragging = false;
-        walkOrbit = orbit;
         auto world = walkWorld();
-        if (selected >= 0)
-        {
-            auto b = &model.buildings[selected];
-            walker = walk.Walker.spawn(cast(float) b.lot.x, cast(float)(b.lot.z + b.lot.side / 2) + walk.radius + 0.2f, 0, world);
-        }
-        else walker = walk.Walker.spawn(orbit.target.x, orbit.target.z, orbit.yaw, world);
+        session = Walking.begin(world, selected >= 0 ? &model.buildings[selected].lot : null, orbit, time);
         walking = true;
-        walkStart = time;
         searchOpen = false;
         // Hide the cursor and lock it to the window; GLFW then reports unbounded virtual positions whose differences
         // are the mouse motion. Raw motion (no OS acceleration) where the platform has it.
@@ -1350,7 +1178,7 @@ private final class App
     {
         if (!walking) return;
         walking = false;
-        orbit = walkOrbit;
+        orbit = session.end();
         flying = false;
         glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
         if (glfwRawMouseMotionSupported()) glfwSetInputMode(window, GLFW_RAW_MOUSE_MOTION, GLFW_FALSE);
@@ -1568,8 +1396,8 @@ private final class App
             const last = model.snapshots.length - 1;
             if (igIsKeyPressed_Bool(ImGuiKey.P, false)) togglePlay();
             // the previous / next whole snapshot, from wherever between two snapshots the position is
-            if (igIsKeyPressed_Bool(ImGuiKey.Comma, true)) seek(max(0.0, ceil(replayPos) - 1));
-            if (igIsKeyPressed_Bool(ImGuiKey.Period, true)) seek(min(cast(double) last, floor(replayPos) + 1));
+            if (igIsKeyPressed_Bool(ImGuiKey.Comma, true)) replay.step(-1);
+            if (igIsKeyPressed_Bool(ImGuiKey.Period, true)) replay.step(1);
             if (igIsKeyPressed_Bool(ImGuiKey.Home, false)) seek(0);
             if (igIsKeyPressed_Bool(ImGuiKey.End, false)) seek(last);
         }
@@ -1785,7 +1613,7 @@ private final class App
         {
             foreach (i, label; colorLabels)
             {
-                const why = unavailable(cast(ColorMetric) i, model);
+                const why = missing(cast(ColorMetric) i, model.hasGit, model.hasPulls);
                 igBeginDisabled(why !is null);
                 if (igSelectable_Bool((label ~ why).toStringz, colorMetric == i, 0, ImVec2(0, 0)))
                 {
@@ -1916,9 +1744,8 @@ private final class App
         igSameLine(igGetWindowWidth() - 40, -1);
         if (igSmallButton(" × ")) select(-1, false);
         itemTooltip("Close (Esc)");
-        const pkg = t.pkg.length ? t.pkg : (t.language == Language.java ? "(default package)" : "(root)");
         igPushFont(mono, 12);
-        mutedText(pkg ~ (t.module_.length ? " · " ~ t.module_ : ""));
+        mutedText(packageLine(*t));
         igPopFont();
         badge(t.kind, kindColor(t.kind), true);
         igSameLine(0, 6);
@@ -1931,33 +1758,33 @@ private final class App
         if (b.gone)
         {
             igSpacing();
-            mutedText("Removed before today");
+            mutedText(removed);
         }
         if (replaying)
         {
-            // the details below stay today's (or, for a gone type, its last seen ones); this line gives the
-            // snapshot's values
+            // the details below stay today's (or, for a gone type, its last seen ones); this box gives the
+            // snapshot's values as four tiles, or says that the type does not exist there
             const k = replayIndex;
             igSpacing();
-            text("Replaying — values at " ~ localDate(model.snapshots[k].time));
-            small(b.hist.exists(k) ? format("%d methods · %d attributes · %s LOC · complexity %d", b.hist.nom[k],
-                b.hist.noa[k], fmt(b.hist.loc[k]), b.hist.cx[k]) : "not in this snapshot");
+            text(replayHeading(localDate(model.snapshots[k].time)));
+            const replayed = replayCells(*b, k);
+            if (replayed is null) small(notInSnapshot);
+            else if (igBeginTable("##replay-metrics", 4, TableFlags_SizingStretchSame, ImVec2(0, 0), 0))
+            {
+                foreach (c; replayed)
+                {
+                    igTableNextColumn();
+                    text(c[0]);
+                    small(c[1]);
+                }
+                igEndTable();
+            }
         }
         igSpacing();
         size_t[] uses, usedBy;
         foreach (j; b.deps) if (visible(j)) uses ~= j;
         foreach (j; b.incoming) if (visible(j)) usedBy ~= j;
-        string[2][] cells = [
-            [t.nom.to!string, "methods"], [t.noa.to!string, "attributes"], [fmt(t.loc), "lines of code"],
-            [t.complexity.to!string, "complexity"], [t.nom == 0 ? "0" : format("%.1f", cast(double) t.complexity / t.nom), "cx / method"],
-            [format("%d / %d", uses.length, usedBy.length), "uses / used by"],
-        ];
-        if (model.hasGit)
-        {
-            cells ~= [b.hasHistory ? b.history.commits.to!string : "0", "commits"];
-            cells ~= [b.hasHistory ? b.history.authors.to!string : "0", "authors"];
-            cells ~= [b.hasHistory ? relTime(b.history.lastCommit) : "—", "last change"];
-        }
+        const cells = metricCells(*t, *b, model.hasGit, uses.length, usedBy.length, now());
         if (igBeginTable("##metrics", 3, TableFlags_SizingStretchSame, ImVec2(0, 0), 0))
         {
             foreach (c; cells)
@@ -1999,14 +1826,13 @@ private final class App
                 {
                     auto pr = &model.github.pulls[k];
                     igPushID_Int(cast(int) k);
-                    const label = format("#%d  %s\n%s · %s · %d files%s", pr.number, pr.title, pr.author.length ? pr.author : "ghost",
-                        relTime(parseIso(pr.updatedAt)), pr.files.length, pr.draft ? " · draft" : "");
+                    const label = format("#%d  %s\n%s", pr.number, pr.title, prMeta(*pr, now()));
                     if (igSelectable_Bool(label.toStringz, false, 0, ImVec2(0, 0))) openUrl(pr.url);
                     itemTooltip(pr.url);
                     igPopID();
                 }
                 if (b.prs.length == 0)
-                    small(model.github.pullsSource.length >= 3 && model.github.pullsSource[0 .. 3] == "all" ? "none" : "none among the " ~ model.github.pullsSource);
+                    small(noPulls(model.github.pullsSource));
             }
         }
         if (b.methods.length)
@@ -2017,10 +1843,10 @@ private final class App
             uint maxCx = 1;
             foreach (m; b.methods) maxCx = max(maxCx, m.complexity);
             const width = igGetContentRegionAvail().x;
-            foreach (m; b.methods[0 .. min(15, $)])
+            foreach (m; b.methods[0 .. min(inspectorMethods, $)])
             {
                 igPushFont(mono, 12.5f);
-                text(m.name ~ (m.parameters ? "(…)" : "()"));
+                text(methodName(m.name, m.parameters));
                 igPopFont();
                 itemTooltip(format("line %d · %d LOC · %d params", m.line, m.loc, m.parameters));
                 const value = format("cx %d · %d loc", m.complexity, m.loc);
@@ -2036,7 +1862,7 @@ private final class App
             }
             // counted on `t.methods` like the section header: `b.methods` is capped at `maxMethods` (300) in
             // codecity.city
-            if (t.methods.length > 15) small(format("+ %d more", t.methods.length - 15));
+            if (const more = moreMethods(t.methods.length)) small(more);
         }
         foreach (pass; 0 .. 2)
         {
@@ -2108,23 +1934,19 @@ private final class App
             {
                 // the shown snapshot's values (picking only hovers buildings that exist in it)
                 const k = replayIndex;
-                const h = &b.hist;
-                row = format("%d methods · %d attrs · %s loc · cx %d · %d commits · at %s", h.nom[k], h.noa[k],
-                    fmt(h.loc[k]), h.cx[k], h.commits[k], localDate(model.snapshots[k].time));
+                row = replayTooltipRow(*b, k, localDate(model.snapshots[k].time));
             }
             else
             {
-                row = format("%d methods · %d attrs · %s loc · cx %d", t.nom, t.noa, fmt(t.loc), t.complexity);
-                if (b.hasHistory) row ~= format(" · %d commits", b.history.commits);
-                if (b.prs.length) row ~= format(" · %d open PR%s", b.prs.length, b.prs.length > 1 ? "s" : "");
+                row = tooltipRow(*t, *b);
             }
         }
         else if (hoveredDistrict >= 0 && model.districts[hoveredDistrict].depth > 0)
         {
-            auto d = model.districts[hoveredDistrict];
-            title = d.label;
-            sub = d.id.replace("module:", "");
-            row = format("%d types · double-click to zoom", d.types);
+            const card = districtTooltip(model.districts[hoveredDistrict], walking);
+            title = card[0];
+            sub = card[1];
+            row = card[2];
         }
         else return;
         igPushStyleColor_Vec4(Col.PopupBg, color(15, 23, 42, 236));
@@ -2229,7 +2051,7 @@ private final class App
             ImDrawList_AddRectFilled(list, ImVec2(cx - 8, cy - 0.75f), ImVec2(cx + 8, cy + 0.75f), c, 0, 0);
             ImDrawList_AddRectFilled(list, ImVec2(cx - 0.75f, cy - 8), ImVec2(cx + 0.75f, cy + 8), c, 0, 0);
             // the controls hint: fully visible for 5 s, then fading out over the sixth second
-            const alpha = cast(float) clamp(6 - (time - walkStart), 0.0, 1.0);
+            const alpha = cast(float) clamp(6 - (time - session.since), 0.0, 1.0);
             if (alpha > 0)
             {
                 igPushStyleVar_Float(StyleVar.Alpha, alpha);
@@ -2261,13 +2083,13 @@ private final class App
         igPushStyleVar_Float(StyleVar.WindowRounding, 12);
         igBegin("##timeline", null, fixedFlags | WindowFlags.AlwaysAutoResize | WindowFlags.NoScrollbar);
         if (igButton("##play", ImVec2(30, 26))) togglePlay();
-        itemTooltip(replayPlaying ? "Pause (P)" : "Play (P)");
+        itemTooltip(replay.playing ? "Pause (P)" : "Play (P)");
         {
             const lo = igGetItemRectMin(), hi = igGetItemRectMax();
             const cx = (lo.x + hi.x) / 2, cy = (lo.y + hi.y) / 2;
             auto dl = igGetWindowDrawList();
             const c = igColor(textColor);
-            if (replayPlaying)
+            if (replay.playing)
             {
                 ImDrawList_AddRectFilled(dl, ImVec2(cx - 5, cy - 6), ImVec2(cx - 1.5f, cy + 6), c, 1, 0);
                 ImDrawList_AddRectFilled(dl, ImVec2(cx + 1.5f, cy - 6), ImVec2(cx + 5, cy + 6), c, 1, 0);
@@ -2276,18 +2098,16 @@ private final class App
         }
         igSameLine(0, 10);
         igSetNextItemWidth(280);
-        float position = cast(float) replayPos;
+        float position = cast(float) replay.p;
         if (igSliderFloat("##position", &position, 0, cast(float)(model.snapshots.length - 1), "", SliderFlags_NoInput))
             seek(position);
         igSameLine(0, 12);
         // the subject cut to 60 characters (code points, not bytes, so a multi-byte character is never split)
-        auto subject = snap.subject.to!dstring;
-        const subjectText = subject.length > 60 ? (subject[0 .. 59] ~ "…"d).to!string : snap.subject;
-        text(format("%s · %s · %s — %s", localDate(snap.time), snap.commit[0 .. min(7, $)], subjectText, snap.author));
+        text(caption(*snap));
         // right-aligned: the window's right padding (14), Now (46), the gap (6) and the speed button (46)
         igSameLine(width - 14 - 46 - 6 - 46, -1);
-        if (igButton(replaySpeedLabels[replaySpeed].toStringz, ImVec2(46, 26)))
-            replaySpeed = (replaySpeed + 1) % replaySpeeds.length;
+        if (igButton(replay.speedLabel.toStringz, ImVec2(46, 26)))
+            replay.nextSpeed();
         itemTooltip("Playback speed");
         igSameLine(0, 6);
         if (igButton("Now", ImVec2(46, 26))) exitReplay();
@@ -2295,13 +2115,4 @@ private final class App
         igEnd();
         igPopStyleVar(1);
     }
-}
-
-/// Seconds since the epoch for an ISO-8601 UTC timestamp such as `2026-09-30T12:00:00Z`; 0 (shown as "—" by
-/// `relTime`) when it cannot be parsed.
-private long parseIso(string s)
-{
-    import std.datetime.systime : SysTime;
-    try return SysTime.fromISOExtString(s).toUnixTime;
-    catch (Exception) return 0;
 }

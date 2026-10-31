@@ -25,43 +25,20 @@ import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import * as Walk from './walk.js';
 import * as Replay from './replay.js';
+// The pure parts of the viewer (no three.js, no DOM), each tested with node --test (src/test/web):
+import * as Text from './text.js';
+import * as Metrics from './metrics.js';
+import * as Search from './search.js';
+import * as City from './city.js';
+import * as Prefs from './prefs.js';
 
 const $ = (sel) => document.querySelector(sel);
-const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-// Link targets come from the city data (the GitHub API's PR URLs, the repository URL); only https:// URLs become
-// links, anything else (javascript:, data:, file:, …) is replaced by an inert '#'. Still pass the result through esc.
-const httpsUrl = (u) => (/^https:\/\//i.test(String(u)) ? String(u) : '#');
-const fmt = (n) => (n >= 10000 ? (n / 1000).toFixed(n >= 100000 ? 0 : 1) + 'k' : n.toLocaleString());
+const { esc, fmt } = Text;
+const nowSec = () => Date.now() / 1000;
 
 // ---------------------------------------------------------------- metrics & palettes
 
-const RAMP = ['#2b6cb0', '#2a9fc0', '#34c3a5', '#8fd67a', '#e8e15b', '#f6b343', '#ef7d34', '#dc3f2e', '#a3123a'];
-const KINDS = {
-  class: '#6b8fc7', abstract: '#9a86d8', interface: '#2fb7a5', enum: '#e3a63b', record: '#d46fa8',
-  annotation: '#8a9aaa', struct: '#4f86c6', trait: '#26a69a', union: '#c98a3a', type: '#b7a3e0', module: '#7c8ba1',
-};
-const LANGUAGES = { java: 'Java', typescript: 'TypeScript', rust: 'Rust' };
-const DAY = 86400;
-const nowSec = () => Date.now() / 1000;
-
-const HEIGHT_METRICS = {
-  nom: { label: 'Methods (NOM)', get: (b) => b.nom },
-  loc: { label: 'Lines of code', get: (b) => b.loc },
-  cx: { label: 'Complexity (WMC)', get: (b) => b.cx },
-  noa: { label: 'Attributes (NOA)', get: (b) => b.noa },
-};
-
-const COLOR_METRICS = {
-  commits: { label: 'Churn (commits)', git: true, get: (b) => b.commits ?? 0, lo: 'stable', hi: 'hot spot' },
-  // `now` is the moment recency is measured from: the present, or the snapshot's commit time during replay.
-  age: { label: 'Recency', git: true, get: (b, now = nowSec()) => (b.last ? Math.max(0, (now - b.last) / DAY) : Infinity), invert: true, lo: 'dormant', hi: 'just changed', unit: 'd' },
-  authors: { label: 'Authors', git: true, get: (b) => b.authors ?? 0, lo: 'one owner', hi: 'many hands' },
-  prs: { label: 'Open pull requests', github: true, get: (b) => b.prs?.length ?? 0, lo: 'none', hi: 'contested' },
-  cx: { label: 'Complexity (WMC)', get: (b) => b.cx, lo: 'simple', hi: 'complex' },
-  density: { label: 'Complexity / method', get: (b) => (b.nom ? b.cx / b.nom : 0), linear: true, lo: 'flat', hi: 'branchy' },
-  loc: { label: 'Lines of code', get: (b) => b.loc, lo: 'small', hi: 'large' },
-  kind: { label: 'Type kind', categorical: true },
-};
+const { RAMP, HEIGHT_METRICS, COLOR_METRICS } = Metrics;
 
 const THEMES = {
   day: {
@@ -80,29 +57,23 @@ const THEMES = {
 
 // ---------------------------------------------------------------- state
 
-const prefs = loadPrefs();
+// Settings: heightKey, colorKey, theme, showTests, labels, ao, beacons (prefs.js).
 const state = {
   city: null,
-  heightKey: prefs.heightKey || 'nom',
-  colorKey: prefs.colorKey || null,
-  theme: prefs.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'night' : 'day'),
-  showTests: prefs.showTests ?? true,
-  labels: prefs.labels ?? true,
-  ao: prefs.ao ?? true,
-  beacons: prefs.beacons ?? true,
+  ...Prefs.initialSettings(loadPrefs(), matchMedia('(prefers-color-scheme: dark)').matches),
   selected: -1,
   hovered: -1,
   matches: null, // Set of building indices matching the search, or null
   incoming: [],
 };
 
+// Storage may be unavailable (private windows, blocked site data): then the settings are simply not kept.
 function loadPrefs() {
-  try { return JSON.parse(localStorage.getItem('codecity.prefs') || '{}'); } catch { return {}; }
+  try { return Prefs.parsePrefs(localStorage.getItem(Prefs.PREFS_KEY)); } catch { return {}; }
 }
 function savePrefs() {
   try {
-    const { heightKey, colorKey, theme, showTests, labels, ao, beacons } = state;
-    localStorage.setItem('codecity.prefs', JSON.stringify({ heightKey, colorKey, theme, showTests, labels, ao, beacons }));
+    localStorage.setItem(Prefs.PREFS_KEY, Prefs.serialisePrefs(state));
   } catch { /* storage unavailable */ }
 }
 
@@ -240,23 +211,11 @@ async function loadCity() {
   return res.json();
 }
 
-function quantile(values, q) {
-  const v = values.filter(Number.isFinite).sort((a, b) => a - b);
-  if (!v.length) return 0;
-  return v[Math.min(v.length - 1, Math.floor(q * (v.length - 1)))];
-}
-
 // A building is shown when the test filter allows it and it exists: in the present-day city that is every type that
 // is not gone, during replay every type of snapshot round(p). Search, arcs and the inspector's dependency lists follow
-// this rule.
+// this rule (city.js).
 function visible(b) {
-  if (!state.showTests && b.test) return false;
-  return replay ? Replay.exists(b, replay.r) : !b.gone;
-}
-
-// Visibility in the present-day city, whatever mode the viewer is in; the height and colour scales are based on it.
-function presentVisible(b) {
-  return (state.showTests || !b.test) && !b.gone;
+  return City.isVisible(b, state.showTests, replay ? replay.r : null);
 }
 
 // ---------------------------------------------------------------- building the city
@@ -301,9 +260,7 @@ function buildCity(city, { previousHeights = null } = {}) {
   buildingMesh.receiveShadow = true;
   cityGroup.add(buildingMesh);
 
-  const incoming = city.buildings.map(() => []);
-  city.buildings.forEach((b, i) => b.deps.forEach((j) => incoming[j].push(i)));
-  state.incoming = incoming;
+  state.incoming = City.incomingDeps(city.buildings);
 
   heights = { cur: new Float32Array(n), from: new Float32Array(n), to: new Float32Array(n), t0: 0, dur: 0 };
   city.buildings.forEach((b, i) => { heights.cur[i] = oldHeights.get(b.id) ?? 0; });
@@ -311,7 +268,7 @@ function buildCity(city, { previousHeights = null } = {}) {
   $('#btn-replay').hidden = !Replay.hasHistory(city);
 
   // Lights, shadows, fog and ground scale with the city.
-  cityRadius = Math.max(20, Math.hypot(city.width, city.depth) / 2);
+  cityRadius = City.cityRadius(city);
   const r = cityRadius;
   sun.position.set(r * 0.6, r * 1.4, r * 0.9);
   sun.target.position.set(0, 0, 0);
@@ -360,8 +317,7 @@ function writeDistrictMatrices() {
 }
 
 function districtShown(i) {
-  const d = state.city.districts[i];
-  return replay ? d.hist?.[replay.r] !== 0 : d.types > 0;
+  return City.districtShown(state.city.districts[i], replay ? replay.r : null);
 }
 
 // Labels the largest districts at depth 1–2 that hold types: in the present-day city those with present types, during
@@ -371,16 +327,9 @@ function buildLabels() {
   labelObjects = [];
   const city = state.city;
   const P = city.platform;
-  const candidates = city.districts
-    .map((d, i) => ({ d, i }))
-    .filter(({ d, i }) => d.depth >= 1 && d.depth <= 2 && (replay ? districtShown(i) : d.types > 0))
-    .sort((a, b) => b.d.w * b.d.d - a.d.w * a.d.d)
-    .slice(0, 24);
-  const anchors = [];
-  for (const { d, i } of candidates) {
-    // A district whose only content is one sub-district shares its front edge; label just one of them.
-    if (anchors.some((a) => Math.abs(a.x - d.x) < 8 && Math.abs(a.z - (d.z + d.d / 2)) < 3) || anchors.length >= 16) continue;
-    anchors.push({ x: d.x, z: d.z + d.d / 2 });
+  // Which districts get a label (city.js); outside replay districtShown is d.types > 0.
+  for (const i of City.labelledDistricts(city.districts, (d, k) => districtShown(k))) {
+    const d = city.districts[i];
     const el = document.createElement('div');
     el.className = 'district-label';
     el.textContent = d.name;
@@ -403,14 +352,11 @@ function setLabelsVisible(on) {
 // Height per unit of the height metric: the 95th percentile of the present-day city's visible buildings maps to 8–16
 // units, depending on the city's size. Replay keeps using this present-day scale, so the city visibly grows.
 function presentHeightScale() {
-  const metric = HEIGHT_METRICS[state.heightKey];
-  const values = state.city.buildings.filter(presentVisible).map(metric.get);
-  const p95 = Math.max(1, quantile(values, 0.95));
-  return Math.min(16, Math.max(8, cityRadius * 0.2)) / p95;
+  return Metrics.heightScale(state.city.buildings, state.heightKey, state.showTests, cityRadius);
 }
 
 function heightFor(value, scale) {
-  return Math.min(0.35 + value * scale, cityRadius * 0.75);
+  return Metrics.heightFor(value, scale, cityRadius);
 }
 
 /** Recomputes target heights for the current metric and animates the skyline towards them. */
@@ -467,9 +413,8 @@ function writeBuildingMatrices() {
 }
 
 function rampColor(t) {
-  const x = Math.min(1, Math.max(0, t)) * (RAMP.length - 1);
-  const i = Math.min(RAMP.length - 2, Math.floor(x));
-  return new THREE.Color(RAMP[i]).lerp(new THREE.Color(RAMP[i + 1]), x - i);
+  const { from, to, f } = Metrics.rampStop(t);
+  return new THREE.Color(from).lerp(new THREE.Color(to), f);
 }
 
 /**
@@ -479,21 +424,14 @@ function rampColor(t) {
  */
 function updateColors() {
   const { buildings } = state.city;
-  const key = replay && state.colorKey === 'prs' ? 'commits' : state.colorKey;
-  const metric = COLOR_METRICS[key];
+  const metric = COLOR_METRICS[Metrics.effectiveColorKey(state.colorKey, !!replay)];
   if (metric.categorical) {
-    baseColors = buildings.map((b) => new THREE.Color(KINDS[b.kind] || KINDS.class));
+    baseColors = buildings.map((b) => new THREE.Color(Metrics.kindColor(b.kind)));
     renderLegend({ categorical: true });
   } else {
     const present = buildings.map((b) => (b.gone ? NaN : metric.get(b)));
-    const finite = present.filter(Number.isFinite);
-    const hi = Math.max(metric.linear ? 1e-6 : 1, quantile(finite, 0.98));
-    const lo = finite.reduce((m, v) => Math.min(m, v), hi);
-    const norm = (v) => {
-      if (!Number.isFinite(v)) return metric.invert ? 0 : 1;
-      const t = metric.linear ? v / hi : Math.log1p(v) / Math.log1p(hi);
-      return metric.invert ? 1 - t : t;
-    };
+    const { lo, hi } = Metrics.colorScale(metric, present);
+    const norm = (v) => Metrics.normalise(metric, hi, v);
     let values = present;
     if (replay) {
       const time = replay.snapshots[replay.r].time;
@@ -511,12 +449,7 @@ function paintBuildings() {
   const dim = new THREE.Color(THEMES[state.theme].dim);
   const white = new THREE.Color(0xffffff);
   const sel = state.selected;
-  const related = new Set();
-  if (sel >= 0) {
-    related.add(sel);
-    state.city.buildings[sel].deps.forEach((j) => related.add(j));
-    state.incoming[sel].forEach((j) => related.add(j));
-  }
+  const related = City.related(sel, state.city.buildings, state.incoming);
   const c = new THREE.Color();
   baseColors.forEach((base, i) => {
     c.copy(base);
@@ -571,105 +504,30 @@ function applyTheme() {
 // ---------------------------------------------------------------- HUD
 
 function renderStats() {
-  const { stats, name } = state.city;
+  const { name } = state.city;
   $('#project-name').textContent = name;
   document.title = `${name} · CodeCity`;
-  const chips = [
-    [fmt(stats.types), 'types'],
-    [fmt(stats.packages), 'packages'],
-    [fmt(stats.methods), 'methods'],
-    [fmt(stats.loc), 'LOC'],
-  ].map(([v, l]) => `<span class="chip"><b>${v}</b><span>${l}</span></span>`);
-  const gh = state.city.github;
-  if (gh) {
-    const prs = gh.pulls ? ` · ${gh.pulls.length}${gh.pullsSource?.startsWith('all') ? '' : '+'} PRs` : '';
-    chips.unshift(`<a class="chip gh" href="${esc(httpsUrl(gh.url))}" target="_blank" rel="noopener" title="Open on GitHub${gh.pullsSource ? ' · ' + esc(gh.pullsSource) : ''}">${GH_MARK}<b>${esc(gh.owner)}/${esc(gh.repo)}</b><span>${prs}</span></a>`);
-  }
-  const langs = Object.entries(stats.languages || {});
-  if (langs.length) {
-    const total = langs.reduce((n, [, c]) => n + c, 0);
-    const label = langs.map(([l, c]) => langs.length > 1 ? `${LANGUAGES[l] || l} ${Math.round((c / total) * 100)}%` : (LANGUAGES[l] || l)).join(' · ');
-    chips.unshift(`<span class="chip"><span>${esc(label)}</span></span>`);
-  }
-  if (stats.failedFiles) chips.push(`<span class="chip warn" title="Files with syntax errors were partially analysed"><b>${stats.failedFiles}</b><span>parse errors</span></span>`);
-  $('#stats').innerHTML = chips.join('');
-}
-
-function metricUnavailable(m) {
-  if (m.git && !state.city.hasGit) return ' (no git)';
-  if (m.github && !state.city.github?.pulls) return ' (no GitHub)';
-  return '';
+  $('#stats').innerHTML = Text.statsHtml(state.city);
 }
 
 function populateSelects() {
-  const hasGit = state.city.hasGit;
-  if (!COLOR_METRICS[state.colorKey] || metricUnavailable(COLOR_METRICS[state.colorKey])) {
-    state.colorKey = hasGit ? 'commits' : 'cx';
-  }
+  // A stored metric that is unknown or unavailable for this city falls back to a default (metrics.js).
+  state.colorKey = Metrics.chooseColorKey(state.colorKey, state.city);
   const beacons = $('#opt-beacons');
   beacons.disabled = !state.city.github?.pulls?.length;
   beacons.closest('label').hidden = !state.city.github?.pulls;
-  if (!HEIGHT_METRICS[state.heightKey]) state.heightKey = 'nom';
-  $('#height-metric').innerHTML = Object.entries(HEIGHT_METRICS)
-    .map(([k, m]) => `<option value="${k}" ${k === state.heightKey ? 'selected' : ''}>${m.label}</option>`).join('');
-  $('#color-metric').innerHTML = Object.entries(COLOR_METRICS)
-    .map(([k, m]) => `<option value="${k}" ${k === state.colorKey ? 'selected' : ''} ${metricUnavailable(m) ? 'disabled' : ''}>${m.label}${metricUnavailable(m)}</option>`).join('');
+  state.heightKey = Metrics.chooseHeightKey(state.heightKey);
+  $('#height-metric').innerHTML = Text.heightOptionsHtml(HEIGHT_METRICS, state.heightKey);
+  $('#color-metric').innerHTML = Text.optionsHtml(COLOR_METRICS, state.colorKey, (m) => Metrics.metricUnavailable(m, state.city));
 }
 
 function renderLegend({ categorical, lo, hi, metric }) {
   const el = $('#legend');
   if (categorical) {
-    const present = new Set(state.city.buildings.map((b) => b.kind));
-    el.innerHTML = `<div class="swatches">${Object.entries(KINDS).filter(([k]) => present.has(k)).map(([k, c]) => `<span class="sw"><i style="background:${c}"></i>${k}</span>`).join('')}</div>`;
+    el.innerHTML = Text.kindLegendHtml(Metrics.presentKinds(state.city.buildings));
     return;
   }
-  const show = (v) => (metric.unit === 'd' ? `${Math.round(v)}d ago` : Number.isInteger(v) ? fmt(v) : v.toFixed(1));
-  const [left, right] = metric.invert ? [show(hi) + '+', show(lo)] : [show(lo), show(hi) + '+'];
-  el.innerHTML = `<div class="bar" style="background:linear-gradient(90deg,${RAMP.join(',')})"></div>
-    <div class="ends"><span>${left}</span><span>${right}</span></div>
-    <div class="ends"><span>${metric.lo}</span><span>${metric.hi}</span></div>`;
-}
-
-function relTime(epoch) {
-  if (!epoch) return '—';
-  const days = (nowSec() - epoch) / DAY;
-  if (days < 1) return 'today';
-  if (days < 30) return `${Math.round(days)}d ago`;
-  if (days < 365) return `${Math.round(days / 30)}mo ago`;
-  return `${(days / 365).toFixed(1)}y ago`;
-}
-
-const GH_MARK = '<svg class="gh-mark" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>';
-
-/** Permalink into the repository on GitHub for a building's file. */
-function githubLink(kind, b) {
-  const gh = state.city.github;
-  const enc = (p) => p.split('/').map(encodeURIComponent).join('/');
-  const path = enc(gh.prefix + b.file);
-  const ref = enc(gh.ref);
-  if (kind === 'history') return `${gh.url}/commits/${ref}/${path}`;
-  return `${gh.url}/${kind}/${ref}/${path}#L${b.line}-L${b.endLine}`;
-}
-
-function renderGitHubSection(b) {
-  const gh = state.city.github;
-  if (!gh) return '';
-  const links = `<div class="gh-links">
-      <a href="${esc(httpsUrl(githubLink('blob', b)))}" target="_blank" rel="noopener">${GH_MARK}File</a>
-      <a href="${esc(httpsUrl(githubLink('blame', b)))}" target="_blank" rel="noopener">Blame</a>
-      <a href="${esc(httpsUrl(githubLink('history', b)))}" target="_blank" rel="noopener">History</a>
-    </div>`;
-  if (!gh.pulls) return links;
-  const prs = (b.prs || []).map((k) => gh.pulls[k]);
-  return `${links}
-    <h3><span>Open pull requests</span><span>${prs.length}</span></h3>
-    <div class="prs">${prs.map((pr) => `
-      <a class="pr" href="${esc(httpsUrl(pr.url))}" target="_blank" rel="noopener">
-        <span class="pr-num">#${esc(pr.number)}</span>
-        <span class="pr-title">${esc(pr.title)}</span>
-        <span class="pr-meta">${esc(pr.author || 'ghost')} · ${relTime(Date.parse(pr.updatedAt) / 1000)} · ${esc(pr.files)} files${pr.draft ? ' · <i>draft</i>' : ''}</span>
-      </a>`).join('') || `<span class="muted">none${gh.pullsSource?.startsWith('all') ? '' : ' among the ' + esc(gh.pullsSource)}</span>`}
-    </div>`;
+  el.innerHTML = Text.rampLegendHtml(RAMP, metric, lo, hi);
 }
 
 function renderInspector() {
@@ -678,46 +536,14 @@ function renderInspector() {
   if (i < 0) { el.hidden = true; return; }
   const b = state.city.buildings[i];
   const hasGit = state.city.hasGit;
-  // b.methods is capped at 300 by the server; the method counts below use b.nom, which counts all of them.
-  const maxCx = Math.max(1, ...b.methods.map((m) => m[3]));
-  const metric = (v, l) => `<div class="metric"><b>${v}</b><span>${l}</span></div>`;
-  const depChip = (j, dir) => {
-    const d = state.city.buildings[j];
-    return `<span class="dep ${dir}" data-idx="${j}" title="${esc(d.id)}">${esc(d.name)}</span>`;
-  };
   const out = b.deps.filter((j) => visible(state.city.buildings[j]));
   const inc = state.incoming[i].filter((j) => visible(state.city.buildings[j]));
-  el.innerHTML = `
-    <div class="head">
-      <div><h2>${esc(b.name)}</h2><div class="pkg">${esc(b.pkg || (b.lang === 'java' ? '(default package)' : '(root)'))}${b.module ? ' · ' + esc(b.module) : ''}</div></div>
-      <button class="close" id="inspector-close" aria-label="Close">✕</button>
-    </div>
-    <div class="badges">
-      <span class="badge kind" style="background:${esc(KINDS[b.kind] || KINDS.class)}">${esc(b.kind)}</span>
-      <span class="badge">${esc(LANGUAGES[b.lang] || b.lang)}</span>
-      ${b.test ? '<span class="badge">test</span>' : ''}
-    </div>
-    <div class="metrics">
-      ${metric(b.nom, 'methods')}${metric(b.noa, 'attributes')}${metric(fmt(b.loc), 'lines of code')}
-      ${metric(b.cx, 'complexity')}${metric(b.nom ? (b.cx / b.nom).toFixed(1) : '0', 'cx / method')}
-      ${metric(out.length + ' / ' + inc.length, 'uses / used by')}
-      ${hasGit ? metric(b.commits ?? 0, 'commits') + metric(b.authors ?? 0, 'authors') + metric(relTime(b.last), 'last change') : ''}
-    </div>
-    <div id="inspector-replay"></div>
-    <div class="file-link"><span title="${esc(b.file)}:${b.line}">${esc(b.file)}:${b.line}</span>${live ? '<button id="view-source">Source</button>' : ''}</div>
-    ${renderGitHubSection(b)}
-    ${b.methods.length ? `<h3><span>Methods by complexity</span><span>${b.nom}</span></h3>
-    <div class="methods">${b.methods.slice(0, 15).map((m) => `
-      <div class="method" title="line ${m[1]} · ${m[2]} LOC · ${m[4]} params">
-        <span class="m-name">${esc(m[0])}(${m[4] ? '…' : ''})</span><span class="m-val">cx ${m[3]} · ${m[2]} loc</span>
-        <span class="m-bar"><i style="width:${(m[3] / maxCx) * 100}%;background:${rampColor(m[3] / Math.max(10, maxCx)).getStyle()}"></i></span>
-      </div>`).join('')}
-      ${b.nom > 15 ? `<span class="muted">+ ${b.nom - 15} more</span>` : ''}
-    </div>` : ''}
-    <h3><span>Uses</span><span>${out.length}</span></h3>
-    <div class="deps">${out.map((j) => depChip(j, 'out')).join('') || '<span class="muted">nothing in this project</span>'}</div>
-    <h3><span>Used by</span><span>${inc.length}</span></h3>
-    <div class="deps">${inc.map((j) => depChip(j, 'in')).join('') || '<span class="muted">no project types</span>'}</div>`;
+  el.innerHTML = Text.inspectorHtml(b, {
+    buildings: state.city.buildings, out, inc, hasGit, live, now: nowSec(),
+    kindColor: Metrics.kindColor(b.kind),
+    barColor: (t) => rampColor(t).getStyle(),
+    github: Text.githubSectionHtml(state.city.github, b, nowSec()),
+  });
   renderReplayNote();
   el.hidden = false;
   el.scrollTop = 0;
@@ -734,15 +560,7 @@ function renderReplayNote() {
   if (!replay || state.selected < 0) { el.innerHTML = ''; return; }
   const b = state.city.buildings[state.selected];
   const date = Replay.formatDate(replay.snapshots[replay.r].time);
-  const metric = (v, l) => `<div class="metric"><b>${v}</b><span>${l}</span></div>`;
-  const v = Replay.valuesAt(b, replay.r);
-  el.innerHTML = `<div class="replay-note">
-      ${b.gone ? '<span class="gone">Removed before today</span>' : ''}
-      <span>Replaying — values at ${date}</span>
-      ${Replay.exists(b, replay.r)
-        ? `<div class="metrics">${metric(v.nom, 'methods')}${metric(v.noa, 'attributes')}${metric(fmt(v.loc), 'lines of code')}${metric(v.cx, 'complexity')}</div>`
-        : '<div class="muted">Not in this snapshot</div>'}
-    </div>`;
+  el.innerHTML = Text.replayNoteHtml(b, Replay.valuesAt(b, replay.r), date, Replay.exists(b, replay.r));
 }
 
 let toastTimer = 0;
@@ -874,27 +692,25 @@ function buildArcs() {
   clearArcs();
   const i = state.selected;
   if (i < 0) return;
-  const { buildings } = state.city;
   const night = state.theme === 'night';
-  const shown = (list) => (visible(buildings[i]) ? list.filter((j) => visible(buildings[j])).slice(0, 200) : []);
-  const out = shown(buildings[i].deps);
-  const inc = shown(state.incoming[i]);
-  const opacity = (night ? 0.75 : 0.85) * (buildings[i].deps.length + state.incoming[i].length > 40 ? 0.5 : 1);
+  const { out, inc, faint } = City.arcEnds(i, state.city.buildings, state.incoming, visible);
+  const opacity = (night ? 0.75 : 0.85) * (faint ? 0.5 : 1);
   const add = (from, to, colorHex) => {
     const p0 = topOf(from), p1 = topOf(to);
     const dist = p0.distanceTo(p1);
+    const shape = City.arcShape(p0.y, p1.y, dist);
     const mid = p0.clone().lerp(p1, 0.5);
-    mid.y = Math.max(p0.y, p1.y) + dist * 0.35 + 2;
+    mid.y = shape.peak;
     const curve = new THREE.QuadraticBezierCurve3(p0, mid, p1);
     const color = new THREE.Color(colorHex).multiplyScalar(night ? 1.8 : 1);
     const tube = new THREE.Mesh(
-      new THREE.TubeGeometry(curve, 40, 0.06 + dist * 0.0008, 6, false),
+      new THREE.TubeGeometry(curve, 40, shape.radius, 6, false),
       new THREE.MeshBasicMaterial({ color, transparent: true, opacity, toneMapped: false, depthWrite: false }),
     );
     const dot = new THREE.Mesh(dotGeometry, new THREE.MeshBasicMaterial({ color: color.clone().multiplyScalar(night ? 1.6 : 1), toneMapped: false }));
-    dot.scale.setScalar(0.18 + dist * 0.002);
+    dot.scale.setScalar(shape.dot);
     arcGroup.add(tube, dot);
-    arcs.push({ tube, dot, curve, t: Math.random(), speed: 14 / Math.max(5, curve.getLength()) });
+    arcs.push({ tube, dot, curve, t: Math.random(), speed: City.arcSpeed(curve.getLength()) });
   };
   out.forEach((j) => add(i, j, '#f97316'));
   inc.forEach((j) => add(j, i, '#0ea5e9'));
@@ -977,13 +793,12 @@ function showTooltip(target, x, y) {
     const b = state.city.buildings[target.index];
     // During replay: the values of snapshot round(p), dated, and no open PRs.
     const v = replay ? Replay.valuesAt(b, replay.r) : b;
-    const at = replay ? `<span class="t-at">· at ${Replay.formatDate(replay.snapshots[replay.r].time)}</span>` : '';
-    html = `<b>${esc(b.name)}</b> <span class="t-pkg">${esc(b.kind)}</span><div class="t-pkg">${esc(b.pkg)}</div>
-      <div class="t-row"><span>${v.nom} methods</span><span>${v.noa} attrs</span><span>${fmt(v.loc)} loc</span><span>cx ${v.cx}</span>${b.commits != null ? `<span>${v.commits} commits</span>` : ''}${b.prs && !replay ? `<span class="t-pr">${b.prs.length} open PR${b.prs.length > 1 ? 's' : ''}</span>` : ''}${at}</div>`;
+    const at = replay ? Replay.formatDate(replay.snapshots[replay.r].time) : null;
+    html = Text.buildingTooltipHtml(b, v, at);
   } else {
     const d = state.city.districts[target.index];
     if (d.depth === 0) { tooltip.hidden = true; return; }
-    html = `<b>${esc(d.name)}</b><div class="t-pkg">${esc(d.id.replace(/^module:/, ''))}</div><div class="t-row"><span>${d.types} types</span><span>double-click to zoom</span></div>`;
+    html = Text.districtTooltipHtml(d);
   }
   tooltip.innerHTML = html;
   tooltip.hidden = false;
@@ -1051,41 +866,24 @@ let results = [];
 let activeResult = 0;
 
 // `show` opens the result list; replay re-runs the search on every snapshot change without opening it.
+// Matching and ranking are in search.js.
 function runSearch(q, { show = true } = {}) {
-  q = q.trim().toLowerCase();
-  if (q.length < 2) {
+  const found = Search.search(state.city.buildings, q, visible);
+  if (!found) {
     state.matches = null;
     resultsEl.hidden = true;
     paintBuildings();
     return;
   }
-  const { buildings } = state.city;
-  const scored = [];
-  buildings.forEach((b, i) => {
-    if (!visible(b)) return;
-    const name = b.name.toLowerCase();
-    const id = b.id.toLowerCase();
-    let score = -1;
-    if (name === q) score = 0;
-    else if (name.startsWith(q)) score = 1;
-    else if (name.includes(q)) score = 2;
-    else if (id.includes(q)) score = 3;
-    if (score >= 0) scored.push({ i, score, len: name.length });
-  });
-  scored.sort((a, b) => a.score - b.score || a.len - b.len);
-  state.matches = new Set(scored.map((s) => s.i));
-  results = scored.slice(0, 12).map((s) => s.i);
+  state.matches = found.matches;
+  results = found.results;
   activeResult = 0;
   if (show) renderResults();
   paintBuildings();
 }
 
 function renderResults() {
-  const { buildings } = state.city;
-  resultsEl.innerHTML = results.length
-    ? results.map((i, k) => `<li data-idx="${i}" class="${k === activeResult ? 'active' : ''}"><span class="r-name">${esc(buildings[i].name)}</span><span class="r-pkg">${esc(buildings[i].pkg)}</span></li>`).join('')
-      + (state.matches.size > results.length ? `<li class="r-empty">${state.matches.size - results.length} more highlighted in the city</li>` : '')
-    : '<li class="r-empty">No matching types</li>';
+  resultsEl.innerHTML = Text.searchResultsHtml(state.city.buildings, results, activeResult, state.matches.size);
   resultsEl.hidden = false;
   resultsEl.querySelectorAll('li[data-idx]').forEach((li) => li.addEventListener('mousedown', (e) => {
     e.preventDefault();
@@ -1101,7 +899,7 @@ searchInput.addEventListener('keydown', (e) => {
   if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
     e.preventDefault();
     if (!results.length) return;
-    activeResult = (activeResult + (e.key === 'ArrowDown' ? 1 : results.length - 1)) % results.length;
+    activeResult = Search.moveActive(activeResult, e.key === 'ArrowDown' ? 1 : -1, results.length);
     renderResults();
   } else if (e.key === 'Enter' && results.length) {
     select(results[activeResult]);
@@ -1393,10 +1191,10 @@ function toggleReplay() {
 function enterReplay() {
   if (!state.city || replay || !Replay.hasHistory(state.city)) return;
   const snapshots = state.city.history.snapshots;
-  replay = { snapshots, count: snapshots.length, p: 0, playing: true, speed: 0, r: -1, scale: presentHeightScale(), arcsAt: 0 };
+  replay = { ...Replay.start(snapshots.length), snapshots, r: -1, scale: presentHeightScale(), arcsAt: 0 };
   heights.dur = 0; // a running height animation would fight the timeline
   $('#tl-slider').max = String(replay.count - 1);
-  $('#tl-speed').textContent = `${Replay.SPEEDS[0]}×`;
+  $('#tl-speed').textContent = Replay.speedLabel(replay.speed);
   document.body.classList.add('replaying');
   $('#btn-replay').classList.add('active');
   $('#btn-replay').setAttribute('aria-pressed', 'true');
@@ -1463,8 +1261,7 @@ function snapshotChanged() {
   if (searchInput.value) runSearch(searchInput.value, { show: false });
   refreshTooltip();
   const s = replay.snapshots[replay.r];
-  $('#tl-info').innerHTML = `<b>${Replay.formatDate(s.time)}</b> · <code>${esc(Replay.shortSha(s.commit))}</code> · `
-    + `${esc(Replay.truncateSubject(s.subject))} — ${esc(s.author)}`;
+  $('#tl-info').innerHTML = Text.timelineHtml(Replay.formatDate(s.time), Replay.shortSha(s.commit), Replay.truncateSubject(s.subject), s.author);
   $('#tl-info').title = `${s.subject}\n${s.author} · ${s.commit} · ${s.types} types`;
 }
 
@@ -1494,34 +1291,28 @@ function updateTimeline() {
 // One frame of playback; it stops (pauses) at the last snapshot.
 function stepReplay(dt) {
   if (!replay.playing) return;
-  replay.p = Replay.advance(replay.p, dt, Replay.SPEEDS[replay.speed], replay.count);
-  if (replay.p >= replay.count - 1) replay.playing = false;
+  Replay.play(replay, dt);
   applyReplay();
 }
 
 // Play / pause; playing from the end starts over at the first snapshot.
 function toggleReplayPlaying() {
   if (!replay) return;
-  if (replay.playing) replay.playing = false;
-  else {
-    if (replay.p >= replay.count - 1) replay.p = 0;
-    replay.playing = replay.count > 1;
-  }
+  Replay.togglePlaying(replay);
   applyReplay();
 }
 
 // Moves to position p and pauses (slider, step keys, Home / End).
 function seekReplay(p) {
   if (!replay) return;
-  replay.p = Replay.clampPosition(p, replay.count);
-  replay.playing = false;
+  Replay.seek(replay, p);
   applyReplay();
 }
 
 function cycleReplaySpeed() {
   if (!replay) return;
-  replay.speed = (replay.speed + 1) % Replay.SPEEDS.length;
-  $('#tl-speed').textContent = `${Replay.SPEEDS[replay.speed]}×`;
+  Replay.nextSpeed(replay);
+  $('#tl-speed').textContent = Replay.speedLabel(replay.speed);
 }
 
 // The replay keys (R and Esc are handled with the other global keys). Returns whether the key was used.

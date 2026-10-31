@@ -250,9 +250,10 @@ public final class CityHistory {
      * blobs would make git fetch them lazily one request at a time. Works with git 2.34, which has no
      * {@code fetch --refetch}: the missing object ids are fed to a plain fetch on stdin, and the noop negotiation
      * stops git from walking the history to find common commits. Failures are ignored; git then still fetches lazily.
-     * Only called for a repository of the cache ({@link RepoCloner#isCached}).
+     * Only called for a repository of the cache ({@link RepoCloner#isCached}). Package-private for the tests
+     * ({@code PrefetchTest}).
      */
-    private static void prefetchMissing(Path top, PrintStream out) {
+    static void prefetchMissing(Path top, PrintStream out) {
         try {
             boolean partial = git(top, "config", "--get", "remote.origin.promisor").strip().equals("true");
             if (!partial) {

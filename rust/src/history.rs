@@ -405,54 +405,33 @@ mod tests {
         assert!(s.windows(2).all(|w| w[0] < w[1]));
     }
 
-    /// Runs git in `dir` with fixed names, e-mails and dates (commit `n` is dated `n` days after 2020-01-01).
-    fn git(dir: &Path, n: u32, args: &[&str]) {
-        let date = format!("{} +0000", 1_577_836_800 + n as i64 * 86_400);
-        let ok = Command::new("git")
-            .current_dir(dir)
-            .args(["-c", "commit.gpgsign=false"])
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "Ann")
-            .env("GIT_AUTHOR_EMAIL", "ann@example.com")
-            .env("GIT_COMMITTER_NAME", "Ann")
-            .env("GIT_COMMITTER_EMAIL", "ann@example.com")
-            .env("GIT_AUTHOR_DATE", &date)
-            .env("GIT_COMMITTER_DATE", &date)
-            .status()
-            .unwrap()
-            .success();
-        assert!(ok, "git {args:?}");
+    /// Runs one of the shared fixture scripts of `src/test/resources` (next to the Java edition's tests) in `dir`.
+    /// `history-three-commits.sh`: A appears, B appears and A grows a method, B is deleted and A gains a field.
+    fn fixture(dir: &Path, script: &str) {
+        let path = format!("{}/../src/test/resources/{script}", env!("CARGO_MANIFEST_DIR"));
+        assert!(Command::new("sh").arg(path).current_dir(dir).status().unwrap().success(), "{script}");
     }
 
-    /// The shared scenario: A grows a method and then a field; B lives only in commit 2.
+    /// A new temporary directory holding the result of a fixture script, and its canonical path.
+    fn repo(script: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path(), script);
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        (dir, root)
+    }
+
+    /// The shared scenario (the Java and D editions assert the same).
     #[test]
     fn replays_three_commits() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
-        let write = |p: &str, s: &str| {
-            std::fs::create_dir_all(root.join(p).parent().unwrap()).unwrap();
-            std::fs::write(root.join(p), s).unwrap();
-        };
-        git(&root, 0, &["init", "-q", "."]);
-        write("src/A.java", "class A { void a() {} }\n");
-        git(&root, 1, &["add", "-A"]);
-        git(&root, 1, &["commit", "-q", "-m", "one"]);
-        write("src/A.java", "class A { void a() {} void b() {} }\n");
-        write("src/B.java", "class B { void x() {} void y() {} }\n");
-        git(&root, 2, &["add", "-A"]);
-        git(&root, 2, &["commit", "-q", "-m", "two"]);
-        std::fs::remove_file(root.join("src/B.java")).unwrap();
-        write("src/A.java", "class A { int f; void a() {} void b() {} }\n");
-        git(&root, 3, &["add", "-A"]);
-        git(&root, 3, &["commit", "-q", "-m", "three"]);
+        let (_dir, root) = repo("history-three-commits.sh");
         let shas: Vec<String> = git::run(&root, &["rev-list", "--reverse", "HEAD"]).unwrap().lines().map(str::to_string).collect();
 
         let model = CityModel::build(&SourceAnalyzer::new(), &root, true, true, None, Some(60));
         let snaps = model.history.as_ref().expect("history");
         assert_eq!(snaps.iter().map(|s| s.commit.clone()).collect::<Vec<_>>(), shas);
-        assert_eq!(snaps.iter().map(|s| s.time).collect::<Vec<_>>(), vec![1_577_923_200, 1_578_009_600, 1_578_096_000]);
-        assert_eq!(snaps.iter().map(|s| s.subject.as_str()).collect::<Vec<_>>(), vec!["one", "two", "three"]);
-        assert_eq!(snaps.iter().map(|s| s.author.as_str()).collect::<Vec<_>>(), vec!["Ann"; 3]);
+        assert_eq!(snaps.iter().map(|s| s.time).collect::<Vec<_>>(), vec![1_577_836_800, 1_577_923_200, 1_578_009_600]);
+        assert_eq!(snaps.iter().map(|s| s.subject.as_str()).collect::<Vec<_>>(), vec!["add A", "add B", "drop B"]);
+        assert_eq!(snaps.iter().map(|s| s.author.as_str()).collect::<Vec<_>>(), vec!["Ann Author"; 3]);
         assert_eq!(snaps.iter().map(|s| s.types).collect::<Vec<_>>(), vec![1, 2, 1]);
 
         let find = |name: &str| model.buildings.iter().find(|b| model.types()[b.index].name == name).unwrap();
@@ -463,7 +442,7 @@ mod tests {
         assert_eq!(ha.last, snaps.iter().map(|s| s.time).collect::<Vec<_>>());
         let hb = b.hist.as_ref().unwrap();
         assert_eq!(hb.nom, vec![-1, 2, -1]);
-        assert_eq!((hb.commits.clone(), hb.last[0], hb.last[2]), (vec![0, 1, 0], -1, -1));
+        assert_eq!((hb.commits.clone(), hb.last.clone()), (vec![0, 1, 0], vec![-1, 1_577_923_200, -1]));
         assert!(b.gone && !a.gone);
         // B's file is the path it had, below the real root.
         assert_eq!(b.file, "src/B.java");
@@ -478,10 +457,12 @@ mod tests {
         assert_eq!(model.district_hist, vec![vec![true; 3]; model.districts.len()]);
 
         let json = model.json();
-        assert!(json.contains(r#""hist":{"nom":[1,2,2],"noa":[0,0,1],"loc":[1,1,1],"cx":[1,2,2],"commits":[1,2,3],"authors":[1,1,1],"#));
-        assert!(json.contains(r#""hist":{"nom":[-1,2,-1],"noa":[-1,0,-1],"loc":[-1,1,-1],"cx":[-1,2,-1],"commits":[0,1,0],"authors":[0,1,0],"last":[-1,1578009600,-1]},"gone":true}"#));
-        assert!(json.contains(&format!(r#""history":{{"snapshots":[{{"commit":"{}","time":1577923200,"author":"Ann","subject":"one","types":1}}"#, shas[0])));
+        assert!(json.contains(r#""hist":{"nom":[1,2,2],"noa":[0,0,1],"loc":[1,1,1],"cx":[1,2,2],"commits":[1,2,3],"authors":[1,1,1],"last":[1577836800,1577923200,1578009600]}"#));
+        assert!(json.contains(r#""hist":{"nom":[-1,2,-1],"noa":[-1,0,-1],"loc":[-1,1,-1],"cx":[-1,2,-1],"commits":[0,1,0],"authors":[0,1,0],"last":[-1,1577923200,-1]},"gone":true}"#));
+        assert!(json.contains(&format!(r#""history":{{"snapshots":[{{"commit":"{}","time":1577836800,"author":"Ann Author","subject":"add A","types":1}}"#, shas[0])));
         assert!(json.contains(r#""types":1,"hist":[1,1,1]}"#));
+        // "gone" only on B.
+        assert_eq!(json.matches(r#""gone":true"#).count(), 1);
     }
 
     /// The hostile repository shared by all three editions (`src/test/resources/hostile-repo.sh`): its configuration
@@ -523,7 +504,7 @@ mod tests {
         }
     }
 
-    /// Without git there is no history, and the city is the normal one.
+    /// Without a work tree there is no history, and the city is the normal one.
     #[test]
     fn no_history_outside_git() {
         let dir = tempfile::tempdir().unwrap();
@@ -531,5 +512,188 @@ mod tests {
         std::fs::write(root.join("A.java"), "class A {}").unwrap();
         let model = CityModel::build(&SourceAnalyzer::new(), &root, true, true, None, Some(60));
         assert!(model.history.is_none() && !model.json().contains("\"hist\""));
+        assert_eq!(model.buildings.len(), 1);
+    }
+
+    /// With git turned off (`--no-git`) there is no history, even in a repository.
+    #[test]
+    fn no_history_without_git() {
+        let (_dir, root) = repo("history-three-commits.sh");
+        let model = CityModel::build(&SourceAnalyzer::new(), &root, true, false, None, Some(60));
+        assert!(model.history.is_none() && !model.json().contains("\"hist\""));
+    }
+
+    /// A repository without any commit has nothing to replay either.
+    #[test]
+    fn no_history_without_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(Command::new("git").args(["init", "-q", "--template=", "."]).current_dir(&root).status().unwrap().success());
+        std::fs::write(root.join("A.java"), "class A {}").unwrap();
+        let model = CityModel::build(&SourceAnalyzer::new(), &root, true, true, None, Some(60));
+        assert!(model.history.is_none() && !model.json().contains("\"hist\""));
+    }
+
+    /// The sampling formula at its edges: one commit; exactly as many commits as snapshots; two snapshots (both ends
+    /// only); a true half rounds up (k(m-1)/(n-1) = 1.5 → 2); one commit more than snapshots skips exactly one in the
+    /// middle; and a long history keeps both ends and strictly increasing indices.
+    #[test]
+    fn sampling_formula_edge_cases() {
+        assert_eq!(sample(0, 60), Vec::<usize>::new());
+        assert_eq!(sample(1, 60), vec![0]);
+        assert_eq!(sample(2, 2), vec![0, 1]);
+        assert_eq!(sample(3, 2), vec![0, 2]);
+        assert_eq!(sample(100_000, 2), vec![0, 99_999]);
+        assert_eq!(sample(4, 3), vec![0, 2, 3]);
+        assert_eq!(sample(6, 4), vec![0, 2, 3, 5]);
+        let one_more = sample(61, 60);
+        assert_eq!((one_more.len(), one_more[59]), (60, 60));
+        assert!(!one_more.contains(&30), "skips index 30");
+        let most = sample(100_000, MAX_SNAPSHOTS);
+        assert_eq!((most.len(), most[0], most[499]), (500, 0, 99_999));
+        assert!(most.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!((DEFAULT_SNAPSHOTS, MIN_SNAPSHOTS, MAX_SNAPSHOTS), (60, 2, 500));
+    }
+
+    // ------------------------------------------------------------------ rules, on history-replay-repo.sh
+
+    /// Author time of commit `n` of history-replay-repo.sh: midnight UTC, one day apart from 2020-01-01.
+    fn day(n: i64) -> i64 {
+        1_577_836_800 + (n - 1) * 86_400
+    }
+
+    /// The JSON text of the entry with this id in the model's `"districts"` or `"buildings"` array: from its opening
+    /// brace up to the next entry. Every edition slices the JSON the same way, so the assertions read alike.
+    fn entry<'a>(json: &'a str, array: &str, id: &str) -> &'a str {
+        let from = json.find(&format!("\"{array}\":[")).expect(array);
+        let at = from + json[from..].find(&format!("{{\"id\":\"{id}\",")).unwrap_or_else(|| panic!("no entry {id}"));
+        let next = json[at + 1..].find("{\"id\":").map_or(json.len(), |i| at + 1 + i);
+        &json[at..next]
+    }
+
+    fn replay(root: &Path, include_tests: bool, snapshots: usize) -> CityModel {
+        let model = CityModel::build(&SourceAnalyzer::new(), root, include_tests, true, None, Some(snapshots));
+        assert!(model.history.is_some());
+        model
+    }
+
+    fn ids(model: &CityModel) -> Vec<String> {
+        let mut ids: Vec<String> = model.buildings.iter().map(|b| model.types()[b.index].fqn.clone()).collect();
+        ids.sort();
+        ids
+    }
+
+    fn snapshot_types(model: &CityModel) -> Vec<usize> {
+        model.history.as_ref().unwrap().iter().map(|s| s.types).collect()
+    }
+
+    /// The city is the union of today's types and every type of any snapshot. A type deleted and added again (C) is
+    /// present, with -1 for the snapshot it was missing from; types that no longer exist (D, p.P) are "gone" and keep
+    /// their last version's file. The statistics count today's types only.
+    #[test]
+    fn the_city_is_the_union_of_all_snapshots() {
+        let (_dir, root) = repo("history-replay-repo.sh");
+        let model = replay(&root, true, 60);
+        assert_eq!(snapshot_types(&model), vec![4, 5, 3, 4]);
+        assert_eq!(ids(&model), ["A", "ATest", "C", "D", "O", "p.P"]);
+        let json = model.json();
+        let c = entry(&json, "buildings", "C");
+        assert!(c.contains(r#""hist":{"nom":[-1,0,-1,1],"noa":[-1,0,-1,0],"#), "{c}");
+        assert!(!c.contains("\"gone\""));
+        let d = entry(&json, "buildings", "D");
+        assert!(d.contains(r#""nom":[-1,0,-1,-1]"#) && d.contains(r#""gone":true"#), "{d}");
+        let p = entry(&json, "buildings", "p.P");
+        assert!(p.contains(r#""file":"src/p/P.java""#) && p.contains(r#""nom":[0,-1,-1,-1]"#) && p.contains(r#""gone":true"#), "{p}");
+        assert_eq!(model.stats.types, 4);
+    }
+
+    /// A type's git activity in snapshot k counts the commits of its file with an author time up to snapshot k's (the
+    /// committer times, an hour later, play no part): C's file is added, deleted and added again by three authors.
+    /// Where the type does not exist, the activity is 0, 0, -1 even though its file had commits.
+    #[test]
+    fn git_activity_is_counted_up_to_each_snapshot() {
+        let (_dir, root) = repo("history-replay-repo.sh");
+        let model = replay(&root, true, 60);
+        let snaps = model.history.as_ref().unwrap();
+        assert_eq!(snaps.iter().map(|s| s.time).collect::<Vec<_>>(), vec![day(1), day(2), day(3), day(4)]);
+        assert_eq!(snaps.iter().map(|s| s.author.as_str()).collect::<Vec<_>>(), ["Ann Author", "Bob Builder", "Ann Author", "Cid Coder"]);
+        let json = model.json();
+        assert!(entry(&json, "buildings", "A").contains(&format!(r#""commits":[1,2,2,2],"authors":[1,2,2,2],"last":[{},{},{},{}]}}"#, day(1), day(2), day(2), day(2))));
+        assert!(entry(&json, "buildings", "C").contains(&format!(r#""commits":[0,1,0,3],"authors":[0,1,0,3],"last":[-1,{},-1,{}]}}"#, day(2), day(4))));
+    }
+
+    /// A district's history marks the snapshots in which it, or a sub-district, holds an existing building: "p" only in
+    /// the first. Its type count is of today's types, so 0.
+    #[test]
+    fn district_history_follows_its_buildings() {
+        let (_dir, root) = repo("history-replay-repo.sh");
+        let model = replay(&root, true, 60);
+        let json = model.json();
+        assert!(entry(&json, "districts", "p").contains(r#""types":0,"hist":[1,0,0,0]}"#));
+        assert!(entry(&json, "districts", "(default)").contains(r#""types":4,"hist":[1,1,1,1]}"#));
+        assert!(entry(&json, "districts", "").contains(r#""types":4,"hist":[1,1,1,1]}"#));
+    }
+
+    /// A's attribute count shrinks from 3 to 1. Its building has today's side, but its lot is reserved for the widest
+    /// version: the footprint of side(3), centred on the building, keeps a street's width from every other building.
+    #[test]
+    fn lots_fit_the_widest_version() {
+        use crate::layout::{side_of_noa, GAP};
+        let (_dir, root) = repo("history-replay-repo.sh");
+        let model = replay(&root, true, 60);
+        let a = model.buildings.iter().find(|b| model.types()[b.index].fqn == "A").unwrap();
+        assert_eq!(a.hist.as_ref().unwrap().noa, vec![3, 1, 1, 1]);
+        assert!((a.lot.side - side_of_noa(1)).abs() < 1e-9);
+        let reserved = side_of_noa(3);
+        let mut touches = false;
+        for b in model.buildings.iter().filter(|b| b.index != a.index && b.lot.district == a.lot.district) {
+            let gap_x = (a.lot.x - b.lot.x).abs() - (reserved + b.lot.side) / 2.0;
+            let gap_z = (a.lot.z - b.lot.z).abs() - (reserved + b.lot.side) / 2.0;
+            assert!(gap_x.max(gap_z) >= GAP - 1e-6, "{}", model.types()[b.index].fqn);
+            // Some neighbour must be closer than a street to today's smaller footprint plus the reserved margin;
+            // otherwise the test would not tell the reserved lot from the plain one.
+            touches |= gap_x.max(gap_z) < GAP + (reserved - side_of_noa(1)) / 2.0 - 1e-6;
+        }
+        assert!(touches, "a neighbour stands next to A's reserved lot");
+    }
+
+    /// With two snapshots only the first and the last commit are replayed. D, which existed only in between, is not
+    /// part of the city at all; the activity is still counted over every commit up to the snapshot.
+    #[test]
+    fn sampling_keeps_both_ends_and_drops_types_in_between() {
+        let (_dir, root) = repo("history-replay-repo.sh");
+        let model = replay(&root, true, 2);
+        let snaps = model.history.as_ref().unwrap();
+        assert_eq!(snaps.iter().map(|s| s.subject.as_str()).collect::<Vec<_>>(), ["one", "four"]);
+        let ends = vec![git::run(&root, &["rev-list", "--max-parents=0", "HEAD"]).unwrap(), git::run(&root, &["rev-parse", "HEAD"]).unwrap()];
+        assert_eq!(snaps.iter().map(|s| s.commit.clone()).collect::<Vec<_>>(), ends);
+        assert_eq!(ids(&model), ["A", "ATest", "C", "O", "p.P"]);
+        let json = model.json();
+        assert!(entry(&json, "buildings", "C").contains(r#""nom":[-1,1],"#));
+        assert!(entry(&json, "buildings", "C").contains(r#""commits":[0,3],"#));
+        assert!(entry(&json, "buildings", "p.P").contains(r#""nom":[0,-1],"#));
+        assert!(entry(&json, "buildings", "A").contains(r#""commits":[1,2],"#));
+    }
+
+    /// Without tests, test types are left out of every snapshot (ATest is in a test directory).
+    #[test]
+    fn tests_are_left_out_of_every_snapshot() {
+        let (_dir, root) = repo("history-replay-repo.sh");
+        let model = replay(&root, false, 60);
+        assert_eq!(snapshot_types(&model), vec![3, 4, 2, 3]);
+        assert_eq!(ids(&model), ["A", "C", "D", "O", "p.P"]);
+    }
+
+    /// Analysing a sub-directory replays only its files (other/O.java never appears), with paths relative to it; the
+    /// git activity is still found, as the history keys are absolute.
+    #[test]
+    fn a_sub_directory_replays_only_its_files() {
+        let (_dir, top) = repo("history-replay-repo.sh");
+        let model = replay(&top.join("src"), true, 60);
+        assert_eq!(snapshot_types(&model), vec![3, 4, 2, 3]);
+        assert_eq!(ids(&model), ["A", "ATest", "C", "D", "p.P"]);
+        let json = model.json();
+        assert!(entry(&json, "buildings", "p.P").contains(r#""file":"p/P.java""#));
+        assert!(entry(&json, "buildings", "A").contains(r#""commits":[1,2,2,2],"#));
     }
 }

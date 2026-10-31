@@ -11,6 +11,7 @@ import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -51,7 +52,10 @@ public final class PullRequests {
      * the quota left.
      */
     private static final int ANONYMOUS_FILE_LOOKUPS = 30;
-    /** Largest response body read; a larger one fails the fetch. The same limit as the Rust edition's HTTP client. */
+    /**
+     * Largest response body read: exactly this many bytes are accepted, one more fails the fetch. The same limit in
+     * every edition.
+     */
     static final int MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
     /** Redirect statuses that are followed (within the same host), and how many of them in a row. */
     private static final Set<Integer> REDIRECTS = Set.of(301, 302, 307, 308);
@@ -61,6 +65,21 @@ public final class PullRequests {
             List.of("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN");
 
     public record Result(List<PullRequest> pulls, String source) {
+    }
+
+    /**
+     * What {@link #fetch} reads from outside: environment variables ({@code variables}, null for an unset one), the
+     * programs on the {@code PATH} ({@code programs}, for {@code gh}) and the API endpoints ({@code restApi}, the REST
+     * base URL, and {@code graphqlApi}). Production uses {@link #of}. Test seam: the tests inject an environment of
+     * their own, a fake {@code gh}, and a fake API server on the loopback interface.
+     */
+    record Environment(Function<String, String> variables, Function<String, Optional<Path>> programs, String restApi,
+                       String graphqlApi) {
+
+        /** The process environment, {@link Git#executable} and the repository's real API endpoints. */
+        static Environment of(GitHubRepo repo) {
+            return new Environment(System::getenv, Git::executable, repo.restApi(), repo.graphqlApi());
+        }
     }
 
     /**
@@ -100,10 +119,12 @@ public final class PullRequests {
             .build();
     private final GitHubRepo repo;
     private final String token;
+    private final Environment env;
 
-    private PullRequests(GitHubRepo repo, String token) {
+    private PullRequests(GitHubRepo repo, String token, Environment env) {
         this.repo = repo;
         this.token = token;
+        this.env = env;
     }
 
     /**
@@ -112,15 +133,8 @@ public final class PullRequests {
      * may come from a hostile repository's remote URL, and CodeCity should not call out to it on its own.
      */
     public static Result fetch(GitHubRepo repo) {
-        String token = token(repo).orElse(null);
-        if (token == null && !repo.isPublicGitHub() && !optedIn(repo, System::getenv)) {
-            System.err.println("  GitHub: not contacting " + repo.host() + " (for a GitHub Enterprise host, set GH_HOST="
-                    + repo.host() + " or log in with `gh auth login --hostname " + repo.host() + "`)");
-            return new Result(List.of(), "unavailable");
-        }
-        PullRequests client = new PullRequests(repo, token);
         try {
-            return token != null ? client.graphql() : client.rest();
+            return fetch(repo, Environment.of(repo));
         } catch (IOException | RuntimeException e) {
             System.err.println("  GitHub: could not fetch pull requests (" + dev.codecity.CodeCity.printable(e.getMessage()) + ")");
             return new Result(List.of(), "unavailable");
@@ -131,11 +145,27 @@ public final class PullRequests {
     }
 
     /**
+     * {@link #fetch(GitHubRepo)} in the environment {@code env}, with failures thrown instead of reported (the
+     * exception's message is what the user is shown). A host that is not contacted gives the source
+     * {@code "unavailable"}.
+     */
+    static Result fetch(GitHubRepo repo, Environment env) throws IOException, InterruptedException {
+        String token = token(repo, env).orElse(null);
+        if (token == null && !repo.isPublicGitHub() && !optedIn(repo, env.variables())) {
+            System.err.println("  GitHub: not contacting " + repo.host() + " (for a GitHub Enterprise host, set GH_HOST="
+                    + repo.host() + " or log in with `gh auth login --hostname " + repo.host() + "`)");
+            return new Result(List.of(), "unavailable");
+        }
+        PullRequests client = new PullRequests(repo, token, env);
+        return token != null ? client.graphql() : client.rest();
+    }
+
+    /**
      * Looks for an API token: the environment first ({@link #envToken}), then the GitHub CLI's stored login for the
      * repository's host ({@link #ghToken}). Empty when there is none, in which case the REST API is used anonymously.
      */
-    static Optional<String> token(GitHubRepo repo) {
-        return envToken(repo, System::getenv).or(() -> ghToken(repo.host()));
+    static Optional<String> token(GitHubRepo repo, Environment env) {
+        return envToken(repo, env.variables()).or(() -> ghToken(repo.host(), env.programs()));
     }
 
     /**
@@ -165,10 +195,11 @@ public final class PullRequests {
     /**
      * {@code gh auth token} for {@code host}: the token of a login the user made to exactly that host. {@code gh}
      * runs without the token variables, since it would otherwise answer with {@code GH_ENTERPRISE_TOKEN} for any
-     * host; the host is passed as {@code --hostname=<host>}, so it can never be read as another option.
+     * host; the host is passed as {@code --hostname=<host>}, so it can never be read as another option. {@code gh} is
+     * found by {@code programs} ({@link Git#executable} in production).
      */
-    private static Optional<String> ghToken(String host) {
-        Optional<java.nio.file.Path> exe = Git.executable("gh");
+    private static Optional<String> ghToken(String host, Function<String, Optional<Path>> programs) {
+        Optional<Path> exe = programs.apply("gh");
         if (exe.isEmpty()) {
             return Optional.empty();
         }
@@ -232,7 +263,7 @@ public final class PullRequests {
         String body = new JsonWriter().beginObject()
                 .field("query", query).name("variables").raw(variables.toString())
                 .endObject().toString();
-        Object json = send(HttpRequest.newBuilder(URI.create(repo.graphqlApi()))
+        Object json = send(HttpRequest.newBuilder(URI.create(env.graphqlApi()))
                 .POST(HttpRequest.BodyPublishers.ofString(body)));
         if (JsonParser.path(json, "errors") instanceof List<?> errors && !errors.isEmpty()) {
             throw new IOException(String.valueOf(JsonParser.path(errors.getFirst(), "message")));
@@ -247,7 +278,7 @@ public final class PullRequests {
      * in what is left is left out, like the PRs after it, rather than shown with only some of its files.
      */
     private Result rest() throws IOException, InterruptedException {
-        String base = repo.restApi() + "/repos/" + repo.owner() + "/" + repo.name();
+        String base = env.restApi() + "/repos/" + repo.owner() + "/" + repo.name();
         Reply listing = request(HttpRequest.newBuilder(
                 URI.create(base + "/pulls?state=open&sort=updated&direction=desc&per_page=100")).GET());
         // The "- 1" keeps one request of the remaining quota unused.
@@ -317,8 +348,7 @@ public final class PullRequests {
                 Optional<String> location = response.headers().firstValue("location");
                 if (REDIRECTS.contains(response.statusCode()) && location.isPresent() && hops < MAX_REDIRECTS) {
                     URI next = uri.resolve(location.get());
-                    if (!"https".equalsIgnoreCase(next.getScheme()) || !uri.getHost().equalsIgnoreCase(next.getHost())
-                            || uri.getPort() != next.getPort()) {
+                    if (!mayFollow(uri, next)) {
                         throw new IOException("redirect to another host refused");
                     }
                     builder.uri(next);
@@ -338,6 +368,15 @@ public final class PullRequests {
                 return new Reply(new String(bytes, StandardCharsets.UTF_8), response.headers());
             }
         }
+    }
+
+    /**
+     * Whether a redirect from {@code from} to {@code to} is followed (with the same headers, the token included): only
+     * to an https URL on the same host (compared case-insensitively) and port.
+     */
+    static boolean mayFollow(URI from, URI to) {
+        return "https".equalsIgnoreCase(to.getScheme()) && to.getHost() != null
+                && from.getHost().equalsIgnoreCase(to.getHost()) && from.getPort() == to.getPort();
     }
 
     /**

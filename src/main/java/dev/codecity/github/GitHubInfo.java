@@ -1,8 +1,11 @@
 package dev.codecity.github;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * GitHub context of an analysed source tree.
@@ -78,5 +81,41 @@ public record GitHubInfo(GitHubRepo repo, String ref, String prefix, List<PullRe
 
     public GitHubInfo withPulls(List<PullRequest> pulls, String source) {
         return new GitHubInfo(repo, ref, prefix, pulls, source);
+    }
+
+    /**
+     * The GitHub page of lines {@code line}..{@code endLine} of {@code file} (relative to the analysed root): {@code
+     * kind} is {@code blob} (file view), {@code blame} or {@code commits} (history), giving
+     * {@code https://<host>/<owner>/<repo>/<kind>/<ref>/<prefix><file>#L<line>-L<endLine>}. The history page takes no
+     * line anchor. The desktop viewer's inspector links use it; the other editions build the same URLs.
+     */
+    public String link(String kind, String file, int line, int endLine) {
+        String url = repo.webUrl() + "/" + kind + "/" + encodePath(ref) + "/" + encodePath(prefix + file);
+        return kind.equals("commits") ? url : url + "#L" + line + "-L" + endLine;
+    }
+
+    /**
+     * Percent-encodes each path segment but keeps the slashes: every byte of the UTF-8 form except the unreserved
+     * characters of RFC 3986 ({@code A-Z a-z 0-9 - . _ ~}) becomes {@code %XX} (upper-case hex). Every viewer of every
+     * edition encodes GitHub links with exactly this set, so the links are identical; GitHub resolves them all.
+     */
+    static String encodePath(String path) {
+        return Stream.of(path.split("/")).map(GitHubInfo::encodeSegment).collect(Collectors.joining("/"));
+    }
+
+    /** One path segment, encoded as described at {@link #encodePath}. */
+    private static String encodeSegment(String segment) {
+        StringBuilder out = new StringBuilder();
+        for (byte b : segment.getBytes(StandardCharsets.UTF_8)) {
+            int c = b & 0xff;
+            if (c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '.' || c == '_'
+                    || c == '~') {
+                out.append((char) c);
+            } else {
+                out.append('%').append(Character.toUpperCase(Character.forDigit(c >> 4, 16)))
+                        .append(Character.toUpperCase(Character.forDigit(c & 15, 16)));
+            }
+        }
+        return out.toString();
     }
 }

@@ -3,8 +3,10 @@
 //! `--export` takes the viewer's `index.html` and replaces its three external references (stylesheet, favicon,
 //! script) with inline copies, plus the city JSON in a `<script id="city-data">` element. The viewer's `app.js` looks
 //! for that element and uses the embedded data instead of fetching `api/city`, so the file works from disk with no
-//! server. `app.js` imports `./walk.js` and `./replay.js`, which an inline module cannot load from disk, so the page's
-//! import map also gets an entry for each, mapping it to a base64 `data:` URL of that module.
+//! server. `app.js` imports the modules [`assets::MODULES`] (`./walk.js`, `./replay.js`, …), which an inline module
+//! cannot load from disk, so the page's import map also gets an entry for each, mapping it to a base64 `data:` URL of
+//! that module (which is why those modules import nothing themselves: a `data:` module cannot resolve a relative
+//! import).
 
 use crate::assets;
 use crate::city::CityModel;
@@ -19,17 +21,13 @@ pub fn export(model: &CityModel, target: &Path) -> std::io::Result<()> {
     let favicon = assets::FAVICON_SVG.replace('"', "'").replace('#', "%23").replace('\n', " ");
     replace_once(&mut html, r#"<link rel="icon" href="favicon.svg" type="image/svg+xml">"#, &format!(r#"<link rel="icon" href="data:image/svg+xml,{favicon}">"#));
     // "./walk.js" in the import map resolves against the page URL, exactly like app.js's import from the inline
-    // module, so the import is served from the data: URL (likewise "./replay.js"). Base64 needs no escaping inside the
-    // JSON string.
-    replace_once(
-        &mut html,
-        r#""imports": {"#,
-        &format!(
-            "\"imports\": {{\n        \"./walk.js\": \"data:text/javascript;base64,{}\",\n        \"./replay.js\": \"data:text/javascript;base64,{}\",",
-            assets::base64(assets::WALK_JS.as_bytes()),
-            assets::base64(assets::REPLAY_JS.as_bytes())
-        ),
-    );
+    // module, so the import is served from the data: URL (likewise every other module). Base64 needs no escaping
+    // inside the JSON string.
+    let mut modules = String::from(r#""imports": {"#);
+    for (name, source) in assets::MODULES {
+        modules.push_str(&format!("\n        \"./{name}\": \"data:text/javascript;base64,{}\",", assets::base64(source.as_bytes())));
+    }
+    replace_once(&mut html, r#""imports": {"#, &modules);
     // The JSON writer escapes '<', so the data cannot terminate the script element early. The script stays a module,
     // as in index.html.
     replace_once(
@@ -54,8 +52,8 @@ fn replace_once(text: &mut String, marker: &str, replacement: &str) {
 
 /// The viewer's Content-Security-Policy allows inline scripts only by hash. Each emitted page (the served one, as
 /// [`assets::get`] hands it to the server, and an exported one) must list exactly the hashes of its own inline
-/// scripts, so editing index.html, app.js, walk.js or replay.js cannot break it. The Java and D editions have the same
-/// test.
+/// scripts, so editing index.html, app.js or the modules it imports cannot break it. The Java and D editions have the
+/// same test.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +94,35 @@ mod tests {
             assert_eq!(listed, script_hashes(page), "the policy lists exactly the page's inline scripts");
         }
         assert_eq!(hash.replace_all(&csp(served), ""), hash.replace_all(&csp(&exported), ""));
+    }
+
+    /// app.js imports its sibling modules (`import … from './name.js'`); each must be served and must be inlined into
+    /// the exported page's import map, and none may import anything itself (a `data:` module cannot resolve a relative
+    /// import). The Java and D editions have the same test.
+    #[test]
+    fn every_module_app_js_imports_is_served_and_inlined_in_the_export() {
+        let imported: Vec<&str> = regex::Regex::new(r"from '\./([\w-]+\.js)'")
+            .unwrap()
+            .captures_iter(assets::APP_JS)
+            .map(|c| c.get(1).unwrap().as_str())
+            .collect();
+        let listed: Vec<&str> = assets::MODULES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(imported, listed, "app.js imports exactly the listed modules, in that order");
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("A.java"), "class A { void f() {} }\n").unwrap();
+        let model = CityModel::build(&SourceAnalyzer::new(), &root, true, false, None, None);
+        let out = root.join("out/city.html");
+        export(&model, &out).unwrap();
+        let exported = std::fs::read_to_string(&out).unwrap();
+        let imports = regex::Regex::new(r#"(?m)^\s*import\b|\bfrom\s*['"]"#).unwrap();
+        for (name, source) in assets::MODULES {
+            assert_eq!(assets::get(&format!("/{name}")), Some(("text/javascript; charset=utf-8", source)), "{name}");
+            let entry = format!("\"./{name}\": \"data:text/javascript;base64,{}\"", assets::base64(source.as_bytes()));
+            assert!(exported.contains(&entry), "{name}");
+            assert!(!imports.is_match(source), "{name} imports nothing");
+        }
     }
 
     /// Cross-check of the in-house SHA-256 as the policy uses it: the expected value was computed with Python's

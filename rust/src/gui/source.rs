@@ -107,7 +107,8 @@ pub fn highlight(code: &str, language: Language) -> Vec<Line> {
         Language::TypeScript => TYPESCRIPT,
         Language::Rust => RUST,
     };
-    let chars: Vec<char> = code.chars().collect();
+    // Every '\r' is dropped up front, so none ends up inside a comment, string or other token (CRLF files).
+    let chars: Vec<char> = code.chars().filter(|&c| c != '\r').collect();
     let n = chars.len();
     let mut lines = vec![];
     let mut line: Line = vec![];

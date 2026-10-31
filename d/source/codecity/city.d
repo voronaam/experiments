@@ -534,3 +534,148 @@ private Stats computeStats(ref Analysis a)
     s.packages = packages.length;
     return s;
 }
+
+// Rules of the plain city model (no git, no GitHub, no history) and its JSON, one per unittest. The golden suite
+// (golden.d) compares whole cities; these blocks name the rule that broke. The Java (CityModelTest) and Rust (city.rs)
+// editions build the same fixture and check the same values; each block names the Java test it mirrors.
+version (unittest)
+{
+    /// The shared fixture: three Java types in package `shop` (one a test that uses `Cart`, which uses `Item`) and
+    /// one TypeScript module building in `web`, in a directory named `shop-city` under `dir` (which the caller
+    /// removes).
+    private CityModel buildFixture(string dir, bool includeTests)
+    {
+        import codecity.git : realPath;
+        import std.file : mkdirRecurse, write;
+        import std.path : buildPath, dirName;
+        const root = buildPath(dir, "shop-city");
+        immutable string[2][] files = [
+            ["src/main/java/shop/Cart.java", "package shop;\npublic class Cart {\n    Item item;\n    int a;\n"
+                ~ "    void add(int n) { if (n > 0) { a += n; } }\n    void clear() {}\n}\n"],
+            ["src/main/java/shop/Item.java", "package shop;\npublic class Item {}\n"],
+            ["src/test/java/shop/CartTest.java", "package shop;\nclass CartTest { Cart c; }\n"],
+            ["web/util.ts", "export function f(x: number) { return x ? 1 : 0; }\n"],
+        ];
+        foreach (f; files)
+        {
+            const path = buildPath(root, f[0]);
+            mkdirRecurse(path.dirName);
+            write(path, f[1]);
+        }
+        return CityModel.build(new SourceAnalyzer, realPath(root), includeTests, false, false, GitHubInfo.init);
+    }
+
+    /// A fresh temporary directory.
+    private string tempFixtureDir()
+    {
+        import std.file : mkdirRecurse, tempDir;
+        import std.path : buildPath;
+        import std.uuid : randomUUID;
+        const dir = buildPath(tempDir, "codecity-city-" ~ randomUUID.toString);
+        mkdirRecurse(dir);
+        return dir;
+    }
+
+    private string[] buildingIds(CityModel m)
+    {
+        string[] r;
+        foreach (ref b; m.buildings) r ~= m.analysis.types[b.index].fqn;
+        return r;
+    }
+}
+
+unittest // jsonHasTheCityHeaderStatsDistrictsAndBuildingsInOrder: header, stats, districts, buildings; no optional parts
+{
+    import std.algorithm : canFind, endsWith, startsWith;
+    import std.file : rmdirRecurse;
+    import std.string : indexOf;
+    const dir = tempFixtureDir();
+    scope (exit) rmdirRecurse(dir);
+    auto m = buildFixture(dir, true);
+    const json = m.json();
+    assert(json.startsWith(`{"name":"shop-city","root":"` ~ m.analysis.root.replace(`\`, `\\`) ~ `","generatedAt":"`), json);
+    assert(json.canFind(`","hasGit":false,"platform":0.4,"width":`), json);
+    assert(json.canFind(`,"stats":{"files":4,"failedFiles":0,"types":4,"packages":2,"methods":3,"loc":9,`
+        ~ `"languages":{"java":3,"typescript":1}},"districts":[{"id":"","name":"shop-city","depth":0,`), json);
+    assert(json.indexOf(`"districts":[`) < json.indexOf(`"buildings":[`));
+    assert(json.endsWith("]}"));
+    foreach (absent; [`"github"`, `"history"`, `"hist"`, `"gone"`, `"prs"`, `"commits"`]) assert(!json.canFind(absent), absent);
+}
+
+unittest // districtsListPackagesWithDepthAndTypeCounts: one district per package, depth and subtree type count
+{
+    import std.algorithm : canFind;
+    import std.file : rmdirRecurse;
+    const dir = tempFixtureDir();
+    scope (exit) rmdirRecurse(dir);
+    auto m = buildFixture(dir, true);
+    string[] labels, ids;
+    uint[] depths, types;
+    foreach (d; m.districts)
+    {
+        labels ~= d.label;
+        ids ~= d.id;
+        depths ~= d.depth;
+        types ~= d.types;
+    }
+    assert(labels == ["shop-city", "shop", "web"] && ids == ["", "shop", "web"]);
+    assert(depths == [0, 1, 1] && types == [4, 3, 1]);
+    assert(m.json().canFind(`{"id":"shop","name":"shop","depth":1,`));
+}
+
+unittest // buildingsAreSortedByIdAndCarryTheirFields: identity, metrics, relative file, methods most complex first
+{
+    import std.algorithm : canFind;
+    import std.file : rmdirRecurse;
+    const dir = tempFixtureDir();
+    scope (exit) rmdirRecurse(dir);
+    auto m = buildFixture(dir, true);
+    assert(buildingIds(m) == ["shop.Cart", "shop.CartTest", "shop.Item", "web/util.ts"]);
+    const json = m.json();
+    assert(json.canFind(`{"id":"shop.Cart","lang":"java","name":"Cart","pkg":"shop","module":"","kind":"class",`
+        ~ `"test":false,"file":"src/main/java/shop/Cart.java","line":2,"endLine":7,"x":`), json);
+    assert(json.canFind(`,"district":1,"nom":2,"noa":2,"loc":6,"cx":3,`
+        ~ `"methods":[["add",5,1,2,1],["clear",6,1,1,0]],"deps":[2]}`), json);
+    assert(json.canFind(`{"id":"shop.CartTest","lang":"java","name":"CartTest","pkg":"shop","module":"",`
+        ~ `"kind":"class","test":true,"file":"src/test/java/shop/CartTest.java",`), json);
+    assert(json.canFind(`{"id":"web/util.ts","lang":"typescript","name":"util.ts","pkg":"web","module":"",`
+        ~ `"kind":"module","test":false,"file":"web/util.ts","line":1,"endLine":2,"x":`), json);
+    assert(json.canFind(`,"district":2,"nom":1,"noa":0,"loc":1,"cx":2,"methods":[["f",1,1,2,1]],"deps":[]}`), json);
+}
+
+unittest // dependenciesAreBuildingIndicesWithMatchingReverseEdges: incoming mirrors deps exactly, ascending
+{
+    import std.algorithm : canFind;
+    import std.file : rmdirRecurse;
+    const dir = tempFixtureDir();
+    scope (exit) rmdirRecurse(dir);
+    auto m = buildFixture(dir, true);
+    auto b = m.buildings;
+    assert(b[0].deps == [2] && b[1].deps == [0]);
+    assert(b[0].incoming == [1] && b[2].incoming == [0]);
+    size_t edges, reverse;
+    foreach (i, ref x; b)
+    {
+        assert(x.index == i);
+        foreach (d; x.deps) assert(b[d].incoming.canFind(i));
+        edges += x.deps.length;
+        reverse += x.incoming.length;
+    }
+    assert(edges == reverse);
+}
+
+unittest // withoutTestsTheTestBuildingsAndTheirEdgesAreDropped: stats count remaining types but every file read
+{
+    import std.algorithm : canFind;
+    import std.file : rmdirRecurse;
+    const dir = tempFixtureDir();
+    scope (exit) rmdirRecurse(dir);
+    auto m = buildFixture(dir, false);
+    assert(buildingIds(m) == ["shop.Cart", "shop.Item", "web/util.ts"]);
+    assert(m.buildings[0].deps == [1] && m.buildings[0].incoming.length == 0);
+    assert(m.json().canFind(`"stats":{"files":4,"failedFiles":0,"types":3,"packages":2,"methods":3,"loc":8,`
+        ~ `"languages":{"java":2,"typescript":1}}`), m.json());
+    uint[] types;
+    foreach (d; m.districts) types ~= d.types;
+    assert(types == [3, 2, 1]);
+}

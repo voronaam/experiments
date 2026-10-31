@@ -97,6 +97,71 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    /// How long a test waits for an expected rebuild.
+    const WAIT: Duration = Duration::from_secs(30);
+    /// How long the tree is left alone after a rebuild before the count is checked again: longer than the debounce,
+    /// so a second rebuild from the same burst would have happened by then.
+    const QUIET: Duration = Duration::from_millis(900);
+
+    /// Waits until `n` rebuilds have happened, then checks that no further one follows.
+    fn expect_calls(calls: &AtomicUsize, n: usize) {
+        let end = std::time::Instant::now() + WAIT;
+        while calls.load(Ordering::SeqCst) < n && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(QUIET);
+        assert_eq!(calls.load(Ordering::SeqCst), n);
+    }
+
+    /// Creating, modifying (in a burst) and deleting a source file, a new directory with a source file (and a later
+    /// file inside it, so the new directory is watched), the two manifests and deleting a directory each cause exactly
+    /// one rebuild. Other files, ignored directories (existing and new) and files changed in them cause none. The
+    /// Java (`SourceWatcherTest`) and D (`watch.d`) editions have the same test.
+    #[test]
+    fn rebuilds_once_for_each_relevant_change_and_never_for_others() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let w = |rel: &str, text: &str| std::fs::write(root.join(rel), text).unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        w("package.json", "{}");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let _w = watch(&root, move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+
+        w("notes.txt", "x");
+        w("notes.txt", "y");
+        w("target/X.java", "class X {}");
+        std::fs::create_dir_all(root.join("node_modules/dep")).unwrap();
+        w("node_modules/dep/Y.java", "class Y {}");
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        w(".hidden/Z.java", "class Z {}");
+        std::fs::remove_file(root.join("notes.txt")).unwrap();
+        expect_calls(&calls, 0);
+
+        w("Main.java", "class Main {}");
+        expect_calls(&calls, 1);
+        for i in 0..5 {
+            w("Main.java", &format!("class Main {{ int f{i}; }}"));
+        }
+        expect_calls(&calls, 2);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        w("sub/Sub.java", "class Sub {}");
+        expect_calls(&calls, 3);
+        w("sub/Later.ts", "export class Later {}");
+        expect_calls(&calls, 4);
+        w("sub/Cargo.toml", "[package]\nname = \"x\"\n");
+        expect_calls(&calls, 5);
+        w("package.json", "{\"name\": \"y\"}");
+        expect_calls(&calls, 6);
+        std::fs::remove_file(root.join("Main.java")).unwrap();
+        expect_calls(&calls, 7);
+        std::fs::remove_dir_all(root.join("sub")).unwrap();
+        expect_calls(&calls, 8);
+    }
+
     /// A change behind a symbolic link to a directory outside the tree is not watched (the walker does not follow
     /// links either), while a change inside the tree is.
     #[test]

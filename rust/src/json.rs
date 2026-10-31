@@ -203,15 +203,78 @@ mod tests {
         assert!(!css.contains("</style"));
     }
 
-    #[test]
-    fn rounds_halves_up_like_java_and_writes_non_finite_as_zero() {
+    /// Writes each value with `num` into one array.
+    fn nums(values: &[f64]) -> String {
         let mut w = JsonWriter::new();
         w.begin_array();
-        // 2.0625 * 1000 = 2062.5 exactly, so these are true ties at the third decimal.
-        for v in [2.0625, -2.0625, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for &v in values {
             w.num(v);
         }
         w.end_array();
-        assert_eq!(w.finish(), "[2.063,-2.062,-1,0,0,0]");
+        w.finish()
+    }
+
+    #[test]
+    fn rounds_halves_up_like_the_other_editions() {
+        // 2.0625 * 1000 = 2062.5 exactly, so these are true ties at the third decimal.
+        assert_eq!(nums(&[2.0625, -2.0625, -1.0, 1.23456, 2.0]), "[2.063,-2.062,-1,1.235,2]");
+    }
+
+    #[test]
+    fn writes_non_finite_numbers_as_zero() {
+        assert_eq!(nums(&[f64::NAN, f64::INFINITY, f64::NEG_INFINITY]), "[0,0,0]");
+    }
+
+    /// Whole numbers are written without a fraction, whether given as a double or as an integer.
+    #[test]
+    fn writes_whole_numbers_without_a_fraction() {
+        assert_eq!(nums(&[0.0, 3.0, -7.0, 1e14]), "[0,3,-7,100000000000000]");
+        let mut w = JsonWriter::new();
+        w.begin_array().int(0).int(i64::MAX).int(i64::MIN).end_array();
+        assert_eq!(w.finish(), "[0,9223372036854775807,-9223372036854775808]");
+    }
+
+    /// Numbers keep at most three decimals, without trailing zeros; what rounds to zero (including minus zero and
+    /// tiny negative values) is written as a plain `0`.
+    #[test]
+    fn rounds_to_three_decimals_without_trailing_zeros() {
+        assert_eq!(nums(&[0.4, 0.1 + 0.2, 2.50, 1.23456, 0.0005, 0.0004, -0.0004, -0.0, -0.4]), "[0.4,0.3,2.5,1.235,0.001,0,0,0,-0.4]");
+    }
+
+    /// Large numbers are written in full with their shortest round-tripping digits (2^60 as 1152921504606847000),
+    /// never with an exponent, the same in every edition.
+    #[test]
+    fn writes_large_numbers_without_an_exponent() {
+        assert_eq!(nums(&[12345678.5, 1e15, (1u64 << 60) as f64, -98765432.125]), "[12345678.5,1000000000000000,1152921504606847000,-98765432.125]");
+    }
+
+    /// Control characters are escaped: newline, carriage return and tab by their short forms, all others (including
+    /// backspace and form feed) as `\u00XX`. DEL and non-ASCII text pass through as they are.
+    #[test]
+    fn escapes_control_characters_and_keeps_other_text() {
+        let mut w = JsonWriter::new();
+        w.begin_array().str("\n\r\t\u{8}\u{c}\u{0}\u{1f}\u{7f}é漢😀'/").end_array();
+        assert_eq!(w.finish(), "[\"\\n\\r\\t\\u0008\\u000c\\u0000\\u001f\u{7f}é漢😀'/\"]");
+    }
+
+    /// Keys are escaped exactly like values: they can hold repository-derived text, and the exported page relies on
+    /// `<`, `>`, `&` and U+2028/2029 never appearing raw anywhere in its JSON.
+    #[test]
+    fn escapes_keys_like_values() {
+        let mut w = JsonWriter::new();
+        w.begin_object().field_int("<k>\"&\u{2028}", 1).end_object();
+        assert_eq!(w.finish(), r#"{"\u003ck\u003e\"\u0026\u2028":1}"#);
+    }
+
+    /// Keys stay in the order they were written, and commas go exactly between the members of nested objects and
+    /// arrays, empty ones included.
+    #[test]
+    fn keeps_keys_in_writing_order_and_commas_between_members() {
+        let mut w = JsonWriter::new();
+        w.begin_object().field_int("b", 1);
+        w.name("a").begin_array().int(1).begin_object().field_bool("c", true).field_bool("d", false).end_object();
+        w.begin_array().end_array().end_array();
+        w.name("e").begin_object().end_object().field_str("f", "x").name("g").opt_str(None).end_object();
+        assert_eq!(w.finish(), r#"{"b":1,"a":[1,{"c":true,"d":false},[]],"e":{},"f":"x","g":null}"#);
     }
 }

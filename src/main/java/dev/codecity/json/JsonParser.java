@@ -16,13 +16,14 @@ import java.util.Map;
  * input raises an {@link IllegalArgumentException}, usually naming the offset (input that ends inside a string escape
  * raises an {@link IndexOutOfBoundsException} instead); {@code PullRequests} treats both as a failed fetch.
  *
- * <p>Arrays and objects may be nested at most {@link #MAX_DEPTH} deep, the limit of the Rust edition's JSON parser:
- * the recursion would otherwise let a hostile response of a few kilobytes of brackets overflow the stack.
+ * <p>Arrays and objects may be nested at most {@link #MAX_DEPTH} deep (only they count, not the value innermost), the
+ * limit of every edition: the recursion would otherwise let a hostile response of a few kilobytes of brackets overflow
+ * the stack.
  */
 public final class JsonParser {
 
     /** Deepest nesting of arrays and objects accepted. */
-    static final int MAX_DEPTH = 128;
+    static final int MAX_DEPTH = 127;
 
     private final String s;
     private int i;

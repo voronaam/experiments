@@ -283,9 +283,11 @@ private void place(Node node, double left, double top, uint depth, ref Layout re
         {
             // The item is the footprint plus the street; the building sits in its top-left corner, and the lot
             // stores the footprint's centre. It stands on this district's platform, one level above depth.
+            // With a larger lot (history replay), the building keeps its own side, centred in the lot, as in the
+            // Java and Rust editions.
             auto t = node.types[item.index];
             const s = node.sides[item.index];
-            result.lots[t.fqn] = Lot(x + s / 2, z + s / 2, s, (depth + 1) * platform, index);
+            result.lots[t.fqn] = Lot(x + s / 2, z + s / 2, side(*t), (depth + 1) * platform, index);
         }
     }
 }
@@ -457,42 +459,277 @@ private void skyline(const Item[] items, double width, double[] xs, double[] zs,
     }
 }
 
-unittest
+// Layout rules, one per unittest. The Java (`CityLayoutTest`) and Rust (`layout.rs`) editions run the same scenarios
+// on the same synthetic fixtures with the same expectations; each block names the Java test it mirrors.
+version (unittest)
 {
-    TypeDecl ty(string pkg, string name, uint noa)
+    import std.conv : to;
+
+    /// A type of the given language in package `pkg` and build module `module_`.
+    private TypeDecl tyIn(Language lang, string module_, string pkg, string name, uint noa)
     {
         TypeDecl t;
-        t.language = Language.java;
-        t.fqn = pkg ~ "." ~ name;
+        t.language = lang;
+        t.fqn = pkg.length ? pkg ~ lang.separator ~ name : name;
         t.name = name;
         t.pkg = pkg;
+        t.module_ = module_;
         t.kind = "class";
         t.noa = noa;
         return t;
     }
 
-    import std.conv : to;
-    immutable pkgs = ["a", "a.b", "a.b.c", "a.d", "e", "e.f.g"];
-    TypeDecl[] types;
-    foreach (i; 0 .. 300)
-        types ~= ty(pkgs[(i * 7) % pkgs.length], "T" ~ i.to!string, ((i * 13) % 9) * (i % 5 == 0 ? 9 : 1));
+    private TypeDecl ty(string pkg, string name, uint noa) { return tyIn(Language.java, "", pkg, name, noa); }
+
+    /// The shared fixture of all three editions: 300 Java types spread evenly over six packages (two of them only
+    /// reachable through empty chains), mostly small, every fifth one larger.
+    private TypeDecl[] city()
+    {
+        immutable pkgs = ["a", "a.b", "a.b.c", "a.d", "e", "e.f.g"];
+        TypeDecl[] types;
+        foreach (i; 0 .. 300)
+            types ~= ty(pkgs[(i * 7) % pkgs.length], "T" ~ i.to!string, ((i * 13) % 9) * (i % 5 == 0 ? 9 : 1));
+        return types;
+    }
+
+    private string[] labels(ref Layout l)
+    {
+        string[] r;
+        foreach (d; l.districts) r ~= d.label;
+        return r;
+    }
+
+    private string[] ids(ref Layout l)
+    {
+        string[] r;
+        foreach (d; l.districts) r ~= d.id;
+        return r;
+    }
+
+    private uint[] depths(ref Layout l)
+    {
+        uint[] r;
+        foreach (d; l.districts) r ~= d.depth;
+        return r;
+    }
+
+    /// Rounds to 9 decimals, so exact expectations are not upset by floating-point noise.
+    private double round9(double v)
+    {
+        import std.math : round;
+        return round(v * 1e9) / 1e9;
+    }
+
+    /// The parent of every district: the closest earlier district one level up (they are in pre-order).
+    private size_t[] parents(const District[] ds)
+    {
+        auto parent = new size_t[ds.length];
+        parent[0] = size_t.max;
+        foreach (i; 1 .. ds.length)
+        {
+            size_t p = i - 1;
+            while (ds[p].depth + 1 != ds[i].depth) p--;
+            parent[i] = p;
+        }
+        return parent;
+    }
+
+    /// The lots as "x z side district" strings, sorted: the set of places regardless of which type got which.
+    private string[] sortedLots(ref Layout l)
+    {
+        import std.format : format;
+        string[] r;
+        foreach (a; l.lots) r ~= format("%.17g %.17g %.17g %s", a.x, a.z, a.side, a.district);
+        r.sort();
+        return r;
+    }
+}
+
+unittest // everyTypeGetsALot: every type of the input gets exactly one lot, keyed by its fqn
+{
+    auto types = city();
     auto l = layout("city", types);
     assert(l.lots.length == types.length);
+    foreach (ref t; types) assert(t.fqn in l.lots, t.fqn);
+}
+
+unittest // buildingsInTheSameDistrictDoNotOverlap: any two lots are at least a street (gap) apart along x or z
+{
+    auto l = layout("city", city());
     auto lots = l.lots.values;
     foreach (i, a; lots)
-    {
-        const dd = l.districts[a.district];
-        assert(a.x - a.side / 2 >= dd.x - dd.w / 2 - 1e-6 && a.x + a.side / 2 <= dd.x + dd.w / 2 + 1e-6);
         foreach (b; lots[i + 1 .. $])
         {
             const gx = abs(a.x - b.x) - (a.side + b.side) / 2;
             const gz = abs(a.z - b.z) - (a.side + b.side) / 2;
             assert(gx >= gap - 1e-6 || gz >= gap - 1e-6);
         }
+}
+
+unittest // buildingsStandInsideTheirDistrict: at least the kerb (pad) to every edge, y = (depth + 1) * platform
+{
+    auto l = layout("city", city());
+    const p = pad - 1e-6;
+    foreach (a; l.lots)
+    {
+        const d = l.districts[a.district];
+        assert(a.x - a.side / 2 >= d.x - d.w / 2 + p && a.x + a.side / 2 <= d.x + d.w / 2 - p);
+        assert(a.z - a.side / 2 >= d.z - d.d / 2 + p && a.z + a.side / 2 <= d.z + d.d / 2 - p);
+        assert(abs(a.y - (d.depth + 1) * platform) < 1e-9);
     }
-    auto single = layout("city", [ty("com.acme.shop", "Cart", 2)]);
-    assert(single.districts.length == 2 && single.districts[1].label == "com.acme.shop");
-    // a footprint override sizes the lot by the given attribute count instead of the type's own
-    auto wide = layout("city", [ty("com.acme.shop", "Cart", 2)], [9]);
-    assert(wide.lots["com.acme.shop.Cart"].side == side(9) && abs(side(9) - 3.6) < 1e-12);
+}
+
+unittest // subDistrictsStandInsideTheirParentWithStreetsBetween: kerb to the parent's edges, streets between siblings
+{
+    auto l = layout("city", city());
+    const ds = l.districts;
+    const parent = parents(ds);
+    const p = pad - 1e-6;
+    foreach (i; 1 .. ds.length)
+    {
+        const c = ds[i], q = ds[parent[i]];
+        assert(c.x - c.w / 2 >= q.x - q.w / 2 + p && c.x + c.w / 2 <= q.x + q.w / 2 - p, c.label);
+        assert(c.z - c.d / 2 >= q.z - q.d / 2 + p && c.z + c.d / 2 <= q.z + q.d / 2 - p, c.label);
+        foreach (j; i + 1 .. ds.length)
+            if (parent[j] == parent[i])
+            {
+                const s = ds[j];
+                const gx = abs(c.x - s.x) - (c.w + s.w) / 2;
+                const gz = abs(c.z - s.z) - (c.d + s.d) / 2;
+                assert(gx >= gap - 1e-6 || gz >= gap - 1e-6, c.label ~ " and " ~ s.label ~ " overlap");
+            }
+    }
+}
+
+unittest // singleChildPackageChainsAreCollapsed: an empty chain above the only package becomes one district
+{
+    auto l = layout("city", [ty("com.acme.shop", "Cart", 2)]);
+    assert(labels(l) == ["city", "com.acme.shop"]);
+    assert(ids(l) == ["", "com.acme.shop"]);
+}
+
+unittest // cityIsRoughlySquare: a packed district comes out roughly square, not as a long row or column
+{
+    TypeDecl[] types;
+    // A fixed permutation of 0..399 (37 is coprime with 400), so the input is not in size order.
+    foreach (i; 0 .. 400)
+    {
+        const k = i * 37 % 400;
+        types ~= ty("p", "T" ~ k.to!string, k % 7);
+    }
+    auto l = layout("city", types);
+    const aspect = l.width / l.depth;
+    assert(aspect >= 0.5 && aspect <= 2);
+}
+
+unittest // layoutIsDeterministic: same input, same city; another order, same districts and the same set of lots
+{
+    import std.algorithm : reverse;
+    auto a = layout("city", city());
+    auto again = layout("city", city());
+    assert(a.districts == again.districts);
+    assert(a.lots == again.lots);
+    // Only equally sized buildings may swap places: the packer keeps their input order (the analysis always hands
+    // the types over sorted by fqn).
+    auto reversed = city();
+    reversed.reverse();
+    auto b = layout("city", reversed);
+    assert(a.districts == b.districts);
+    assert(a.width == b.width && a.depth == b.depth);
+    assert(sortedLots(a) == sortedLots(b));
+}
+
+unittest // footprintGrowsWithTheSquareRootOfTheAttributes: side = 1.2 + 0.8 * sqrt(noa), 1.2 without attributes
+{
+    assert(abs(side(0) - 1.2) < 1e-12 && abs(side(1) - 2.0) < 1e-12);
+    assert(abs(side(4) - 2.8) < 1e-12 && abs(side(9) - 3.6) < 1e-12);
+    auto t = ty("p", "A", 9);
+    assert(abs(side(t) - side(9)) < 1e-12);
+}
+
+unittest // emptyCityIsOneBareDistrict: just the kerb on both sides, centred on the origin
+{
+    auto l = layout("city", []);
+    assert(l.districts == [District("", "city", 0, 0, 0, 2 * pad, 2 * pad, 0)]);
+    assert(l.lots.length == 0);
+    assert(l.width == 2 * pad && l.depth == 2 * pad);
+}
+
+unittest // districtsArePreOrderWithDepthsIdsAndSubtreeTypeCounts: siblings in packing order, larger first
+{
+    auto l = layout("city", city());
+    assert(labels(l) == ["city", "a", "b", "c", "d", "e", "f.g"]);
+    assert(ids(l) == ["", "a", "a.b", "a.b.c", "a.d", "e", "e.f.g"]);
+    assert(depths(l) == [0, 1, 2, 3, 2, 1, 2]);
+    uint[] types;
+    foreach (d; l.districts) types ~= d.types;
+    assert(types == [300, 200, 100, 50, 50, 100, 50]);
+}
+
+unittest // collapsedChainsJoinWithTheirLanguageSeparator: "/" for TypeScript, "::" for Rust
+{
+    auto ts = layout("city", [tyIn(Language.typescript, "", "src/ui/forms", "F", 0)]);
+    assert(labels(ts) == ["city", "src/ui/forms"] && ids(ts) == ["", "src/ui/forms"]);
+    auto rust = layout("city", [tyIn(Language.rust, "", "net::http", "Get", 0)]);
+    assert(labels(rust) == ["city", "net::http"] && ids(rust) == ["", "net::http"]);
+}
+
+unittest // districtWithOwnTypesIsNotFolded: a package with types of its own keeps its own district
+{
+    auto l = layout("city", [ty("a", "A", 0), ty("a.b", "B", 0)]);
+    assert(labels(l) == ["city", "a", "b"] && ids(l) == ["", "a", "a.b"]);
+    assert(l.lots["a.A"].district == 1 && l.lots["a.b.B"].district == 2);
+}
+
+unittest // modulesGetTheirOwnDistrictAndAreNeverFolded: "(root)" for the root module, ids start with "module:"
+{
+    auto l = layout("city", [tyIn(Language.java, "core", "x.y", "X", 0), tyIn(Language.java, "", "z", "Z", 0)]);
+    assert(labels(l) == ["city", "(root)", "z", "core", "x.y"]);
+    assert(ids(l) == ["", "module:(root)", "module:(root)/z", "module:core", "module:core/x.y"]);
+    assert(depths(l) == [0, 1, 2, 1, 2]);
+    assert(l.lots["x.y.X"].district == 4);
+}
+
+unittest // singleModuleHasNoModuleLevel: the packages sit directly on the city
+{
+    auto l = layout("city", [tyIn(Language.java, "core", "x.y", "X", 0), tyIn(Language.java, "core", "x.w", "W", 0)]);
+    assert(labels(l) == ["city", "x", "w", "y"] && ids(l) == ["", "x", "x.w", "x.y"]);
+}
+
+unittest // typesOutsideAPackageStandInADefaultDistrict: "(default)" for Java, "(root)" for TypeScript and Rust
+{
+    auto l = layout("city", [tyIn(Language.java, "", "", "J", 0), tyIn(Language.typescript, "", "", "T", 0),
+        tyIn(Language.rust, "", "", "R", 0)]);
+    // "(root)" holds two buildings, so it is packed (and listed) first.
+    assert(labels(l) == ["city", "(root)", "(default)"] && ids(l) == ["", "(root)", "(default)"]);
+    assert(l.lots["J"].district == 2 && l.lots["T"].district == 1 && l.lots["R"].district == 1);
+}
+
+unittest // largerLotsCentreTheBuildingsOwnFootprint: placed as if larger, each building keeps its own side
+{
+    auto own = [ty("p", "A", 0), ty("p", "B", 1), ty("q", "C", 4)];
+    auto grown = [ty("p", "A", 9), ty("p", "B", 4), ty("q", "C", 4)];
+    auto wide = layout("city", own, [9u, 4, 4]);
+    auto reference = layout("city", grown);
+    assert(wide.districts == reference.districts);
+    foreach (ref t; own)
+    {
+        const w = wide.lots[t.fqn], g = reference.lots[t.fqn];
+        assert(abs(w.x - g.x) < 1e-9 && abs(w.z - g.z) < 1e-9, t.fqn);
+        assert(abs(w.side - side(t)) < 1e-12, t.fqn);
+        assert(w.district == g.district);
+    }
+}
+
+unittest // twoBuildingsHaveExactCoordinates: pins the packer on a tiny case, centred on the origin
+{
+    // The bigger building goes first at the back-left corner, the smaller one in front of it (a wider strip would
+    // put it beside, but the score ties and the narrower strip wins).
+    auto l = layout("city", [ty("p", "A", 0), ty("p", "B", 9)]);
+    assert(round9(l.width) == 7.6 && round9(l.depth) == 9.6);
+    const p = l.districts[1];
+    assert([round9(p.x), round9(p.z), round9(p.w), round9(p.d)] == [0.0, 0.0, 5.6, 7.6]);
+    const b = l.lots["p.B"], a = l.lots["p.A"];
+    assert([round9(b.x), round9(b.z), round9(b.side), round9(b.y)] == [0.0, -1.0, 3.6, 0.8]);
+    assert([round9(a.x), round9(a.z), round9(a.side), round9(a.y)] == [-1.2, 2.2, 1.2, 0.8]);
 }

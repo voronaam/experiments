@@ -30,8 +30,13 @@ public final class RepoCloner {
      * ({@link Git#command}). Both sides are compared as real paths.
      */
     public static boolean isCached(Path dir) {
+        return isCached(dir, cacheRoot());
+    }
+
+    /** {@link #isCached(Path)} for the cache at {@code root}. Test seam: the tests use a cache in a temporary directory. */
+    static boolean isCached(Path dir, Path root) {
         try {
-            return dir.toRealPath().startsWith(cacheRoot().toRealPath());
+            return dir.toRealPath().startsWith(root.toRealPath());
         } catch (IOException e) {
             return false; // no cache yet, or dir does not exist
         }
@@ -49,10 +54,19 @@ public final class RepoCloner {
      * @throws IOException if git fails, or the computed directory would lie outside the cache
      */
     public static Path cloneOrUpdate(GitHubRepo repo) throws IOException {
-        Path dir = cacheRoot().resolve(repo.host()).resolve(repo.owner()).resolve(repo.name()).normalize();
+        return cloneOrUpdate(repo, cacheRoot(), repo.cloneUrl());
+    }
+
+    /**
+     * {@link #cloneOrUpdate(GitHubRepo)} with the cache at {@code root} and the repository cloned from {@code url}
+     * (production: {@link #cacheRoot()} and {@link GitHubRepo#cloneUrl()}). Test seam: the tests clone local bare
+     * repositories ({@code file://} URLs) into a cache in a temporary directory, through the same code path.
+     */
+    static Path cloneOrUpdate(GitHubRepo repo, Path root, String url) throws IOException {
+        Path dir = root.resolve(repo.host()).resolve(repo.owner()).resolve(repo.name()).normalize();
         // Defence in depth: GitHubRepo already rejects "." and "..", but a path escaping the cache must never be
         // cloned into or hard-reset.
-        if (!dir.startsWith(cacheRoot())) {
+        if (!dir.startsWith(root)) {
             throw new IOException("refusing to clone outside the cache: " + dir);
         }
         if (Files.isDirectory(dir.resolve(".git"))) {
@@ -72,7 +86,7 @@ public final class RepoCloner {
             if (repo.branch() != null) {
                 clone.addAll(List.of("--branch", repo.branch()));
             }
-            clone.addAll(List.of("--", repo.cloneUrl(), dir.toString()));
+            clone.addAll(List.of("--", url, dir.toString()));
             Git.interactive(clone);
         }
         return dir;

@@ -19,6 +19,7 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -36,7 +37,8 @@ import java.util.regex.Pattern;
  *
  * <h2>Endpoints</h2>
  * <ul>
- *   <li>{@code /}, {@code /index.html}, {@code /app.js}, {@code /walk.js}, {@code /replay.js}, {@code /style.css}, {@code /favicon.svg}: the viewer, read
+ *   <li>{@code /}, {@code /index.html}, {@code /app.js}, the modules it imports ({@link #MODULES}: {@code /walk.js},
+ *       {@code /replay.js}, …), {@code /style.css}, {@code /favicon.svg}: the viewer, read
  *       from the {@code web/} resources on the classpath. Any other path is a 404, so no file on disk is reachable
  *       by its path.</li>
  *   <li>{@code GET /api/city}: the whole city as JSON ({@link CityModel#json()}).</li>
@@ -63,14 +65,29 @@ import java.util.regex.Pattern;
  */
 public final class CityServer implements AutoCloseable {
 
-    private static final Map<String, String> STATIC = Map.of(
-            "/", "index.html",
-            "/index.html", "index.html",
-            "/app.js", "app.js",
-            "/walk.js", "walk.js",
-            "/replay.js", "replay.js",
-            "/style.css", "style.css",
-            "/favicon.svg", "favicon.svg");
+    /**
+     * The ES modules {@code app.js} imports ({@code import … from './name.js'}), each served at {@code /name.js} and
+     * inlined by {@link dev.codecity.HtmlExporter} as a {@code data:} URL in the import map. A new module must be added
+     * here (and in the Rust and D editions' asset lists); ViewerPageTest checks that every import of app.js is listed.
+     */
+    public static final List<String> MODULES =
+            List.of("walk.js", "replay.js", "text.js", "metrics.js", "search.js", "city.js", "prefs.js");
+
+    private static final Map<String, String> STATIC = staticFiles();
+
+    /** Request path → resource name of every file of the viewer. */
+    private static Map<String, String> staticFiles() {
+        Map<String, String> files = new HashMap<>(Map.of(
+                "/", "index.html",
+                "/index.html", "index.html",
+                "/app.js", "app.js",
+                "/style.css", "style.css",
+                "/favicon.svg", "favicon.svg"));
+        for (String module : MODULES) {
+            files.put("/" + module, module);
+        }
+        return Map.copyOf(files);
+    }
 
     private static final Map<String, String> CONTENT_TYPES = Map.of(
             "html", "text/html; charset=utf-8",
@@ -182,8 +199,20 @@ public final class CityServer implements AutoCloseable {
         return true;
     }
 
+    /**
+     * Answers 404 unless the request's path is exactly {@code path}; returns whether it did. A context of the JDK
+     * server also receives every path below it ({@code /api/city/x}), which the Rust and D editions do not serve.
+     */
+    private static boolean notFound(HttpExchange ex, String path) throws IOException {
+        if (ex.getRequestURI().getPath().equals(path)) {
+            return false;
+        }
+        send(ex, 404, "text/plain", "not found".getBytes(StandardCharsets.UTF_8));
+        return true;
+    }
+
     private void city(HttpExchange ex) throws IOException {
-        if (refused(ex)) {
+        if (refused(ex) || notFound(ex, "/api/city")) {
             return;
         }
         send(ex, 200, "application/json; charset=utf-8", model.json().getBytes(StandardCharsets.UTF_8));
@@ -196,25 +225,36 @@ public final class CityServer implements AutoCloseable {
      * followed or blocked on. An error names the file by its path relative to the root, never the absolute path.
      */
     private void source(HttpExchange ex) throws IOException {
-        if (refused(ex)) {
+        if (refused(ex) || notFound(ex, "/api/source")) {
             return;
         }
         CityModel current = model;
-        int id;
+        // The first "id=" parameter decides. A missing or malformed id (anything but decimal digits, e.g. "-1", "+1" or
+        // "abc", or too large a number) is a bad request; a well-formed one that names no type is not found. The Rust
+        // and D editions answer the same.
+        String value = null;
+        String query = ex.getRequestURI().getRawQuery();
+        for (String kv : query == null ? new String[0] : query.split("&")) {
+            if (kv.startsWith("id=")) {
+                value = kv.substring(3);
+                break;
+            }
+        }
+        long id;
         try {
-            String query = ex.getRequestURI().getQuery();
-            // Pull the digits of "id=N" out of the query string. Without a match the whole query is left as it is and
-            // fails to parse, which ends up as a 400.
-            id = Integer.parseInt(query == null ? "" : query.replaceFirst("^.*\\bid=(\\d+).*$", "$1"));
+            if (value == null || !value.matches("\\d+")) {
+                throw new NumberFormatException();
+            }
+            id = Long.parseLong(value);
         } catch (NumberFormatException e) {
             send(ex, 400, "text/plain", "bad id".getBytes(StandardCharsets.UTF_8));
             return;
         }
-        if (id < 0 || id >= current.types().size()) {
+        if (id >= current.types().size()) {
             send(ex, 404, "text/plain", "unknown type".getBytes(StandardCharsets.UTF_8));
             return;
         }
-        TypeInfo t = current.types().get(id);
+        TypeInfo t = current.types().get((int) id);
         String file = current.analysis().root().relativize(t.file()).toString().replace('\\', '/');
         String code;
         try {
@@ -244,7 +284,7 @@ public final class CityServer implements AutoCloseable {
      * reconnect two seconds after the connection drops (for example when the server restarts).
      */
     private void events(HttpExchange ex) throws IOException {
-        if (refused(ex)) {
+        if (refused(ex) || notFound(ex, "/api/events")) {
             return;
         }
         ex.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");

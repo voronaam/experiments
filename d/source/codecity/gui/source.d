@@ -10,6 +10,7 @@ module codecity.gui.source;
 
 import codecity.model : Language;
 import std.algorithm : canFind;
+import std.array : replace;
 import std.uni : isAlpha, isAlphaNum, isNumber, isUpper, toUpper;
 import std.conv : to;
 
@@ -83,7 +84,8 @@ private immutable string[] rustKeywords = [
 Line[] highlight(string code, Language language)
 {
     const keywords = language == Language.java ? javaKeywords : language == Language.typescript ? tsKeywords : rustKeywords;
-    dchar[] chars = code.to!(dchar[]);
+    // every '\r' is dropped up front, so none ends up inside a comment, string or other token (CRLF files)
+    dchar[] chars = code.replace("\r", "").to!(dchar[]);
     const n = chars.length;
     Line[] lines;
     Line line;
@@ -291,4 +293,105 @@ unittest
     assert(find(lines[4], "b`") == Style.str);
     assert(find(lines[4], "'react'") == Style.str);
     assert(find(lines[5], "C_MAX") == Style.constant);
+}
+
+// ------------------------------------------------------------------ shared samples and hostile input
+//
+// The samples in `testdata/highlight/` (one per language) must give exactly the tokens in their `.tokens.json` files,
+// which the Rust (`source_tests.rs`) and Java (`SourceViewerTest`) editions check too, so the three source windows
+// colour code identically: a JSON array with one entry per line, each an array of `[style, text]` pairs. The hostile
+// inputs check the highlighter's promises on anything: it terminates quickly, gives one line per line of input and
+// loses no character but `\r`.
+
+version (unittest)
+{
+    import std.json : JSONValue, parseJSON;
+
+    /// The shared name of a token class.
+    private string styleName(Style s)
+    {
+        final switch (s)
+        {
+        case Style.plain: return "plain";
+        case Style.keyword: return "keyword";
+        case Style.type: return "type";
+        case Style.constant: return "constant";
+        case Style.str: return "string";
+        case Style.comment: return "comment";
+        case Style.number: return "number";
+        case Style.annotation: return "annotation";
+        }
+    }
+
+    /// Highlights `testdata/highlight/<file>` and compares it with `<file>.tokens.json`, line by line.
+    private void checkSample(string file, Language language)
+    {
+        import std.file : readText;
+        import std.path : buildNormalizedPath, dirName;
+        const dir = buildNormalizedPath(__FILE_FULL_PATH__.dirName, "..", "..", "..", "..", "testdata", "highlight");
+        auto lines = highlight(readText(buildNormalizedPath(dir, file)), language);
+        auto expected = parseJSON(readText(buildNormalizedPath(dir, file ~ ".tokens.json"))).array;
+        assert(expected.length == lines.length, file ~ ": line count");
+        foreach (n, line; lines)
+        {
+            JSONValue[] actual;
+            foreach (tok; line) actual ~= JSONValue([JSONValue(styleName(tok.style)), JSONValue(tok.text)]);
+            assert(JSONValue(actual) == expected[n], file ~ ": line " ~ (n + 1).to!string);
+        }
+    }
+
+    /// One line per input line, and every character but '\r' kept in order, in no empty token.
+    private void assertLossless(string code, Language language)
+    {
+        import std.algorithm : splitter;
+        import std.array : array;
+        auto lines = highlight(code, language);
+        auto texts = code.replace("\r", "").splitter('\n').array;
+        if (texts.length == 0) texts = [""]; // splitter gives nothing at all for empty input
+        assert(lines.length == texts.length, "line count");
+        foreach (k, l; lines)
+        {
+            string joined;
+            foreach (tok; l)
+            {
+                assert(tok.text.length, "empty token");
+                joined ~= tok.text;
+            }
+            assert(joined == texts[k], joined);
+        }
+    }
+}
+
+// the Java, TypeScript and Rust samples match the shared tokens
+unittest
+{
+    checkSample("Sample.java", Language.java);
+    checkSample("sample.ts", Language.typescript);
+    checkSample("sample.rs", Language.rust);
+}
+
+// hostile input keeps every character and line
+unittest
+{
+    foreach (code; ["", "\n", "a\n", "\r\n\r\n", "x = 1;\r\ny = 2;\r\n", "/*", "/* a\r\n b */ c", `"`, `"\`, "'", "`",
+        `"""`, "#[", "#[derive(\n)]", "@", "@\n", "#", "0x", "1.2.3.4e+-5", "'a", "'ab'", "a'b'c'",
+        "\x00\x01\x07\x1b[31m\x7f", "\uFEFFclass Ä { String ü = \"ö\"; }", "let 𝑥 = '😀'; // 😀\u202Eevil",
+        "\uFFFD\uFFFD broken \uFFFD", `\\\`, "/* /* */ */", "// comment \\\nnext", "`${`${`nested`}`}`"])
+        foreach (language; [Language.java, Language.typescript, Language.rust])
+            assertLossless(code, language);
+}
+
+// huge and pathological input finishes quickly
+unittest
+{
+    import std.array : replicate;
+    import std.datetime.stopwatch : AutoStart, StopWatch;
+    auto sw = StopWatch(AutoStart.yes);
+    const manyLines = "\n".replicate(100_000);
+    foreach (code; ["/*".replicate(50_000) ~ `"`.replicate(50_000) ~ "a".replicate(100_000), manyLines,
+        "/* x */ \"y\" 'z' `w` @a #[b] 12 ".replicate(20_000)])
+        foreach (language; [Language.java, Language.typescript, Language.rust])
+            assertLossless(code, language);
+    assert(highlight(manyLines, Language.java).length == 100_001);
+    assert(sw.peek.total!"seconds" < 30);
 }

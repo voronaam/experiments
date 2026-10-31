@@ -18,19 +18,40 @@ import std.path : baseName, buildPath;
 /// rebuild rather than many.
 private enum debounce = 400.msecs;
 
-/// Starts watching `root` in the background and returns immediately.
-void watch(string root, void delegate() onChange)
+/// A running watcher. The program never stops its watcher (it ends with the process); tests call `stop`, so no
+/// watcher thread or inotify descriptor outlives its test.
+final class Watcher
 {
+    private shared bool stopped;
+    private Thread thread;
+
+    /// Ends the watcher's thread (within about 200 ms, or after a rebuild in progress) and waits for it. Safe to call
+    /// more than once.
+    void stop()
+    {
+        import core.atomic : atomicStore;
+        atomicStore(stopped, true);
+        thread.join(false);
+    }
+
+    private bool stopping()
+    {
+        import core.atomic : atomicLoad;
+        return atomicLoad(stopped);
+    }
+}
+
+/// Starts watching `root` in the background and returns immediately; the result can stop it again.
+Watcher watch(string root, void delegate() onChange)
+{
+    auto w = new Watcher;
     version (linux)
-    {
-        auto t = new Thread({ inotifyLoop(root, onChange); });
-    }
+        w.thread = new Thread({ inotifyLoop(root, onChange, w); });
     else
-    {
-        auto t = new Thread({ pollLoop(root, onChange); });
-    }
-    t.isDaemon = true;
-    t.start();
+        w.thread = new Thread({ pollLoop(root, onChange, w); });
+    w.thread.isDaemon = true;
+    w.thread.start();
+    return w;
 }
 
 /// inotify watches single directories, not trees, so every directory under `root` (except ignored and symlinked
@@ -39,7 +60,7 @@ void watch(string root, void delegate() onChange)
 /// Debouncing: while nothing is pending, `poll` waits indefinitely. A relevant event sets `pending`, and from then
 /// on `poll` waits at most `debounce`; every further event restarts that wait. When it times out with nothing new,
 /// `onChange` runs.
-version (linux) private void inotifyLoop(string root, void delegate() onChange)
+version (linux) private void inotifyLoop(string root, void delegate() onChange, Watcher w)
 {
     import core.sys.linux.sys.inotify;
     import core.sys.posix.poll : poll, pollfd, POLLIN;
@@ -47,7 +68,12 @@ version (linux) private void inotifyLoop(string root, void delegate() onChange)
     import std.string : fromStringz, toStringz;
 
     const fd = inotify_init1(IN_CLOEXEC);
-    if (fd < 0) return pollLoop(root, onChange);
+    if (fd < 0) return pollLoop(root, onChange, w);
+    scope (exit)
+    {
+        import core.sys.posix.unistd : close;
+        close(fd);
+    }
     // Watch descriptor → watched directory, to rebuild the full path from an event's name. Entries are never
     // removed; a deleted directory's watch is simply never reported again.
     string[int] dirs;
@@ -70,10 +96,11 @@ version (linux) private void inotifyLoop(string root, void delegate() onChange)
     // One read returns as many whole events as fit; 64 KiB holds hundreds of them.
     ubyte[64 * 1024] buf;
     bool pending;
-    while (true)
+    // While idle, wake every 200 ms anyway to notice `Watcher.stop`.
+    while (!w.stopping)
     {
         pollfd p = pollfd(fd, POLLIN, 0);
-        const ready = poll(&p, 1, pending ? cast(int) debounce.total!"msecs" : -1);
+        const ready = poll(&p, 1, pending ? cast(int) debounce.total!"msecs" : 200);
         if (ready == 0 && pending)
         {
             pending = false; // quiet for a moment: rebuild
@@ -118,7 +145,7 @@ version (linux) private void inotifyLoop(string root, void delegate() onChange)
 /// manifest (Cargo.toml, package.json) and compares it with the previous one. Added and deleted files change the
 /// snapshot's keys, so they are noticed too. After a change it waits `debounce`, takes a fresh snapshot as the new
 /// baseline and calls `onChange`.
-private void pollLoop(string root, void delegate() onChange)
+private void pollLoop(string root, void delegate() onChange, Watcher w)
 {
     long[string] stamps;
     long[string] scan()
@@ -133,7 +160,7 @@ private void pollLoop(string root, void delegate() onChange)
         return s;
     }
     stamps = scan();
-    while (true)
+    while (!w.stopping)
     {
         Thread.sleep(1.seconds);
         auto now = scan();
@@ -161,7 +188,8 @@ version (linux) unittest
     mkdirRecurse(outside);
     symlink(outside, buildPath(root, "link"));
     shared int calls;
-    watch(root, { atomicOp!"+="(calls, 1); });
+    auto watcher = watch(root, { atomicOp!"+="(calls, 1); });
+    scope (exit) watcher.stop();
     Thread.sleep(200.msecs); // the watcher registers the tree on its own thread
     write(buildPath(outside, "X.java"), "class X {}");
     Thread.sleep(1200.msecs);
@@ -169,4 +197,65 @@ version (linux) unittest
     write(buildPath(root, "Y.java"), "class Y {}");
     Thread.sleep(1200.msecs);
     assert(atomicLoad(calls) == 1);
+}
+
+/// Creating, modifying (in a burst) and deleting a source file, a new directory with a source file (and a later file
+/// inside it, so the new directory is watched), the two manifests and deleting a directory each cause exactly one
+/// rebuild. Other files, ignored directories (existing and new) and files changed in them cause none. The Java
+/// (`SourceWatcherTest`) and Rust (`watch.rs`) editions have the same test. (The watcher is stopped at the end, so
+/// neither its thread nor its inotify descriptor outlives the test.)
+version (linux) unittest
+{
+    import core.atomic : atomicLoad, atomicOp;
+    import core.time : MonoTime;
+    import std.file : mkdirRecurse, remove, rmdirRecurse, tempDir, write;
+    import std.format : format;
+    import std.uuid : randomUUID;
+
+    const root = buildPath(tempDir, "codecity-watch-test-" ~ randomUUID.toString);
+    mkdirRecurse(buildPath(root, "target"));
+    scope (exit) rmdirRecurse(root);
+    void w(string rel, string text) { write(buildPath(root, rel), text); }
+    w("package.json", "{}");
+    shared int calls;
+    // Waits until `n` rebuilds have happened, then leaves the tree alone for longer than the debounce and checks that
+    // no further one followed.
+    void expectCalls(int n)
+    {
+        const end = MonoTime.currTime + 30.seconds;
+        while (atomicLoad(calls) < n && MonoTime.currTime < end) Thread.sleep(20.msecs);
+        Thread.sleep(900.msecs);
+        assert(atomicLoad(calls) == n, format("%d rebuilds, expected %d", atomicLoad(calls), n));
+    }
+    auto watcher = watch(root, { atomicOp!"+="(calls, 1); });
+    scope (exit) watcher.stop();
+    Thread.sleep(200.msecs); // the watcher registers the tree on its own thread
+
+    w("notes.txt", "x");
+    w("notes.txt", "y");
+    w("target/X.java", "class X {}");
+    mkdirRecurse(buildPath(root, "node_modules", "dep"));
+    w("node_modules/dep/Y.java", "class Y {}");
+    mkdirRecurse(buildPath(root, ".hidden"));
+    w(".hidden/Z.java", "class Z {}");
+    remove(buildPath(root, "notes.txt"));
+    expectCalls(0);
+
+    w("Main.java", "class Main {}");
+    expectCalls(1);
+    foreach (i; 0 .. 5) w("Main.java", format("class Main { int f%d; }", i));
+    expectCalls(2);
+    mkdirRecurse(buildPath(root, "sub"));
+    w("sub/Sub.java", "class Sub {}");
+    expectCalls(3);
+    w("sub/Later.ts", "export class Later {}");
+    expectCalls(4);
+    w("sub/Cargo.toml", "[package]\nname = \"x\"\n");
+    expectCalls(5);
+    w("package.json", `{"name": "y"}`);
+    expectCalls(6);
+    remove(buildPath(root, "Main.java"));
+    expectCalls(7);
+    rmdirRecurse(buildPath(root, "sub"));
+    expectCalls(8);
 }

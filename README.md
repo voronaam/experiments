@@ -183,6 +183,44 @@ serves the viewer on localhost only (refusing other `Host` names), and treats ev
 pull-request field as plain text. GitHub tokens are only sent to the API host they belong to. See the
 [threat model](docs/threat-model.md) for the details, the residual risks and the rules for changes.
 
+## Testing
+
+```bash
+scripts/test-all.sh              # Java, Rust, D and browser test suites, then parity on the fixtures, with a summary
+scripts/test-web.sh              # the browser viewer's unit tests only (node --test, Node 22+)
+scripts/parity.sh                # the three built editions on the fixtures: identical output, matching the golden files
+scripts/parity.sh https://github.com/google/gson ~/src/app   # parity on real repositories (add --history to replay)
+scripts/parity.sh --update-golden                            # rewrite testdata/golden/, only if all editions agree
+```
+
+* **End-to-end tests.** Each edition's own suite (`./mvnw test`, `cargo test`, `dub test`) runs the whole pipeline on
+  the fixtures in `testdata/` and compares the city JSON with the golden files in `testdata/golden/`
+  (`GoldenCityTest`, `golden_tests.rs`, `golden.d`). The three editions share the golden files, so they are held to
+  identical output.
+  * `java-project`, `ts-project`, `rust-project` and `mixed-project` cover the analysis rules of each language: types,
+    metrics, complexity, imports, test code, skipped files and syntax errors. They are analysed without git history,
+    with and without `--no-tests`.
+  * `make-history-repo.sh` builds a git repository with fixed authors and dates, analysed with git history and with
+    `--history`.
+* **Normalisation.** Before comparing, `generatedAt` and `buildMillis` are removed, `root` becomes `"<root>"` and each
+  building's `deps` are sorted (`scripts/city_json.py`, mirrored by each test). A failing test prints the first
+  differences, and keeps the actual JSON in the edition's build directory (`target/`, `rust/target/`, `d/.dub/`).
+* **After an intended change of the output,** build the three editions, run `scripts/parity.sh --update-golden`
+  (or `UPDATE_GOLDEN=1 scripts/parity.sh`) and review the change with `git diff testdata/golden`. It refuses to
+  write anything unless all three editions produce the same JSON for every fixture.
+* `parity.sh` builds nothing: it uses `target/codecity.jar`, `rust/target/release/codecity` and `d/bin/codecity`
+  (override with `JAVA_JAR`, `RUST_BIN`, `D_BIN`). `--keep` keeps the exported files.
+* **Browser viewer.** The viewer's logic that needs neither three.js nor the DOM lives in small ES modules next to
+  `app.js` (`walk.js`, `replay.js`, `text.js`, `metrics.js`, `search.js`, `city.js`, `prefs.js`), tested by
+  `src/test/web/*.test.mjs` with Node's built-in test runner — no npm packages, no `package.json`. The walk and
+  replay tests use the same scenarios and numbers as the desktop viewers' tests; the markup tests feed hostile
+  strings into every field and check that nothing can open an element, add an attribute or link to anything but
+  `https://`. Run `scripts/test-web.sh` (skipped with a message when Node is missing) or
+  `node --test 'src/test/web/*.test.mjs'`. The modules import nothing themselves: the exported page loads each one
+  from a `data:` URL in its import map, which cannot resolve relative imports. A new module goes into the module
+  lists of all three editions (`CityServer.MODULES`, `assets::MODULES`, `assets.modules`); each edition's page test
+  checks that every module `app.js` imports is served and inlined in the export.
+
 ## How it is built
 
 | | |

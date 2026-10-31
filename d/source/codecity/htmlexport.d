@@ -1,8 +1,10 @@
 /// Writes the viewer and the city data into one self-contained HTML file.
 ///
 /// The exported page is the served `index.html` with its local references inlined: the stylesheet, the favicon (as
-/// a data URI) and the viewer script. `app.js` imports `./walk.js` and `./replay.js`, which an inline module cannot
-/// load from disk, so the page's import map gets an entry for each, mapping it to a base64 `data:` URL of that module. The city JSON goes
+/// a data URI) and the viewer script. `app.js` imports the modules `codecity.assets.modules` (`./walk.js`,
+/// `./replay.js`, …), which an inline module cannot load from disk, so the page's import map gets an entry for each,
+/// mapping it to a base64 `data:` URL of that module (which is why those modules import nothing themselves: a `data:`
+/// module cannot resolve a relative import). The city JSON goes
 /// into a `<script id="city-data" type="application/json">` element, which `app.js` reads instead of fetching `/api/city`. Third-party references in the page (fonts and
 /// libraries from CDNs) stay as links, so the file still needs network access for those. Without a server there is
 /// no `/api/source` and no live update.
@@ -27,12 +29,13 @@ void exportHtml(CityModel model, string target)
     const favicon = faviconSvg.replace(`"`, "'").replace("#", "%23").replace("\n", " ");
     replaceOnce(html, `<link rel="icon" href="favicon.svg" type="image/svg+xml">`, `<link rel="icon" href="data:image/svg+xml,` ~ favicon ~ `">`);
     // "./walk.js" in the import map resolves against the page URL, exactly like app.js's import from the inline
-    // module, so the import is served from the data: URL (likewise "./replay.js"). Base64 needs no escaping inside the
-    // JSON string.
-    replaceOnce(html, `"imports": {`, "\"imports\": {\n        \"./walk.js\": \"data:text/javascript;base64,"
-        ~ Base64.encode(cast(const(ubyte)[]) walkJs).idup ~ "\","
-        ~ "\n        \"./replay.js\": \"data:text/javascript;base64,"
-        ~ Base64.encode(cast(const(ubyte)[]) replayJs).idup ~ "\",");
+    // module, so the import is served from the data: URL (likewise every other module). Base64 needs no escaping
+    // inside the JSON string.
+    string imports = `"imports": {`;
+    foreach (m; modules)
+        imports ~= "\n        \"./" ~ m[0] ~ "\": \"data:text/javascript;base64,"
+            ~ Base64.encode(cast(const(ubyte)[]) m[1]).idup ~ "\",";
+    replaceOnce(html, `"imports": {`, imports);
     // the JSON writer escapes '<', so the data cannot terminate the script element early
     replaceOnce(html, `<script type="module" src="app.js"></script>`,
         `<script id="city-data" type="application/json">` ~ model.json ~ "</script>\n<script type=\"module\">\n" ~ appJs ~ "\n</script>");
@@ -53,7 +56,7 @@ private void replaceOnce(ref string text, string marker, string replacement)
 
 /// The viewer's Content-Security-Policy allows inline scripts only by hash. Each emitted page (the served one, as
 /// `asset` hands it to the server, and an exported one) must list exactly the hashes of its own inline scripts, so
-/// editing index.html, app.js, walk.js or replay.js cannot break it. The Java and Rust editions have the same test.
+/// editing index.html, app.js or the modules it imports cannot break it. The Java and Rust editions have the same test.
 unittest
 {
     import codecity.analysis : SourceAnalyzer;
@@ -103,4 +106,41 @@ unittest
         assert(listed == scriptHashes(page), "the policy lists exactly the page's inline scripts");
     }
     assert(csp(served).replaceAll(hash, "") == csp(exported).replaceAll(hash, ""));
+}
+
+/// app.js imports its sibling modules (`import … from './name.js'`); each must be served and must be inlined into the
+/// exported page's import map, and none may import anything itself (a `data:` module cannot resolve a relative
+/// import). The Java and Rust editions have the same test.
+unittest
+{
+    import codecity.analysis : SourceAnalyzer;
+    import codecity.github : GitHubInfo;
+    import std.algorithm : canFind, map;
+    import std.array : array;
+    import std.base64 : Base64;
+    import std.file : mkdirRecurse, readText, rmdirRecurse, tempDir, write;
+    import std.path : buildPath;
+    import std.regex : ctRegex, matchAll, matchFirst;
+    import std.uuid : randomUUID;
+
+    string[] imported;
+    foreach (c; appJs.matchAll(ctRegex!(`from '\./([\w-]+\.js)'`))) imported ~= c[1];
+    assert(imported == modules.map!(m => m[0]).array, "app.js imports exactly the listed modules, in that order");
+
+    const dir = buildPath(tempDir, "codecity-export-test-" ~ randomUUID.toString);
+    mkdirRecurse(dir);
+    scope (exit) rmdirRecurse(dir);
+    write(buildPath(dir, "A.java"), "class A { void f() {} }\n");
+    auto model = CityModel.build(new SourceAnalyzer, dir, true, false, false, GitHubInfo.init);
+    const out_ = buildPath(dir, "out", "city.html");
+    exportHtml(model, out_);
+    const exported = readText(out_);
+    foreach (m; modules)
+    {
+        string ct, body_;
+        assert(asset("/" ~ m[0], ct, body_), m[0]);
+        assert(ct == "text/javascript; charset=utf-8" && body_ == m[1], m[0]);
+        assert(exported.canFind(`"./` ~ m[0] ~ `": "data:text/javascript;base64,` ~ Base64.encode(cast(const(ubyte)[]) m[1]) ~ `"`), m[0]);
+        assert(m[1].matchFirst(ctRegex!(`^\s*import\b|\bfrom\s*['"]`, "m")).empty, m[0] ~ " imports nothing");
+    }
 }

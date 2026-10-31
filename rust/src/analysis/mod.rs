@@ -20,6 +20,14 @@ pub mod java;
 pub mod java_parse;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod java_rules_tests;
+#[cfg(test)]
+mod typescript_rules_tests;
+#[cfg(test)]
+mod rust_rules_tests;
+#[cfg(test)]
+mod caps_tests;
 pub mod rust_lang;
 pub mod rust_parse;
 pub mod text;
@@ -270,6 +278,11 @@ impl SourceAnalyzer {
         };
         // Catch panics so that one file the analyser cannot handle does not abort the whole (parallel) analysis.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match lang {
+            // Test-only seam: lets the tests crash an analyser on purpose (see `crash_tests`).
+            #[cfg(test)]
+            _ if file.file_name().is_some_and(|n| n.to_string_lossy().starts_with(crash_tests::CRASH_ON_PURPOSE)) => {
+                panic!("deliberate analyser crash (test)")
+            }
             Language::Java => java::parse(root, file, &code),
             Language::TypeScript => typescript::parse(root, file, &code),
             Language::Rust => rust_lang::parse(root, file, &code),
@@ -374,5 +387,54 @@ mod walk_tests {
         assert_eq!(fqns, ["A", "src/B.ts:B"]);
         assert_eq!(a.files, 3); // A.java, B.ts and Big.java
         assert_eq!(a.failed_files, 1); // Big.java is too large to parse
+    }
+}
+
+/// A crash in an analyser fails only the file it happened in, and a file that is not valid UTF-8 is read as
+/// ISO-8859-1. The Java (`AdversarialInputTest`) and D (`analysis/package.d`) editions have the same tests.
+#[cfg(test)]
+mod crash_tests {
+    use super::*;
+
+    /// Files whose name starts with this make the analyser panic (test builds only, see `SourceAnalyzer::parse`).
+    pub const CRASH_ON_PURPOSE: &str = "CrashOnPurpose";
+
+    /// Like Java's `stackOverflowInAnAnalyserFailsOnlyThatFile`: the crashing files count as failed, every other file
+    /// is analysed, and the analysis as a whole goes on.
+    #[test]
+    fn a_crash_in_an_analyser_fails_only_that_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("CrashOnPurpose1.java"), "class Bad1 {}").unwrap();
+        std::fs::write(tmp.path().join("CrashOnPurpose2.ts"), "export class Bad2 {}").unwrap();
+        std::fs::write(tmp.path().join("Good.java"), "class Good {}").unwrap();
+        std::fs::write(tmp.path().join("good.ts"), "export class Fine {}").unwrap();
+        let a = SourceAnalyzer::new().analyze(tmp.path(), true);
+        let mut fqns: Vec<&str> = a.types.iter().map(|t| t.fqn.as_str()).collect();
+        fqns.sort();
+        assert_eq!(fqns, ["Good", "good.ts:Fine"]);
+        assert_eq!(a.files, 4);
+        assert_eq!(a.failed_files, 2);
+    }
+
+    /// A file that is not valid UTF-8 is read as ISO-8859-1 (every byte one character), so legacy sources still yield
+    /// their types, with the accented names decoded, and none counts as failed.
+    #[test]
+    fn invalid_utf8_is_read_as_latin1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("Legacy.java"), b"// Gr\xfc\xdfe \xa9 2001\nclass Caf\xe9 {\n    String s = \"\xe9\";\n    void m\xfc() {}\n}\n").unwrap();
+        std::fs::write(src.join("legacy.ts"), b"export class Caf\xe9 { n = \"\xe9\"; f\xfc() {} }\n").unwrap();
+        std::fs::write(src.join("lib.rs"), b"// \xa9\npub struct Caf\xe9 { s: u8 }\nimpl Caf\xe9 { fn f\xfc(&self) {} }\n").unwrap();
+        let a = SourceAnalyzer::new().analyze(tmp.path(), true);
+        assert_eq!(a.failed_files, 0);
+        assert_eq!(a.types.len(), 3);
+        for t in &a.types {
+            assert_eq!(t.name, "Café", "{}", t.fqn);
+            assert_eq!(t.methods.len(), 1, "{}", t.fqn);
+            assert!(t.methods[0].name.ends_with('ü'), "{}", t.fqn);
+        }
+        assert!(a.types.iter().any(|t| t.fqn == "Café"));
+        assert!(a.types.iter().any(|t| t.fqn == "src/legacy.ts:Café"));
     }
 }

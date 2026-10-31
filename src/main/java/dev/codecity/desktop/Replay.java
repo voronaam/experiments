@@ -1,6 +1,11 @@
 package dev.codecity.desktop;
 
+import dev.codecity.history.Snapshot;
 import dev.codecity.layout.CityLayout;
+
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
 
 /**
  * Playback state of the history replay: a continuous position over the snapshots, play/pause and speed. Like
@@ -44,6 +49,12 @@ final class Replay {
 
     double speed() {
         return SPEEDS[speed];
+    }
+
+    /** The speed as shown on its button, e.g. {@code 2×} or {@code 0.5×}. */
+    String speedLabel() {
+        double s = speed();
+        return (s == Math.rint(s) ? String.valueOf((int) s) : String.valueOf(s)) + "×";
     }
 
     /** Moves to the next speed: 1× → 2× → 4× → 0.5× → 1×. */
@@ -128,6 +139,24 @@ final class Replay {
         double a = Math.max(0, va);
         double b = Math.max(0, vb);
         return a + (b - a) * f;
+    }
+
+    /**
+     * The timeline's text: the local date, the short commit id, the subject cut to 60 characters (code points, so a
+     * character outside the BMP is never split, with an ellipsis), then the author.
+     */
+    static String caption(Snapshot s) {
+        String subject = s.subject();
+        if (subject.codePointCount(0, subject.length()) > 60) {
+            subject = subject.substring(0, subject.offsetByCodePoints(0, 59)) + "…";
+        }
+        return day(s.time()) + " · " + s.commit().substring(0, Math.min(7, s.commit().length())) + " · " + subject
+                + " — " + s.author();
+    }
+
+    /** A date as {@code YYYY-MM-DD} in the local time zone. */
+    static String day(long epochSeconds) {
+        return LocalDate.ofInstant(Instant.ofEpochSecond(epochSeconds), ZoneId.systemDefault()).toString();
     }
 
     /** Footprint side for an attribute count with the layout's formula; 0 for an absent type (-1). */

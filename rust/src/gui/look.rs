@@ -220,11 +220,22 @@ impl ColorMetric {
 
     /// None when available, otherwise why not.
     pub fn unavailable(self, model: &CityModel) -> Option<&'static str> {
+        self.missing(model.has_git(), model.has_pulls())
+    }
+
+    /// [`ColorMetric::unavailable`] for a model with or without git history and fetched pull requests: None when
+    /// available, otherwise the suffix the colour menu shows after the metric's name.
+    pub fn missing(self, has_git: bool, has_pulls: bool) -> Option<&'static str> {
         match self {
-            ColorMetric::Commits | ColorMetric::Age | ColorMetric::Authors if !model.has_git() => Some(" (no git)"),
-            ColorMetric::Prs if !model.has_pulls() => Some(" (no GitHub)"),
+            ColorMetric::Commits | ColorMetric::Age | ColorMetric::Authors if !has_git => Some(" (no git)"),
+            ColorMetric::Prs if !has_pulls => Some(" (no GitHub)"),
             _ => None,
         }
+    }
+
+    /// Whether a model with or without git history and fetched pull requests can colour by this metric.
+    pub fn available(self, has_git: bool, has_pulls: bool) -> bool {
+        self.missing(has_git, has_pulls).is_none()
     }
 
     /// Whether the scale is linear rather than logarithmic. Only complexity per method, a ratio rather than a count.
@@ -274,13 +285,13 @@ pub struct Scale {
 impl Scale {
     /// Measures the metric over all buildings of `model`.
     pub fn of(metric: ColorMetric, model: &CityModel) -> Scale {
-        let mut finite: Vec<f64> = model
-            .buildings
-            .iter()
-            .filter(|b| !b.gone)
-            .map(|b| metric.value(&model.types()[b.index], b))
-            .filter(|v| v.is_finite())
-            .collect();
+        Scale::over(metric, model.buildings.iter().filter(|b| !b.gone).map(|b| metric.value(&model.types()[b.index], b)).collect())
+    }
+
+    /// The scale for `metric` over the raw metric `values` of the buildings it is measured on; infinite values are
+    /// left out.
+    pub fn over(metric: ColorMetric, values: Vec<f64>) -> Scale {
+        let mut finite: Vec<f64> = values.into_iter().filter(|v| v.is_finite()).collect();
         finite.sort_by(f64::total_cmp);
         // Nearest-rank percentile, rounding the rank down.
         let p98 = if finite.is_empty() { 0.0 } else { finite[((0.98 * (finite.len() - 1) as f64) as usize).min(finite.len() - 1)] };
@@ -318,6 +329,14 @@ impl Scale {
         ramp(x)
     }
 
+    /// The legend's texts under the two ends of the ramp: the formatted `lo` and `hi` with a `+` (values above `hi`
+    /// are clipped there). Recency is inverted on the ramp (see [`Scale::color_of`]), so its values are swapped: the
+    /// oldest age is on the left under "dormant", the newest on the right.
+    pub fn ends(&self) -> (String, String) {
+        let (lo, hi) = (self.show(self.lo), format!("{}+", self.show(self.hi)));
+        if self.metric.invert() { (hi, lo) } else { (lo, hi) }
+    }
+
     /// A metric value formatted for the legend.
     pub fn show(&self, v: f64) -> String {
         if self.metric == ColorMetric::Age {
@@ -325,7 +344,7 @@ impl Scale {
         } else if v == v.trunc() {
             fmt(v)
         } else {
-            format!("{v:.1}")
+            one_decimal(v)
         }
     }
 }
@@ -338,12 +357,14 @@ pub fn now() -> i64 {
 /// Compact number for labels and chips: rounded with thousands separators (`9,876`) below 10,000, `12.3k` below
 /// 100,000, `123k` above.
 pub fn fmt(n: f64) -> String {
+    // Rounded half up to a whole number first; thousands and tenths of thousands then follow in integers, so a tie
+    // (12,250 → 12.3k) rounds up exactly as in the other viewers, whatever the binary value of n / 1000.
+    let v = (n + 0.5).floor() as i64;
     if n >= 100_000.0 {
-        format!("{}k", (n / 1000.0).round())
+        format!("{}k", (v + 500) / 1000)
     } else if n >= 10_000.0 {
-        format!("{:.1}k", n / 1000.0)
+        format!("{}k", tenths((v + 50) / 100))
     } else {
-        let v = n.round() as i64;
         let s = v.unsigned_abs().to_string();
         // thousands separators, counted on the digits only so a minus sign does not shift them (`-1,234`)
         let bytes = s.as_bytes();
@@ -358,13 +379,30 @@ pub fn fmt(n: f64) -> String {
     }
 }
 
-/// Relative age of a Unix timestamp: "today", "12d ago", "5mo ago" (30-day months) or "1.5y ago".
-pub fn rel_time(epoch: i64) -> String {
+/// Tenths as a number with one decimal: 123 → "12.3", -5 → "-0.5". Every one-decimal number the viewers show is
+/// rounded to tenths first (half up) and then written by this, the same way in every edition.
+pub fn tenths(t: i64) -> String {
+    format!("{}{}.{}", if t < 0 { "-" } else { "" }, t.unsigned_abs() / 10, t.unsigned_abs() % 10)
+}
+
+/// `x` with one decimal, rounded half up: `floor(10x + 0.5)` tenths.
+pub fn one_decimal(x: f64) -> String {
+    tenths((x * 10.0 + 0.5).floor() as i64)
+}
+
+/// The ratio `a / b` (b > 0) with one decimal, rounded half up in integers: 5 / 4 → "1.3".
+pub fn ratio(a: i64, b: i64) -> String {
+    tenths((20 * a + b).div_euclid(2 * b))
+}
+
+/// Relative age of a Unix timestamp measured at `now` (Unix seconds): "today", "12d ago", "5mo ago" (30-day months) or
+/// "1.5y ago"; "—" for 0 or less, which means "no date known".
+pub fn rel_time_at(epoch: i64, now: i64) -> String {
     // 0 or less means "no date known".
     if epoch <= 0 {
         return "—".into();
     }
-    let days = (now() - epoch) as f64 / 86400.0;
+    let days = (now - epoch) as f64 / 86400.0;
     if days < 1.0 {
         "today".into()
     } else if days < 30.0 {
@@ -372,7 +410,8 @@ pub fn rel_time(epoch: i64) -> String {
     } else if days < 365.0 {
         format!("{}mo ago", (days / 30.0).round())
     } else {
-        format!("{:.1}y ago", days / 365.0)
+        // Tenths of years in integers: half up of (seconds · 10) / (seconds per 365 days).
+        format!("{}y ago", ratio(now - epoch, 365 * 86_400))
     }
 }
 
@@ -382,24 +421,4 @@ pub fn rel_time(epoch: i64) -> String {
 /// option-like strings) is refused.
 pub fn is_web_link(url: &str) -> bool {
     url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) && !url.chars().any(|c| c <= ' ' || c == '\x7f')
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn web_links_are_https_only() {
-        assert!(super::is_web_link("https://github.com/o/r/pull/1"));
-        assert!(super::is_web_link("HTTPS://github.com/o/r"));
-        for bad in ["javascript:alert(1)", "file:///etc/passwd", "http://x", "--help", "https://x y", "https://x\n", "ssh://h", "", "https:/"] {
-            assert!(!super::is_web_link(bad), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn fmt_signs_and_separators() {
-        assert_eq!(super::fmt(-123.0), "-123");
-        assert_eq!(super::fmt(-1234.0), "-1,234");
-        assert_eq!(super::fmt(9876.0), "9,876");
-        assert_eq!(super::fmt(12_345.0), "12.3k");
-    }
 }

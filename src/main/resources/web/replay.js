@@ -48,6 +48,43 @@ export function stepPosition(p, dir, count) {
   return clampPosition(target, count);
 }
 
+/** A playback of `count` snapshots: at the first one, playing, at 1× (speed is an index into SPEEDS). */
+export function start(count) {
+  return { count, p: 0, playing: true, speed: 0 };
+}
+
+/** One frame of `dt` seconds while playing (see advance); it pauses at the last snapshot. Nothing while paused. */
+export function play(rp, dt) {
+  if (!rp.playing) return;
+  rp.p = advance(rp.p, dt, SPEEDS[rp.speed], rp.count);
+  if (rp.p >= rp.count - 1) rp.playing = false;
+}
+
+/** Play / pause; playing from the end starts over at the first snapshot. A single snapshot never plays. */
+export function togglePlaying(rp) {
+  if (rp.playing) rp.playing = false;
+  else {
+    if (rp.p >= rp.count - 1) rp.p = 0;
+    rp.playing = rp.count > 1;
+  }
+}
+
+/** Moves to position p (clamped) and pauses: the slider, the step keys, Home and End. */
+export function seek(rp, p) {
+  rp.p = clampPosition(p, rp.count);
+  rp.playing = false;
+}
+
+/** Cycles the speed 1× → 2× → 4× → 0.5× → 1×. */
+export function nextSpeed(rp) {
+  rp.speed = (rp.speed + 1) % SPEEDS.length;
+}
+
+/** The speed button's text for a speed index, e.g. "2×" or "0.5×". */
+export function speedLabel(speed) {
+  return `${SPEEDS[speed]}×`;
+}
+
 /** Linear interpolation of a per-snapshot metric; −1 (absent) counts as 0. Null when absent in both snapshots. */
 export function lerpMetric(values, fr) {
   const va = values[fr.a], vb = values[fr.b];

@@ -21,12 +21,8 @@ import javafx.scene.layout.Region;
 import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
 
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
-import java.time.Instant;
+import java.util.List;
 import java.util.function.IntPredicate;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 /**
  * Right-hand panel describing the selected class: name and package, kind/language badges, a grid of metrics, file
@@ -83,9 +79,7 @@ final class InspectorPane extends ScrollPane {
         Label name = new Label(t.name());
         name.getStyleClass().add("inspector-title");
         name.setWrapText(true);
-        String noPackage = t.language() == dev.codecity.analysis.Language.JAVA ? "(default package)" : "(root)";
-        Label pkg = new Label((t.packageName().isEmpty() ? noPackage : t.packageName())
-                + (t.module().isEmpty() ? "" : " · " + t.module()));
+        Label pkg = new Label(ViewRules.packageLine(t));
         pkg.getStyleClass().add("mono-muted");
         pkg.setWrapText(true);
         Button close = new Button("✕");
@@ -117,16 +111,8 @@ final class InspectorPane extends ScrollPane {
             metrics.getColumnConstraints().add(col);
         }
         int cell = 0;
-        cell = metric(metrics, cell, String.valueOf(t.nom()), "methods");
-        cell = metric(metrics, cell, String.valueOf(t.noa()), "attributes");
-        cell = metric(metrics, cell, Look.fmt(t.loc()), "lines of code");
-        cell = metric(metrics, cell, String.valueOf(t.complexity()), "complexity");
-        cell = metric(metrics, cell, t.nom() == 0 ? "0" : String.format("%.1f", (double) t.complexity() / t.nom()), "cx / method");
-        cell = metric(metrics, cell, out.length + " / " + in.length, "uses / used by");
-        if (model.hasGit()) {
-            cell = metric(metrics, cell, b.history() == null ? "0" : String.valueOf(b.history().commits()), "commits");
-            cell = metric(metrics, cell, b.history() == null ? "0" : String.valueOf(b.history().authors()), "authors");
-            metric(metrics, cell, b.history() == null ? "—" : Look.relTime(b.history().lastCommit()), "last change");
+        for (String[] c : ViewRules.metricCells(b, model.hasGit(), out.length, in.length, System.currentTimeMillis() / 1000)) {
+            cell = metric(metrics, cell, c[0], c[1]);
         }
 
         Label file = new Label(b.file() + ":" + t.line());
@@ -145,11 +131,12 @@ final class InspectorPane extends ScrollPane {
 
         content.getChildren().addAll(head, badges, metrics);
         if (b.gone()) {
-            content.getChildren().add(styled(new Label("Removed before today"), "replay-note"));
+            content.getChildren().add(styled(new Label(ViewRules.REMOVED), "replay-note"));
         }
         if (replay != null && b.hist() != null) {
-            content.getChildren().addAll(styled(new Label("Replaying — values at " + replay.date()), "replay-note"),
-                    replayMetrics(b, replay.snapshot()));
+            List<String[]> cells = ViewRules.replayCells(b, replay.snapshot());
+            content.getChildren().addAll(styled(new Label(ViewRules.replayHeading(replay.date())), "replay-note"),
+                    cells == null ? styled(new Label(ViewRules.NOT_IN_SNAPSHOT), "muted") : replayMetrics(cells));
         }
         content.getChildren().add(fileRow);
         gitHub(model.github(), b);
@@ -158,10 +145,11 @@ final class InspectorPane extends ScrollPane {
             content.getChildren().add(section("Methods by complexity", t.methods().size()));
             int maxCx = Math.max(1, b.methods().stream().mapToInt(MethodInfo::complexity).max().orElse(1));
             VBox methods = new VBox(4);
-            b.methods().stream().limit(15).forEach(m -> methods.getChildren().add(methodRow(m, maxCx)));
+            b.methods().stream().limit(ViewRules.INSPECTOR_METHODS).forEach(m -> methods.getChildren().add(methodRow(m, maxCx)));
             // Counted on all of the type's methods like the header; b.methods() is capped at 300.
-            if (t.methods().size() > 15) {
-                Label more = new Label("+ " + (t.methods().size() - 15) + " more");
+            String moreText = ViewRules.moreMethods(t.methods().size());
+            if (moreText != null) {
+                Label more = new Label(moreText);
                 more.getStyleClass().add("muted");
                 methods.getChildren().add(more);
             }
@@ -207,9 +195,7 @@ final class InspectorPane extends ScrollPane {
             number.getStyleClass().add("pr-number");
             Label title = new Label(pr.title());
             title.getStyleClass().add("pr-title");
-            String updated = pr.updatedAt() == null ? "" : " · " + Look.relTime(Instant.parse(pr.updatedAt()).getEpochSecond());
-            Label meta = new Label((pr.author() == null ? "ghost" : pr.author()) + updated + " · "
-                    + pr.files().size() + " files" + (pr.draft() ? " · draft" : ""));
+            Label meta = new Label(ViewRules.prMeta(pr, System.currentTimeMillis() / 1000));
             meta.getStyleClass().add("muted");
             VBox text = new VBox(1, title, meta);
             HBox row = new HBox(8, number, text);
@@ -219,8 +205,7 @@ final class InspectorPane extends ScrollPane {
             prs.getChildren().add(row);
         }
         if (b.prs().length == 0) {
-            String source = gh.pullsSource() == null ? "" : gh.pullsSource();
-            Label none = new Label(source.startsWith("all") ? "none" : "none among the " + source);
+            Label none = new Label(ViewRules.noPulls(gh.pullsSource()));
             none.getStyleClass().add("muted");
             prs.getChildren().add(none);
         }
@@ -228,25 +213,10 @@ final class InspectorPane extends ScrollPane {
     }
 
     /**
-     * github.com/owner/repo/{blob|blame|commits}/ref/path#Lx-Ly
-     *
-     * <p>The path is the analysed root's prefix inside the repository plus the building's root-relative file. The
-     * history ({@code commits}) page takes no line anchor.
+     * github.com/owner/repo/{blob|blame|commits}/ref/path#Lx-Ly ({@link GitHubInfo#link}).
      */
     static String link(GitHubInfo gh, String kind, Building b) {
-        String path = encodePath(gh.prefix() + b.file());
-        String url = gh.repo().webUrl() + "/" + kind + "/" + encodePath(gh.ref()) + "/" + path;
-        return kind.equals("commits") ? url : url + "#L" + b.type().line() + "-L" + b.type().endLine();
-    }
-
-    /**
-     * Percent-encodes each path segment but keeps the slashes. {@link URLEncoder} does form encoding, which writes a
-     * space as '+', so that is turned into {@code %20} for use in a URL path.
-     */
-    private static String encodePath(String path) {
-        return Stream.of(path.split("/"))
-                .map(s -> URLEncoder.encode(s, StandardCharsets.UTF_8).replace("+", "%20"))
-                .collect(Collectors.joining("/"));
+        return gh.link(kind, b.file(), b.type().line(), b.type().endLine());
     }
 
     private Hyperlink linkButton(String text, String url) {
@@ -263,9 +233,8 @@ final class InspectorPane extends ScrollPane {
         return java.util.Arrays.stream(indices).filter(visible).toArray();
     }
 
-    /** Adds one value/label tile to the three-column grid at position {@code cell}; returns the next position. */
-    /** The type's methods, attributes, lines and complexity in snapshot {@code k}; "—" where it did not exist. */
-    private static GridPane replayMetrics(Building b, int k) {
+    /** The replayed snapshot's tiles ({@link ViewRules#replayCells}) in one row of four. */
+    private static GridPane replayMetrics(List<String[]> cells) {
         GridPane grid = new GridPane();
         grid.getStyleClass().add("metrics");
         for (int c = 0; c < 4; c++) {
@@ -273,11 +242,8 @@ final class InspectorPane extends ScrollPane {
             col.setPercentWidth(25);
             grid.getColumnConstraints().add(col);
         }
-        int[][] values = {b.hist().nom, b.hist().noa, b.hist().loc, b.hist().cx};
-        String[] labels = {"methods", "attributes", "lines", "cx"};
-        for (int i = 0; i < 4; i++) {
-            int v = values[i][k];
-            metric(grid, 0, v < 0 ? "—" : Look.fmt(v), labels[i]);
+        for (int i = 0; i < cells.size(); i++) {
+            metric(grid, 0, cells.get(i)[0], cells.get(i)[1]);
             // metric() places by a 3-column grid; move the box into column i of the single row.
             Node box = grid.getChildren().getLast();
             GridPane.setConstraints(box, i, 0);
@@ -321,7 +287,7 @@ final class InspectorPane extends ScrollPane {
      * the type's maximum is higher, then that is the hot end).
      */
     private static Node methodRow(MethodInfo m, int maxCx) {
-        Label name = new Label(m.name() + (m.parameters() > 0 ? "(…)" : "()"));
+        Label name = new Label(ViewRules.methodName(m.name(), m.parameters()));
         name.getStyleClass().add("method-name");
         name.setMinWidth(0);
         Region spacer = new Region();

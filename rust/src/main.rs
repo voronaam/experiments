@@ -22,6 +22,8 @@ mod city;
 mod export;
 mod git;
 mod github;
+#[cfg(test)]
+mod golden_tests;
 mod history;
 #[cfg(feature = "gui")]
 mod gui;
@@ -338,5 +340,114 @@ mod tests {
         // A separate value is a path, not the count.
         assert_eq!(args(&["--history", "/no/such/dir"]).err().unwrap(), "not a directory: /no/such/dir");
         assert_eq!(args(&[]).unwrap().unwrap().history, None);
+    }
+
+    /// The message of the usage error `a` causes.
+    fn error(a: &[&str]) -> String {
+        args(a).err().expect("a usage error")
+    }
+
+    /// A temporary directory, canonical so it compares equal to a parsed root.
+    fn tmp() -> (tempfile::TempDir, String) {
+        let t = tempfile::tempdir().unwrap();
+        let d = std::fs::canonicalize(t.path()).unwrap().display().to_string();
+        (t, d)
+    }
+
+    /// Without options: port 7070, tests, git, GitHub and the browser on; no watch, export, window or history.
+    #[test]
+    fn defaults_without_options() {
+        let (_t, d) = tmp();
+        let o = args(&[&d]).unwrap().unwrap();
+        assert_eq!(o.root, Some(PathBuf::from(&d)));
+        assert!(o.remote.is_none());
+        assert_eq!(o.port, 7070);
+        assert!(o.include_tests && o.git && o.github && o.open);
+        assert!(!o.watch && !o.gui);
+        assert_eq!(o.export, None);
+        assert_eq!(o.history, None);
+    }
+
+    /// Every flag, in its short and long form, turns on or off exactly its own setting.
+    #[test]
+    fn every_flag_sets_its_option() {
+        let (_t, d) = tmp();
+        let o = args(&["--no-tests", "--no-git", "--no-github", "--no-open", &d]).unwrap().unwrap();
+        assert!(!o.include_tests && !o.git && !o.github && !o.open);
+        assert!(!o.watch && !o.gui);
+        assert!(args(&["-w", &d]).unwrap().unwrap().watch);
+        assert!(args(&["--watch", &d]).unwrap().unwrap().watch);
+        assert!(args(&["-g", &d]).unwrap().unwrap().gui);
+        assert!(args(&["--gui", &d]).unwrap().unwrap().gui);
+        assert!(!args(&["--no-tests", &d]).unwrap().unwrap().include_tests);
+        assert!(args(&["--no-tests", &d]).unwrap().unwrap().git);
+        assert_eq!(args(&["--export", "out.html", &d]).unwrap().unwrap().export, Some(PathBuf::from("out.html")));
+        // Options may come after the path, too.
+        assert_eq!(args(&[&d, "--export", "x.html"]).unwrap().unwrap().export, Some(PathBuf::from("x.html")));
+    }
+
+    /// `-p/--port` takes 0 (any free port) to 65535; anything else is "invalid port".
+    #[test]
+    fn port_rules() {
+        let (_t, d) = tmp();
+        assert_eq!(args(&["-p", "8080", &d]).unwrap().unwrap().port, 8080);
+        assert_eq!(args(&["--port", "0", &d]).unwrap().unwrap().port, 0);
+        assert_eq!(args(&["--port", "65535", &d]).unwrap().unwrap().port, 65535);
+        for bad in ["65536", "-1", "abc", "", "80.5", "99999999999"] {
+            assert_eq!(error(&["-p", bad, &d]), "invalid port", "{bad}");
+        }
+        assert_eq!(error(&[&d, "-p"]), "-p needs a value");
+        assert_eq!(error(&[&d, "--port"]), "--port needs a value");
+        assert_eq!(error(&[&d, "--export"]), "--export needs a value");
+    }
+
+    /// Unknown options, a second path and a path that is not a directory are refused with a message.
+    #[test]
+    fn refuses_unknown_options_second_paths_and_non_directories() {
+        let (_t, d) = tmp();
+        assert_eq!(error(&["--bogus", &d]), "unknown option --bogus");
+        assert_eq!(error(&[&d, "-x"]), "unknown option -x");
+        assert_eq!(error(&["--history-x", &d]), "unknown option --history-x");
+        assert_eq!(error(&[&d, &d]), "only one path may be given");
+        let file = format!("{d}/file.txt");
+        std::fs::write(&file, "x").unwrap();
+        assert_eq!(error(&[&file]), format!("not a directory: {file}"));
+        assert_eq!(error(&[&format!("{d}/missing")]), format!("not a directory: {d}/missing"));
+        // Both mistakes at once: the option conflict is reported first, as in the other editions.
+        assert_eq!(error(&["--history", "-w", &file]), "--history cannot be combined with --watch");
+    }
+
+    /// `-h`/`--help` anywhere before an error asks for the usage text (None), whatever else is given.
+    #[test]
+    fn help_wins() {
+        let (_t, d) = tmp();
+        assert!(args(&["-h"]).unwrap().is_none());
+        assert!(args(&["--port", "1", &d, "--help", "--bogus"]).unwrap().is_none());
+    }
+
+    /// A GitHub spec that is not an existing directory is a repository to clone, not a path.
+    #[test]
+    fn github_specs_are_remotes() {
+        let o = args(&["github:owner/repo@dev"]).unwrap().unwrap();
+        assert!(o.root.is_none());
+        let r = o.remote.unwrap();
+        assert_eq!((r.owner.as_str(), r.name.as_str(), r.branch.as_deref()), ("owner", "repo", Some("dev")));
+    }
+
+    /// The usage text is the same in all three editions (`testdata/cli/usage.txt`).
+    #[test]
+    fn usage_text_is_shared() {
+        let shared = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../testdata/cli/usage.txt")).unwrap();
+        assert_eq!(USAGE, shared);
+    }
+
+    /// `--gui` in a build without the desktop window is a run failure with a clear message (the D edition's `cli`
+    /// build has the same rule).
+    #[cfg(not(feature = "gui"))]
+    #[test]
+    fn gui_without_the_gui_feature_fails() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../testdata/java-project");
+        let o = args(&["--gui", "--no-git", "--no-github", root]).unwrap().unwrap();
+        assert_eq!(run(o).err().unwrap(), "this build has no desktop window (built without the `gui` feature)");
     }
 }

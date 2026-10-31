@@ -5,8 +5,18 @@
 
 pub const INDEX_HTML: &str = include_str!("../../src/main/resources/web/index.html");
 pub const APP_JS: &str = include_str!("../../src/main/resources/web/app.js");
-pub const WALK_JS: &str = include_str!("../../src/main/resources/web/walk.js");
-pub const REPLAY_JS: &str = include_str!("../../src/main/resources/web/replay.js");
+/// The ES modules `app.js` imports (`import … from './name.js'`), as (file name, source): each is served at `/name.js`
+/// and inlined by [`crate::export`] as a `data:` URL in the import map. A new module must be added here (and in the
+/// Java and D editions' lists); a test in [`crate::export`] checks that every import of app.js is listed.
+pub const MODULES: [(&str, &str); 7] = [
+    ("walk.js", include_str!("../../src/main/resources/web/walk.js")),
+    ("replay.js", include_str!("../../src/main/resources/web/replay.js")),
+    ("text.js", include_str!("../../src/main/resources/web/text.js")),
+    ("metrics.js", include_str!("../../src/main/resources/web/metrics.js")),
+    ("search.js", include_str!("../../src/main/resources/web/search.js")),
+    ("city.js", include_str!("../../src/main/resources/web/city.js")),
+    ("prefs.js", include_str!("../../src/main/resources/web/prefs.js")),
+];
 pub const STYLE_CSS: &str = include_str!("../../src/main/resources/web/style.css");
 pub const FAVICON_SVG: &str = include_str!("../../src/main/resources/web/favicon.svg");
 
@@ -67,10 +77,11 @@ pub fn get(path: &str) -> Option<(&'static str, &'static str)> {
     Some(match path {
         "/" | "/index.html" => ("text/html; charset=utf-8", served_index()),
         "/app.js" => ("text/javascript; charset=utf-8", APP_JS),
-        "/walk.js" => ("text/javascript; charset=utf-8", WALK_JS),
-        "/replay.js" => ("text/javascript; charset=utf-8", REPLAY_JS),
         "/style.css" => ("text/css; charset=utf-8", STYLE_CSS),
         "/favicon.svg" => ("image/svg+xml", FAVICON_SVG),
-        _ => return None,
+        _ => {
+            let (_, source) = MODULES.iter().find(|(name, _)| path.strip_prefix('/') == Some(*name))?;
+            ("text/javascript; charset=utf-8", *source)
+        }
     })
 }

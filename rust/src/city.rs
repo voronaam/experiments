@@ -536,3 +536,112 @@ fn iso(secs: i64) -> String {
     let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Rules of the plain city model (no git, no GitHub, no history) and its JSON, one per test. The golden suite
+    //! (`golden_tests.rs`) compares whole cities; these tests name the rule that broke. The Java (`CityModelTest`) and
+    //! D (`city.d`) editions build the same fixture and check the same values.
+
+    use super::*;
+
+    /// The shared fixture: three Java types in package `shop` (one a test that uses `Cart`, which uses `Item`) and
+    /// one TypeScript module building in `web`, in a directory named `shop-city`. The temporary directory is returned
+    /// too, as it is removed when dropped.
+    fn build(include_tests: bool) -> (tempfile::TempDir, CityModel) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("shop-city");
+        let files = [
+            ("src/main/java/shop/Cart.java", "package shop;\npublic class Cart {\n    Item item;\n    int a;\n    void add(int n) { if (n > 0) { a += n; } }\n    void clear() {}\n}\n"),
+            ("src/main/java/shop/Item.java", "package shop;\npublic class Item {}\n"),
+            ("src/test/java/shop/CartTest.java", "package shop;\nclass CartTest { Cart c; }\n"),
+            ("web/util.ts", "export function f(x: number) { return x ? 1 : 0; }\n"),
+        ];
+        for (rel, code) in files {
+            let f = root.join(rel);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, code).unwrap();
+        }
+        let root = std::fs::canonicalize(root).unwrap();
+        let model = CityModel::build(&SourceAnalyzer::new(), &root, include_tests, false, None, None);
+        (dir, model)
+    }
+
+    fn ids(m: &CityModel) -> Vec<&str> {
+        m.buildings.iter().map(|b| m.analysis.types[b.index].fqn.as_str()).collect()
+    }
+
+    /// The document starts with the city's name, root, time stamp, git flag, platform height and size, then the
+    /// stats (with the type count per language, most common first), the districts and the buildings, in that order.
+    /// Optional parts (github, history) are left out rather than written as null.
+    #[test]
+    fn json_has_the_city_header_stats_districts_and_buildings_in_order() {
+        let (_dir, m) = build(true);
+        let json = m.json();
+        let root = m.analysis.root.to_string_lossy().replace('\\', "\\\\");
+        assert!(json.starts_with(&format!("{{\"name\":\"shop-city\",\"root\":\"{root}\",\"generatedAt\":\"")), "{json}");
+        assert!(json.contains("\",\"hasGit\":false,\"platform\":0.4,\"width\":"), "{json}");
+        assert!(json.contains(",\"stats\":{\"files\":4,\"failedFiles\":0,\"types\":4,\"packages\":2,\"methods\":3,\"loc\":9,\"languages\":{\"java\":3,\"typescript\":1}},\"districts\":[{\"id\":\"\",\"name\":\"shop-city\",\"depth\":0,"), "{json}");
+        assert!(json.find("\"districts\":[").unwrap() < json.find("\"buildings\":[").unwrap());
+        assert!(json.ends_with("]}"));
+        for absent in ["\"github\"", "\"history\"", "\"hist\"", "\"gone\"", "\"prs\"", "\"commits\""] {
+            assert!(!json.contains(absent), "{absent}");
+        }
+    }
+
+    /// One district per package below the city, each with its depth and the number of types in its subtree.
+    #[test]
+    fn districts_list_packages_with_depth_and_type_counts() {
+        let (_dir, m) = build(true);
+        assert_eq!(m.districts.iter().map(|d| d.label.as_str()).collect::<Vec<_>>(), ["shop-city", "shop", "web"]);
+        assert_eq!(m.districts.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), ["", "shop", "web"]);
+        assert_eq!(m.districts.iter().map(|d| d.depth).collect::<Vec<_>>(), [0, 1, 1]);
+        assert_eq!(m.districts.iter().map(|d| d.types).collect::<Vec<_>>(), [4, 3, 1]);
+        assert!(m.json().contains("{\"id\":\"shop\",\"name\":\"shop\",\"depth\":1,"));
+    }
+
+    /// Buildings are sorted by id and carry the type's identity and metrics; the file is relative to the root with
+    /// forward slashes; methods are positional arrays `[name, line, loc, cx, parameters]`, most complex first.
+    #[test]
+    fn buildings_are_sorted_by_id_and_carry_their_fields() {
+        let (_dir, m) = build(true);
+        assert_eq!(ids(&m), ["shop.Cart", "shop.CartTest", "shop.Item", "web/util.ts"]);
+        let json = m.json();
+        assert!(json.contains("{\"id\":\"shop.Cart\",\"lang\":\"java\",\"name\":\"Cart\",\"pkg\":\"shop\",\"module\":\"\",\"kind\":\"class\",\"test\":false,\"file\":\"src/main/java/shop/Cart.java\",\"line\":2,\"endLine\":7,\"x\":"), "{json}");
+        assert!(json.contains(",\"district\":1,\"nom\":2,\"noa\":2,\"loc\":6,\"cx\":3,\"methods\":[[\"add\",5,1,2,1],[\"clear\",6,1,1,0]],\"deps\":[2]}"), "{json}");
+        assert!(json.contains("{\"id\":\"shop.CartTest\",\"lang\":\"java\",\"name\":\"CartTest\",\"pkg\":\"shop\",\"module\":\"\",\"kind\":\"class\",\"test\":true,\"file\":\"src/test/java/shop/CartTest.java\","), "{json}");
+        assert!(json.contains("{\"id\":\"web/util.ts\",\"lang\":\"typescript\",\"name\":\"util.ts\",\"pkg\":\"web\",\"module\":\"\",\"kind\":\"module\",\"test\":false,\"file\":\"web/util.ts\",\"line\":1,\"endLine\":2,\"x\":"), "{json}");
+        assert!(json.contains(",\"district\":2,\"nom\":1,\"noa\":0,\"loc\":1,\"cx\":2,\"methods\":[[\"f\",1,1,2,1]],\"deps\":[]}"), "{json}");
+    }
+
+    /// Dependencies are building indices; the reverse edges (incoming) mirror them exactly, in ascending order.
+    #[test]
+    fn dependencies_are_building_indices_with_matching_reverse_edges() {
+        let (_dir, m) = build(true);
+        let b = &m.buildings;
+        assert_eq!((b[0].deps.as_slice(), b[1].deps.as_slice()), (&[2][..], &[0][..]));
+        assert_eq!((b[0].incoming.as_slice(), b[2].incoming.as_slice()), (&[1][..], &[0][..]));
+        let (mut edges, mut reverse) = (0, 0);
+        for (i, x) in b.iter().enumerate() {
+            assert_eq!(x.index, i);
+            for &d in &x.deps {
+                assert!(b[d].incoming.contains(&i));
+            }
+            edges += x.deps.len();
+            reverse += x.incoming.len();
+        }
+        assert_eq!(edges, reverse);
+    }
+
+    /// Without tests, test buildings and every edge to or from them are gone; the stats count the remaining types
+    /// but still every source file read.
+    #[test]
+    fn without_tests_the_test_buildings_and_their_edges_are_dropped() {
+        let (_dir, m) = build(false);
+        assert_eq!(ids(&m), ["shop.Cart", "shop.Item", "web/util.ts"]);
+        assert_eq!(m.buildings[0].deps, [1]);
+        assert!(m.buildings[0].incoming.is_empty());
+        assert!(m.json().contains("\"stats\":{\"files\":4,\"failedFiles\":0,\"types\":3,\"packages\":2,\"methods\":3,\"loc\":8,\"languages\":{\"java\":2,\"typescript\":1}}"), "{}", m.json());
+        assert_eq!(m.districts.iter().map(|d| d.types).collect::<Vec<_>>(), [3, 2, 1]);
+    }
+}

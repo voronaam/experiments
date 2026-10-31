@@ -21,6 +21,7 @@ import java.nio.file.LinkOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 
 /**
@@ -28,7 +29,8 @@ import java.util.Set;
  * marked.
  *
  * <p>The highlighter is a single-pass hand-written scanner, not a real lexer: it knows comments, string and character
- * literals, Java text blocks, annotations/Rust lifetimes, numbers and a keyword list per language, and guesses
+ * literals, Java text blocks, TypeScript template literals, annotations / decorators / Rust attributes and lifetimes,
+ * numbers and a keyword list per language, and guesses
  * constants (ALL_CAPS) and types (Capitalised). Odd constructs may be coloured wrongly, but apart from dropped '\r'
  * characters every character ends up in exactly one token. The file is shown in a virtualised {@link ListView} with
  * one row per line.
@@ -60,7 +62,7 @@ final class SourceViewer {
     }
 
     /** A run of text and its CSS style class ({@code keyword}, {@code string}, {@code comment}, ...). */
-    private record Token(String text, String style) {
+    record Token(String text, String style) {
     }
 
     /**
@@ -80,11 +82,7 @@ final class SourceViewer {
         } catch (IOException e) {
             code = "// unable to read " + b.file();
         }
-        List<List<Token>> lines = highlight(code, switch (b.type().language()) {
-            case JAVA -> KEYWORDS;
-            case TYPESCRIPT -> TS_KEYWORDS;
-            case RUST -> RUST_KEYWORDS;
-        });
+        List<List<Token>> lines = highlight(code, b.type().language());
         int first = b.type().line();
         int last = b.type().endLine();
         int digits = String.valueOf(lines.size()).length();
@@ -147,27 +145,42 @@ final class SourceViewer {
         return highlight(code, KEYWORDS);
     }
 
+    /** Splits source in {@code language} into styled tokens per line (see {@link #highlight(String, Set)}). */
+    static List<List<Token>> highlight(String code, dev.codecity.analysis.Language language) {
+        return highlight(code, switch (language) {
+            case JAVA -> KEYWORDS;
+            case TYPESCRIPT -> TS_KEYWORDS;
+            case RUST -> RUST_KEYWORDS;
+        });
+    }
+
     /**
-     * The scanner. At each position the first matching rule wins, in this order: newline, continuation of a multi-line
-     * construct ({@code mode}), line comment, block comment, text block, Rust lifetime, string/char literal,
-     * annotation, word (keyword / constant / type / plain), number, anything else (plain). Plain characters are
-     * collected in {@code plain} and flushed as one token before the next styled token, so the token count stays low.
-     * '\n' is handled first, even inside comments and text blocks, and no token ever contains one, so each line gets
-     * its own list; '\r' is dropped. Lifetimes are only recognised in Rust code ({@code keywords} is
-     * {@code RUST_KEYWORDS}), so a TypeScript {@code 'react'} stays a string.
+     * The scanner, the same as the Rust and D viewers' ({@code gui/source.rs}, {@code gui/source.d}); the three are
+     * held to identical tokens by the samples in {@code testdata/highlight/}. It works on code points, so a character
+     * outside the BMP is never split. At each position the first matching rule wins, in this order: '\r' (dropped),
+     * newline, continuation of a multi-line construct ({@code mode}: block comment, text block or template literal),
+     * line comment, block comment, text block, template literal, Rust lifetime, string/char literal, annotation /
+     * decorator / Rust attribute / TypeScript {@code #private} name, word (keyword / constant / type / plain), number,
+     * anything else (plain). Plain characters are collected in {@code plain} and flushed as one token before the next
+     * styled token, so the token count stays low. No token ever contains a line break, so each line gets its own list.
+     * Lifetimes are only recognised in Rust code ({@code keywords} is {@code RUST_KEYWORDS}), so a TypeScript
+     * {@code 'react'} stays a string.
      *
      * @return one token list per line, as many lists as the text has lines
      */
     static List<List<Token>> highlight(String code, Set<String> keywords) {
+        // Every '\r' is dropped up front, so none ends up inside a comment, string or other token (CRLF files).
+        int[] cs = code.codePoints().filter(c -> c != '\r').toArray();
+        int n = cs.length;
         List<List<Token>> lines = new ArrayList<>();
         List<Token> line = new ArrayList<>();
         boolean rust = keywords == RUST_KEYWORDS;
-        String mode = null; // "comment" or "string" for constructs that continue onto the next line
-        int i = 0;
-        int n = code.length();
+        String modeStyle = null; // the style of a construct that continues onto the next line, or null
+        String close = null; // and its closing delimiter
         StringBuilder plain = new StringBuilder();
+        int i = 0;
         while (i < n) {
-            char c = code.charAt(i);
+            int c = cs[i];
             if (c == '\r') {
                 i++;
                 continue;
@@ -179,46 +192,57 @@ final class SourceViewer {
                 i++;
                 continue;
             }
-            if (mode != null) {
-                String close = mode.equals("comment") ? "*/" : "\"\"\"";
-                int end = code.indexOf(close, i);
-                int nl = code.indexOf('\n', i);
-                if (end >= 0 && (nl < 0 || end < nl)) {
-                    line.add(new Token(code.substring(i, end + close.length()), mode));
-                    i = end + close.length();
-                    mode = null;
-                } else {
-                    int stop = nl < 0 ? n : nl;
-                    line.add(new Token(code.substring(i, stop), mode));
-                    i = stop;
+            if (modeStyle != null) {
+                // The rest of this line, or up to and including the closing delimiter if it is on this line; in
+                // literals a backslash steps over the next character, unless that is the line break.
+                int j = i;
+                while (j < n && cs[j] != '\n' && !starts(cs, j, close)) {
+                    j += modeStyle.equals("string") && cs[j] == '\\' && j + 1 < n && cs[j + 1] != '\n' ? 2 : 1;
                 }
+                String style = modeStyle;
+                if (j < n && starts(cs, j, close)) {
+                    j += close.length();
+                    modeStyle = null;
+                }
+                line.add(new Token(text(cs, i, j), style));
+                i = j;
                 continue;
             }
-            if (code.startsWith("//", i)) {
+            if (starts(cs, i, "//")) {
                 flush(plain, line);
-                int nl = code.indexOf('\n', i);
-                int stop = nl < 0 ? n : nl;
-                line.add(new Token(code.substring(i, stop), "comment"));
-                i = stop;
-            } else if (code.startsWith("/*", i)) {
+                int j = i;
+                while (j < n && cs[j] != '\n') {
+                    j++;
+                }
+                line.add(new Token(text(cs, i, j), "comment"));
+                i = j;
+            } else if (starts(cs, i, "/*")) {
                 flush(plain, line);
-                mode = "comment";
+                modeStyle = "comment";
+                close = "*/";
                 line.add(new Token("/*", "comment"));
                 i += 2;
-            } else if (code.startsWith("\"\"\"", i)) {
+            } else if (starts(cs, i, "\"\"\"")) {
                 flush(plain, line);
-                mode = "string";
+                modeStyle = "string";
+                close = "\"\"\"";
                 line.add(new Token("\"\"\"", "string"));
                 i += 3;
-            } else if (rust && c == '\'' && i + 2 < n && Character.isJavaIdentifierStart(code.charAt(i + 1))
-                    && code.charAt(i + 2) != '\'') {
+            } else if (c == '`') {
+                flush(plain, line);
+                modeStyle = "string";
+                close = "`";
+                line.add(new Token("`", "string"));
+                i++;
+            } else if (rust && c == '\'' && i + 2 < n && (Character.isAlphabetic(cs[i + 1]) || cs[i + 1] == '_')
+                    && cs[i + 2] != '\'') {
                 // a Rust lifetime such as 'a or 'static, not a character literal
                 flush(plain, line);
                 int j = i + 1;
-                while (j < n && Character.isJavaIdentifierPart(code.charAt(j))) {
+                while (ident(cs, j)) {
                     j++;
                 }
-                line.add(new Token(code.substring(i, j), "annotation"));
+                line.add(new Token(text(cs, i, j), "annotation"));
                 i = j;
             } else if (c == '"' || c == '\'') {
                 flush(plain, line);
@@ -226,59 +250,100 @@ final class SourceViewer {
                 // Single-line literal: runs to the matching quote or the end of the line (the line break itself is
                 // never taken); a backslash skips the next character so an escaped quote does not end it, unless that
                 // character is the line break.
-                while (j < n && code.charAt(j) != c && code.charAt(j) != '\n') {
-                    j += code.charAt(j) == '\\' && j + 1 < n && code.charAt(j + 1) != '\n' ? 2 : 1;
+                while (j < n && cs[j] != c && cs[j] != '\n') {
+                    j += cs[j] == '\\' && j + 1 < n && cs[j + 1] != '\n' ? 2 : 1;
                 }
-                if (j < n && code.charAt(j) == c) {
+                if (j < n && cs[j] == c) {
                     j++;
                 }
-                line.add(new Token(code.substring(i, j), "string"));
+                line.add(new Token(text(cs, i, j), "string"));
                 i = j;
-            } else if (c == '@' && i + 1 < n && Character.isJavaIdentifierStart(code.charAt(i + 1))) {
+            } else if ((c == '@' || c == '#') && i + 1 < n && (Character.isAlphabetic(cs[i + 1]) || cs[i + 1] == '[')) {
+                // Java annotations, TypeScript decorators and #private names, Rust attributes (#[derive(..)] up to
+                // the first ']' on the line, or the end of the line)
                 flush(plain, line);
                 int j = i + 1;
-                while (j < n && (Character.isJavaIdentifierPart(code.charAt(j)) || code.charAt(j) == '.')) {
-                    j++;
+                if (cs[j] == '[') {
+                    while (j < n && cs[j] != ']' && cs[j] != '\n') {
+                        j++;
+                    }
+                    if (j < n && cs[j] == ']') {
+                        j++;
+                    }
+                } else {
+                    while (ident(cs, j) || (j < n && cs[j] == '.')) {
+                        j++;
+                    }
                 }
-                line.add(new Token(code.substring(i, j), "annotation"));
+                line.add(new Token(text(cs, i, j), "annotation"));
                 i = j;
-            } else if (Character.isJavaIdentifierStart(c)) {
+            } else if (Character.isAlphabetic(c) || c == '_' || c == '$') {
                 int j = i;
-                while (j < n && Character.isJavaIdentifierPart(code.charAt(j))) {
+                while (ident(cs, j)) {
                     j++;
                 }
-                String word = code.substring(i, j);
+                String word = text(cs, i, j);
                 if (keywords.contains(word)) {
                     flush(plain, line);
                     line.add(new Token(word, "keyword"));
-                } else if (word.length() > 1 && word.equals(word.toUpperCase()) && Character.isLetter(word.charAt(0))) {
+                } else if (j - i > 1 && Character.isAlphabetic(c) && word.equals(word.toUpperCase(Locale.ROOT))) {
                     // MAX_SIZE is a constant; a single capital letter (T) falls through to the type rule below.
                     flush(plain, line);
                     line.add(new Token(word, "constant"));
-                } else if (Character.isUpperCase(word.charAt(0))) {
+                } else if (Character.isUpperCase(c)) {
                     flush(plain, line);
                     line.add(new Token(word, "type"));
                 } else {
                     plain.append(word);
                 }
                 i = j;
-            } else if (Character.isDigit(c)) {
+            } else if (c >= '0' && c <= '9') {
                 // Letters, '.' and '_' are included so 0x1F, 1_000, 3.5f and 10u32 stay one token.
                 flush(plain, line);
                 int j = i;
-                while (j < n && (Character.isLetterOrDigit(code.charAt(j)) || code.charAt(j) == '.' || code.charAt(j) == '_')) {
+                while (j < n && (alphanumeric(cs[j]) || cs[j] == '.' || cs[j] == '_')) {
                     j++;
                 }
-                line.add(new Token(code.substring(i, j), "number"));
+                line.add(new Token(text(cs, i, j), "number"));
                 i = j;
             } else {
-                plain.append(c);
+                plain.appendCodePoint(c);
                 i++;
             }
         }
         flush(plain, line);
         lines.add(line);
         return lines;
+    }
+
+    /** Whether {@code s} starts at code point {@code i} of {@code cs}. */
+    private static boolean starts(int[] cs, int i, String s) {
+        if (i + s.length() > cs.length) {
+            return false;
+        }
+        for (int k = 0; k < s.length(); k++) {
+            if (cs[i + k] != s.charAt(k)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Whether code point {@code i} exists and continues an identifier: alphanumeric, '_' or '$'. */
+    private static boolean ident(int[] cs, int i) {
+        return i < cs.length && (alphanumeric(cs[i]) || cs[i] == '_' || cs[i] == '$');
+    }
+
+    /** A letter or a number in the Unicode sense (alphabetic, or a decimal, letter or other number), as in Rust. */
+    private static boolean alphanumeric(int c) {
+        int type = Character.getType(c);
+        return Character.isAlphabetic(c) || type == Character.DECIMAL_DIGIT_NUMBER || type == Character.LETTER_NUMBER
+                || type == Character.OTHER_NUMBER;
+    }
+
+    /** Code points {@code from} (inclusive) to {@code to} (exclusive) of {@code cs} as a string. */
+    private static String text(int[] cs, int from, int to) {
+        return new String(cs, from, to - from);
     }
 
     private static void flush(StringBuilder plain, List<Token> line) {

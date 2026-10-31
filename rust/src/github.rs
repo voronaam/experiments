@@ -14,9 +14,9 @@
 //!
 //! The repository may come from the analysed tree's own (untrusted) git configuration, so the token is guarded: an
 //! environment token for github.com only ever goes to api.github.com, and a GitHub Enterprise host gets a token (or a
-//! request at all) only when the user opted in to that very host (see [`token`] and [`fetch_pulls`]). ureq does not
-//! send the Authorization header on to another host when it follows a redirect, reads at most 10 MB of a response,
-//! and serde_json refuses JSON nested more than 128 deep.
+//! request at all) only when the user opted in to that very host (see [`token`] and [`fetch_pulls`]). Redirects are
+//! followed only to https on the same host and port, responses are capped at 10 MiB and JSON at 127 levels of
+//! nesting ([`request`]): the same rules as in the other editions.
 
 use crate::git;
 use regex::Regex;
@@ -200,7 +200,12 @@ pub fn cache_root() -> PathBuf {
 /// and the user's, not the analysed project's: only there may the history replay fetch missing objects
 /// ([`crate::git::command`]). Both sides are compared canonicalised.
 pub fn is_cached(dir: &Path) -> bool {
-    match (std::fs::canonicalize(dir), std::fs::canonicalize(cache_root())) {
+    is_cached_in(dir, &cache_root())
+}
+
+/// [`is_cached`] for the cache at `root`. Test seam: the tests use a cache in a temporary directory.
+pub(crate) fn is_cached_in(dir: &Path, root: &Path) -> bool {
+    match (std::fs::canonicalize(dir), std::fs::canonicalize(root)) {
         (Ok(dir), Ok(cache)) => dir.starts_with(cache),
         _ => false,
     }
@@ -218,7 +223,35 @@ fn home() -> PathBuf {
 /// works without fetching more, since it only compares trees. git runs with the terminal attached, so its progress
 /// output and any credential prompt reach the user.
 pub fn clone_or_update(repo: &GitHubRepo) -> Result<PathBuf, String> {
-    let dir = cache_root().join(&repo.host).join(&repo.owner).join(&repo.name);
+    clone_into(repo, &cache_root(), &format!("{}.git", repo.web_url()))
+}
+
+/// The path `p` with `.` components dropped and each `..` removing the component before it, without looking at the
+/// file system (like Java's `Path.normalize`).
+fn normalise(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// [`clone_or_update`] with the cache at `root` and the repository cloned from `url` (production: [`cache_root`] and
+/// the repository's HTTPS URL). Test seam: the tests clone local bare repositories (`file://` URLs) into a cache in a
+/// temporary directory, through the same code path.
+pub(crate) fn clone_into(repo: &GitHubRepo, root: &Path, url: &str) -> Result<PathBuf, String> {
+    let dir = normalise(&root.join(&repo.host).join(&repo.owner).join(&repo.name));
+    // Defence in depth: `parse` already rejects "." and "..", but a path escaping the cache must never be cloned into
+    // or hard-reset.
+    if !dir.starts_with(normalise(root)) {
+        return Err(format!("refusing to clone outside the cache: {}", dir.display()));
+    }
     let interactive = |args: &[&str]| -> Result<(), String> {
         let git = git::executable("git").ok_or("git: not found on the PATH")?;
         let status = Command::new(git).args(args).status().map_err(|e| format!("git: {e}"))?;
@@ -240,14 +273,13 @@ pub fn clone_or_update(repo: &GitHubRepo) -> Result<PathBuf, String> {
     } else {
         println!("{}", crate::printable(&format!("Cloning {} into {d} …", repo.web_url())));
         std::fs::create_dir_all(dir.parent().unwrap()).map_err(|e| e.to_string())?;
-        // Always over HTTPS, whichever URL form was given.
-        let url = format!("{}.git", repo.web_url());
+        // Always over HTTPS (in production), whichever URL form was given.
         let mut args = vec!["clone", "--filter=blob:none"];
         if let Some(b) = &repo.branch {
             args.extend(["--branch", b]);
         }
         // "--" so that a URL or path can never be read as an option.
-        args.extend(["--", &url, &d]);
+        args.extend(["--", url, &d]);
         interactive(&args)?;
     }
     Ok(dir)
@@ -268,11 +300,11 @@ const TOKEN_VARIABLES: [&str; 4] = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_T
 /// An API token: the environment first ([`env_token`]), else `gh auth token` for the host: the token of a login the
 /// user made to exactly that host. `gh` runs without the token variables, since it would otherwise answer with
 /// `GH_ENTERPRISE_TOKEN` for any host; the host is passed as `--hostname=<host>`, so it can never be read as another
-/// option. `gh` is started by its absolute path ([`git::executable`]). None when there is none or `gh` is not
-/// installed.
-fn token(repo: &GitHubRepo) -> Option<String> {
-    env_token(repo, |v| std::env::var(v).ok()).or_else(|| {
-        let mut gh = Command::new(git::executable("gh")?);
+/// option. `gh` is started by its absolute path (`env.programs`: [`git::executable`] in production). None when there
+/// is none or `gh` is not installed.
+fn token(repo: &GitHubRepo, env: &Env) -> Option<String> {
+    env_token(repo, env.vars).or_else(|| {
+        let mut gh = Command::new((env.programs)("gh")?);
         gh.args(["auth", "token", &format!("--hostname={}", repo.host)]);
         TOKEN_VARIABLES.iter().for_each(|v| {
             gh.env_remove(v);
@@ -311,65 +343,190 @@ fn pull_url(repo: &GitHubRepo, url: Option<&str>, number: i64) -> String {
     }
 }
 
+/// What [`fetch_pulls`] reads from outside: environment variables (`vars`), the programs on the `PATH`
+/// (`programs`, for `gh`) and the API endpoints (`rest_api`, the REST base URL, and `graphql_api`). Production uses
+/// the process environment, [`git::executable`] and the repository's real endpoints. Test seam: the tests inject an
+/// environment of their own, a fake `gh`, and a fake API server on the loopback interface.
+pub(crate) struct Env<'a> {
+    pub vars: &'a dyn Fn(&str) -> Option<String>,
+    pub programs: &'a dyn Fn(&str) -> Option<PathBuf>,
+    pub rest_api: String,
+    pub graphql_api: String,
+}
+
 /// Open PRs and how complete the list is. Never fails: problems are reported and yield None. A GitHub Enterprise
 /// host is not contacted at all unless there is a token for it or `GH_HOST` names it: the host may come from a
 /// hostile repository's remote URL, and CodeCity should not call out to it on its own.
 pub fn fetch_pulls(repo: &GitHubRepo) -> Option<(Vec<PullRequest>, String)> {
-    let token = token(repo);
-    if token.is_none() && !repo.is_public() && !opted_in(repo, |v| std::env::var(v).ok()) {
+    let env = Env { vars: &|v| std::env::var(v).ok(), programs: &git::executable, rest_api: repo.rest_api(), graphql_api: repo.graphql_api() };
+    match fetch_with(repo, &env) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("  GitHub: could not fetch pull requests ({})", crate::printable(&e));
+            None
+        }
+    }
+}
+
+/// [`fetch_pulls`] in the environment `env`, with a failure returned as the message the user is shown. Ok(None):
+/// the host was not contacted.
+pub(crate) fn fetch_with(repo: &GitHubRepo, env: &Env) -> Result<Option<(Vec<PullRequest>, String)>, String> {
+    let token = token(repo, env);
+    if token.is_none() && !repo.is_public() && !opted_in(repo, env.vars) {
         eprintln!(
             "  GitHub: not contacting {0} (for a GitHub Enterprise host, set GH_HOST={0} or log in with `gh auth login --hostname {0}`)",
             repo.host
         );
-        return None;
+        return Ok(None);
     }
     // http_status_as_error(false): error statuses come back as responses, so `request` can turn 401/403/429 into
     // readable messages. 30 s bounds each whole request.
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(30)))
         .http_status_as_error(false)
+        // Redirects are followed by `request` itself, by the rule of all editions (`may_follow`).
+        .max_redirects(0)
         .build()
         .into();
-    let result = match &token {
-        Some(t) => graphql(&agent, repo, t),
-        None => rest(&agent, repo),
-    };
-    match result {
-        Ok(r) => Some(r),
-        Err(e) => {
-            eprintln!("  GitHub: could not fetch pull requests ({})", crate::printable(&e.to_string()));
-            None
-        }
+    match &token {
+        Some(t) => graphql(&agent, repo, &env.graphql_api, t),
+        None => rest(&agent, repo, &env.rest_api),
     }
+    .map(Some)
 }
+
+/// Largest response body read; a larger one fails the request. The same limit in every edition: exactly this many
+/// bytes are accepted, one more is refused.
+const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+/// Deepest nesting of arrays and objects accepted in a response, in every edition: a document nested this deep is
+/// read, one level more is refused (only arrays and objects count, not the value innermost).
+const MAX_JSON_DEPTH: usize = 127;
+/// Redirect statuses that are followed (by [`may_follow`]), and how many of them in a row.
+const REDIRECTS: [u16; 4] = [301, 302, 307, 308];
+const MAX_REDIRECTS: usize = 5;
 
 /// One API call; returns the parsed JSON body and the `x-ratelimit-remaining` header (requests left in the current
 /// rate-limit window), if present. Any non-2xx status is an error.
+///
+/// A redirect (GitHub uses them for renamed repositories) is followed only to an https URL on the same host and port
+/// ([`may_follow`]), with the same method, headers (the token included) and body; a redirect elsewhere fails the
+/// request, so the token cannot be sent on. ureq's own redirect handling is off. The body is read up to
+/// [`MAX_RESPONSE_BYTES`] and parsed by [`parse_json`].
 fn request(agent: &ureq::Agent, method: &str, url: &str, token: Option<&str>, body: Option<String>) -> Result<(Value, Option<usize>), String> {
-    let builder = ureq::http::Request::builder()
-        .method(method)
-        .uri(url)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        // GitHub rejects API requests without a User-Agent.
-        .header("User-Agent", "codecity");
-    let builder = match token {
-        Some(t) => builder.header("Authorization", format!("Bearer {t}")),
-        None => builder,
-    };
-    let response = match body {
-        Some(b) => agent.run(builder.body(b).map_err(|e| e.to_string())?),
-        None => agent.run(builder.body(()).map_err(|e| e.to_string())?),
+    use std::io::Read;
+    let mut url = url.to_string();
+    let mut hops = 0;
+    loop {
+        let builder = ureq::http::Request::builder()
+            .method(method)
+            .uri(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            // GitHub rejects API requests without a User-Agent.
+            .header("User-Agent", "codecity");
+        let builder = match token {
+            Some(t) => builder.header("Authorization", format!("Bearer {t}")),
+            None => builder,
+        };
+        let response = match &body {
+            Some(b) => agent.run(builder.body(b.clone()).map_err(|e| e.to_string())?),
+            None => agent.run(builder.body(()).map_err(|e| e.to_string())?),
+        }
+        .map_err(|e| e.to_string())?;
+        let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok());
+        let status = response.status().as_u16();
+        if let (true, Some(location)) = (REDIRECTS.contains(&status) && hops < MAX_REDIRECTS, header("location")) {
+            let next = resolve(&url, location);
+            if !may_follow(&url, &next) {
+                return Err("redirect to another host refused".into());
+            }
+            url = next;
+            hops += 1;
+            continue;
+        }
+        if let Some(e) = failure(status, header("x-ratelimit-remaining"), header("retry-after").is_some()) {
+            return Err(e);
+        }
+        let remaining = header("x-ratelimit-remaining").and_then(|v| v.parse().ok());
+        // One byte more than the limit is read, to tell a body of exactly the limit from a larger one.
+        let mut bytes = vec![];
+        response
+            .into_body()
+            .into_with_config()
+            .limit(u64::MAX)
+            .reader()
+            .take(MAX_RESPONSE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return Err(format!("response larger than {MAX_RESPONSE_BYTES} bytes"));
+        }
+        return Ok((parse_json(&String::from_utf8_lossy(&bytes))?, remaining));
     }
-    .map_err(|e| e.to_string())?;
-    let header = |name: &str| response.headers().get(name).and_then(|v| v.to_str().ok());
-    if let Some(e) = failure(response.status().as_u16(), header("x-ratelimit-remaining"), header("retry-after").is_some()) {
-        return Err(e);
+}
+
+/// `location` (a redirect's Location header) resolved against `base`: an absolute URL as it is, `//host/…` with the
+/// scheme of `base`, `/path` on the origin of `base`, anything else relative to the directory of `base`'s path.
+fn resolve(base: &str, location: &str) -> String {
+    if location.contains("://") {
+        return location.to_string();
     }
-    let remaining = header("x-ratelimit-remaining").and_then(|v| v.parse().ok());
-    let text = response.into_body().read_to_string().map_err(|e| e.to_string())?;
-    let json = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    Ok((json, remaining))
+    let scheme_end = base.find("://").map_or(0, |i| i + 3);
+    if let Some(rest) = location.strip_prefix("//") {
+        return format!("{}{rest}", &base[..scheme_end]);
+    }
+    let origin_end = base[scheme_end..].find('/').map_or(base.len(), |i| scheme_end + i);
+    if location.starts_with('/') {
+        return format!("{}{location}", &base[..origin_end]);
+    }
+    let path_end = base.find(['?', '#']).unwrap_or(base.len());
+    let dir_end = base[..path_end].rfind('/').filter(|&i| i >= origin_end).unwrap_or(origin_end);
+    format!("{}/{location}", &base[..dir_end])
+}
+
+/// Whether a redirect from `from` to `to` is followed (with the same headers, the token included): only to an https
+/// URL on the same host (compared case-insensitively) and port (an explicit port differs from none). The rule of all
+/// editions.
+fn may_follow(from: &str, to: &str) -> bool {
+    let (Ok(from), Ok(to)) = (from.parse::<ureq::http::Uri>(), to.parse::<ureq::http::Uri>()) else { return false };
+    to.scheme_str().is_some_and(|s| s.eq_ignore_ascii_case("https"))
+        && matches!((from.host(), to.host()), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b))
+        && from.port_u16() == to.port_u16()
+}
+
+/// The deepest nesting of arrays and objects in the JSON text `text`; brackets inside strings do not count.
+fn json_depth(text: &str) -> usize {
+    let (mut depth, mut deepest, mut in_string, mut escaped) = (0usize, 0usize, false, false);
+    for b in text.bytes() {
+        if in_string {
+            match b {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// One JSON document. Nesting is checked first ([`json_depth`] at most [`MAX_JSON_DEPTH`]), the rule of every
+/// edition; serde_json's own limit (also 127 levels) stays on as well.
+fn parse_json(text: &str) -> Result<Value, String> {
+    if json_depth(text) > MAX_JSON_DEPTH {
+        return Err("JSON nested too deeply".into());
+    }
+    serde_json::from_str(text).map_err(|e| e.to_string())
 }
 
 /// The message for a failed request, or None for a 2xx status. GitHub answers an exhausted rate limit with 429, or
@@ -387,9 +544,9 @@ fn failure(status: u16, rate_limit_remaining: Option<&str>, retry_after: bool) -
 }
 
 /// One GraphQL query; returns its `data`. GraphQL reports errors with HTTP 200 and an "errors" array.
-fn query(agent: &ureq::Agent, repo: &GitHubRepo, token: &str, query: &str, variables: Value) -> Result<Value, String> {
+fn query(agent: &ureq::Agent, url: &str, token: &str, query: &str, variables: Value) -> Result<Value, String> {
     let body = serde_json::json!({ "query": query, "variables": variables });
-    let (mut json, _) = request(agent, "POST", &repo.graphql_api(), Some(token), Some(body.to_string()))?;
+    let (mut json, _) = request(agent, "POST", url, Some(token), Some(body.to_string()))?;
     if let Some(err) = json["errors"].as_array().and_then(|e| e.first()) {
         return Err(err["message"].as_str().unwrap_or("GraphQL error").to_string());
     }
@@ -399,7 +556,8 @@ fn query(agent: &ureq::Agent, repo: &GitHubRepo, token: &str, query: &str, varia
 /// All open PRs (up to PAGE_SIZE × MAX_PAGES), most recently updated first, with their files, paged with the
 /// connection cursor (`after: endCursor` until `hasNextPage` is false). A PR's files are paged the same way, one
 /// extra request per further 100 files.
-fn graphql(agent: &ureq::Agent, repo: &GitHubRepo, token: &str) -> Result<(Vec<PullRequest>, String), String> {
+/// `url` is the GraphQL endpoint.
+fn graphql(agent: &ureq::Agent, repo: &GitHubRepo, url: &str, token: &str) -> Result<(Vec<PullRequest>, String), String> {
     let pulls_query = format!(
         "query($owner: String!, $name: String!, $cursor: String) {{ repository(owner: $owner, name: $name) {{ \
          pullRequests(states: OPEN, first: {PAGE_SIZE}, after: $cursor, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ \
@@ -415,7 +573,7 @@ fn graphql(agent: &ureq::Agent, repo: &GitHubRepo, token: &str) -> Result<(Vec<P
         if !more {
             break;
         }
-        let data = query(agent, repo, token, &pulls_query, serde_json::json!({ "owner": repo.owner, "name": repo.name, "cursor": cursor }))?;
+        let data = query(agent, url, token, &pulls_query, serde_json::json!({ "owner": repo.owner, "name": repo.name, "cursor": cursor }))?;
         let prs = &data["repository"]["pullRequests"];
         if prs.is_null() {
             return Err("repository not found or not accessible".into());
@@ -430,7 +588,7 @@ fn graphql(agent: &ureq::Agent, repo: &GitHubRepo, token: &str) -> Result<(Vec<P
                     break;
                 }
                 let variables = serde_json::json!({ "owner": repo.owner, "name": repo.name, "number": number, "cursor": connection["pageInfo"]["endCursor"] });
-                connection = query(agent, repo, token, files_query, variables)?["repository"]["pullRequest"]["files"].take();
+                connection = query(agent, url, token, files_query, variables)?["repository"]["pullRequest"]["files"].take();
             }
             pulls.push(PullRequest {
                 number,
@@ -452,8 +610,9 @@ fn graphql(agent: &ureq::Agent, repo: &GitHubRepo, token: &str) -> Result<(Vec<P
 /// Without a token: one listing request (the 100 most recently updated open PRs), then each PR's files, 100 per
 /// request until a page comes back short, for as many PRs as the budget of file requests allows. A PR whose files do
 /// not fit in what is left is left out, like the PRs after it, rather than shown with only some of its files.
-fn rest(agent: &ureq::Agent, repo: &GitHubRepo) -> Result<(Vec<PullRequest>, String), String> {
-    let base = format!("{}/repos/{}/{}", repo.rest_api(), repo.owner, repo.name);
+/// `api` is the REST base URL.
+fn rest(agent: &ureq::Agent, repo: &GitHubRepo, api: &str) -> Result<(Vec<PullRequest>, String), String> {
+    let base = format!("{api}/repos/{}/{}", repo.owner, repo.name);
     let (listing, remaining) = request(agent, "GET", &format!("{base}/pulls?state=open&sort=updated&direction=desc&per_page=100"), None, None)?;
     // Keep one request in reserve; without the header, assume the full ANONYMOUS_FILE_LOOKUPS are available.
     let budget = ANONYMOUS_FILE_LOOKUPS.min(remaining.unwrap_or(ANONYMOUS_FILE_LOOKUPS + 1).saturating_sub(1));
@@ -572,3 +731,9 @@ mod tests {
         assert_eq!(failure(404, None, false).as_deref(), Some("HTTP 404"));
     }
 }
+
+/// The end-to-end tests of this module and of the git plumbing it uses: a fake GitHub API on the loopback interface,
+/// the clone cache with local bare repositories, remote detection and command time limits.
+#[cfg(test)]
+#[path = "github_tests.rs"]
+mod github_tests;

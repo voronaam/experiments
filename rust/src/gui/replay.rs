@@ -220,5 +220,120 @@ mod tests {
         assert_eq!(metric_at(&t, HeightMetric::Nom, (1, 2, 0.5)), Some(3.0));
         assert_eq!(metric_at(&t, HeightMetric::Nom, (0, 0, 0.0)), None);
         assert_eq!(side_at(&t, (0, 1, 0.5)), side_of_noa(4) / 2.0);
+        // An absent type has side 0 on both sides of a snapshot it is absent from; present noa 0 is the smallest lot.
+        assert_eq!(side_at(&t, (0, 0, 0.0)), 0.0);
+        assert_eq!(side_at(&t, (2, 2, 0.0)), side_of_noa(0));
+    }
+
+    // The scenarios below are mirrored by Java's `ReplayTest` and D's `replay.d`, with the same numbers.
+
+    #[test]
+    fn speeds_cycle_and_scale_the_playback_rate() {
+        let mut r = Replay::new(10, 1.0);
+        assert_eq!(r.speed_label(), "1×");
+        // 0.8 s per snapshot at 1×.
+        r.advance(0.8);
+        assert!((r.p - 1.0).abs() < 1e-9);
+        r.next_speed();
+        r.advance(0.8);
+        assert!((r.p - 3.0).abs() < 1e-9);
+        r.next_speed();
+        r.advance(0.2);
+        assert!((r.p - 4.0).abs() < 1e-9);
+        r.next_speed();
+        assert_eq!(r.speed_label(), "0.5×");
+        r.advance(1.6);
+        assert!((r.p - 5.0).abs() < 1e-9);
+        r.next_speed();
+        assert_eq!(r.speed_label(), "1×");
+    }
+
+    #[test]
+    fn paused_playback_stands_still_and_seeking_clamps() {
+        let mut r = Replay::new(5, 1.0);
+        r.toggle();
+        assert!(!r.playing);
+        r.advance(3.0);
+        assert_eq!(r.p, 0.0);
+        r.seek(99);
+        assert_eq!((r.p, r.playing), (4.0, false));
+        // Stepping stops at both ends.
+        r.step(1);
+        assert_eq!(r.p, 4.0);
+        r.seek(0);
+        r.step(-1);
+        assert_eq!(r.p, 0.0);
+        // From a whole snapshot, a step moves by one.
+        r.seek(2);
+        r.step(1);
+        assert_eq!(r.p, 3.0);
+        r.step(-1);
+        assert_eq!(r.p, 2.0);
+    }
+
+    #[test]
+    fn nearest_snapshot_rounds_halves_up() {
+        let mut r = Replay::new(4, 1.0);
+        for (p, k, frame) in [(0.0, 0, (0, 1, 0.0)), (0.49, 0, (0, 1, 0.49)), (0.5, 1, (0, 1, 0.5)), (2.5, 3, (2, 3, 0.5)), (3.0, 3, (3, 3, 0.0))] {
+            r.p = p;
+            assert_eq!(r.snapshot(), k, "p = {p}");
+            let (a, b, f) = r.frame();
+            assert_eq!((a, b), (frame.0, frame.1));
+            assert!((f - frame.2).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn a_single_snapshot_never_plays() {
+        let mut r = Replay::new(1, 1.0);
+        r.advance(0.1);
+        assert_eq!((r.p, r.playing), (0.0, false));
+        r.toggle();
+        r.advance(0.1);
+        assert_eq!((r.p, r.playing), (0.0, false));
+        assert_eq!((r.snapshot(), r.frame()), (0, (0, 0, 0.0)));
+        // Even an empty history counts as one snapshot.
+        assert_eq!(Replay::new(0, 1.0).count, 1);
+    }
+
+    #[test]
+    fn colour_values_come_from_the_snapshot() {
+        let mut t = Track::absent(3);
+        t.nom = vec![-1, 0, 4];
+        t.cx = vec![-1, 3, 10];
+        t.loc = vec![-1, 7, 20];
+        t.commits = vec![0, 2, 5];
+        t.authors = vec![0, 1, 2];
+        t.last = vec![-1, 1_000, 1_000 + 3 * 86_400];
+        let snap = |time: i64| Snapshot { commit: "c".into(), time, author: "a".into(), subject: "s".into(), types: 1 };
+        let at = snap(1_000 + 10 * 86_400);
+        assert_eq!(color_value(ColorMetric::Commits, &t, 2, &at), 5.0);
+        // Open pull requests only exist today: churn stands in.
+        assert_eq!(color_metric(ColorMetric::Prs), ColorMetric::Commits);
+        assert_eq!(color_value(ColorMetric::Prs, &t, 1, &at), 2.0);
+        assert_eq!(color_value(ColorMetric::Authors, &t, 2, &at), 2.0);
+        // Recency: days before the snapshot's time; infinite before the first commit; never negative.
+        assert_eq!(color_value(ColorMetric::Age, &t, 2, &at), 7.0);
+        assert_eq!(color_value(ColorMetric::Age, &t, 0, &at), f64::INFINITY);
+        assert_eq!(color_value(ColorMetric::Age, &t, 2, &snap(0)), 0.0);
+        // Absent metrics count as 0; no methods gives density 0.
+        assert_eq!(color_value(ColorMetric::Cx, &t, 0, &at), 0.0);
+        assert_eq!(color_value(ColorMetric::Density, &t, 1, &at), 0.0);
+        assert_eq!(color_value(ColorMetric::Density, &t, 2, &at), 2.5);
+        assert_eq!(color_value(ColorMetric::Loc, &t, 2, &at), 20.0);
+        assert_eq!(color_value(ColorMetric::Kind, &t, 2, &at), 0.0);
+    }
+
+    #[test]
+    fn caption_cuts_long_subjects_by_characters() {
+        let s = |subject: &str| Snapshot { commit: "abcdef1234".into(), time: 1_790_769_600, author: "Ann".into(), subject: subject.into(), types: 1 };
+        let short = caption(&s("fix it"));
+        assert!(short.ends_with(" · abcdef1 · fix it — Ann"), "{short}");
+        assert_eq!(short.len() - " · abcdef1 · fix it — Ann".len(), 10);
+        let sixty = "x".repeat(60);
+        assert!(caption(&s(&sixty)).contains(&format!(" · {sixty} — ")));
+        // 61 characters (emoji, outside the BMP): the first 59 and an ellipsis.
+        let emoji = "😀".repeat(61);
+        assert!(caption(&s(&emoji)).ends_with(&format!(" · {}… — Ann", "😀".repeat(59))));
     }
 }

@@ -78,13 +78,15 @@ struct JsonWriter
     /// The rounding is Java's `Math.round`, which rounds halves up (`-2.0625` → `-2.062`), not `std.math.round`,
     /// which rounds them away from zero. Whole values below 1e15 are printed as integers (`2`, not `2.0`); the
     /// limit keeps them well inside the range where a double holds every integer exactly and `cast(long)` is exact.
+    /// Other numbers get their shortest round-tripping digits, never with an exponent (`1000000000000000`), as the
+    /// Java and Rust editions write them.
     /// JSON has no NaN or infinity, so those are written as `0`.
     ref JsonWriter number(double v) return
     {
         comma();
         const double r = isFinite(v) ? roundHalfUp(v * 1000) / 1000 : 0;
         if (r == trunc(r) && abs(r) < 1e15) output.formattedWrite("%d", cast(long) r);
-        else output.put(shortest(r));
+        else output.put(plain(shortest(r)));
         needComma = true;
         return this;
     }
@@ -139,6 +141,32 @@ private double roundHalfUp(double x)
     return x - f >= 0.5 ? f + 1 : f;
 }
 
+/// `s` (a `%g` number such as `1.5e+20`) without its exponent: `150000000000000000000`. Numbers without an
+/// exponent are returned as they are.
+string plain(string s)
+{
+    import std.conv : to;
+    import std.string : indexOf;
+    const e = s.indexOf('e');
+    if (e < 0) return s;
+    const exp = s[e + 1 .. $].to!int;
+    string mantissa = s[0 .. e];
+    string sign;
+    if (mantissa.length && mantissa[0] == '-')
+    {
+        sign = "-";
+        mantissa = mantissa[1 .. $];
+    }
+    const dot = mantissa.indexOf('.');
+    const digits = dot < 0 ? mantissa : mantissa[0 .. dot] ~ mantissa[dot + 1 .. $];
+    // The position of the decimal point within `digits` once the exponent is applied.
+    const point = cast(long)(dot < 0 ? mantissa.length : dot) + exp;
+    string zeros(long n) { string z; foreach (_; 0 .. n) z ~= '0'; return z; }
+    if (point >= cast(long) digits.length) return sign ~ digits ~ zeros(point - digits.length);
+    if (point <= 0) return sign ~ "0." ~ zeros(-point) ~ digits;
+    return sign ~ digits[0 .. point] ~ "." ~ digits[point .. $];
+}
+
 /// Shortest decimal representation that round-trips (like Java's Double.toString / Rust's `{}` for our ranges).
 ///
 /// Tries 1, 2, … significant digits and returns the first that parses back to exactly `v`. 17 significant digits
@@ -168,7 +196,7 @@ unittest
     assert(shortest(12.345) == "12.345" && shortest(-0.5) == "-0.5");
 }
 
-unittest
+unittest // roundsHalvesUpLikeTheOtherEditions and writesNonFiniteNumbersAsZero
 {
     auto w = JsonWriter.create();
     w.beginArray();
@@ -180,7 +208,7 @@ unittest
 
 /// A hostile string (from a file name, commit message or pull request title) cannot end or confuse the `<script>`
 /// element an export embeds the JSON in, nor break a JavaScript string. The Java and Rust editions have the same test.
-unittest
+unittest // escapesEverythingThatCouldEscapeAScriptElement
 {
     auto w = JsonWriter.create();
     w.beginArray().value("</script><!--\u2028\u2029\x01&>\"\\").endArray();
@@ -188,11 +216,71 @@ unittest
 }
 
 /// The viewer files an export inlines as they are must not contain what would end their element early.
-unittest
+unittest // inlinedViewerFilesCannotEndTheirElements
 {
     import codecity.assets : appJs, styleCss;
     import std.algorithm : canFind;
     import std.uni : toLower;
     assert(!appJs.toLower.canFind("</script") && !appJs.toLower.canFind("<!--"));
     assert(!styleCss.toLower.canFind("</style"));
+}
+
+// The rules below, one per unittest, mirror JsonWriterTest (Java) and json.rs (Rust); each block names the Java test.
+
+version (unittest)
+{
+    /// Writes each value with `number` into one array.
+    private string nums(const double[] values)
+    {
+        auto w = JsonWriter.create();
+        w.beginArray();
+        foreach (v; values) w.number(v);
+        w.endArray();
+        return w.finish();
+    }
+}
+
+unittest // writesWholeNumbersWithoutAFraction: as a double or as an integer
+{
+    assert(nums([0.0, 3.0, -7.0, 1e14]) == "[0,3,-7,100000000000000]");
+    auto w = JsonWriter.create();
+    w.beginArray().value(0L).value(long.max).value(long.min).endArray();
+    assert(w.finish() == "[0,9223372036854775807,-9223372036854775808]");
+}
+
+unittest // roundsToThreeDecimalsWithoutTrailingZeros: what rounds to zero (minus zero too) is a plain 0
+{
+    assert(nums([0.4, 0.1 + 0.2, 2.50, 1.23456, 0.0005, 0.0004, -0.0004, -0.0, -0.4])
+        == "[0.4,0.3,2.5,1.235,0.001,0,0,0,-0.4]");
+}
+
+unittest // writesLargeNumbersWithoutAnExponent: shortest round-tripping digits in full (2^60 as 1152921504606847000)
+{
+    assert(nums([12345678.5, 1e15, cast(double)(1UL << 60), -98765432.125])
+        == "[12345678.5,1000000000000000,1152921504606847000,-98765432.125]");
+    assert(plain("1.5e+20") == "150000000000000000000" && plain("-2.5e-03") == "-0.0025" && plain("12.5") == "12.5");
+}
+
+unittest // escapesControlCharactersAndKeepsOtherText: \n \r \t short, other controls as \u00XX, the rest as it is
+{
+    auto w = JsonWriter.create();
+    w.beginArray().value("\n\r\t\b\f\x00\x1f\x7fé漢😀'/").endArray();
+    assert(w.finish() == "[\"\\n\\r\\t\\u0008\\u000c\\u0000\\u001f\x7fé漢😀'/\"]");
+}
+
+unittest // escapesKeysLikeValues: keys can hold repository-derived text; <, >, & and U+2028/2029 never appear raw
+{
+    auto w = JsonWriter.create();
+    w.beginObject().field("<k>\"&\u2028", 1).endObject();
+    assert(w.finish() == `{"\u003ck\u003e\"\u0026\u2028":1}`);
+}
+
+unittest // keepsKeysInWritingOrderAndCommasBetweenMembers: nested and empty objects and arrays included
+{
+    auto w = JsonWriter.create();
+    w.beginObject().field("b", 1);
+    w.name("a").beginArray().value(1).beginObject().fieldBool("c", true).fieldBool("d", false).endObject();
+    w.beginArray().endArray().endArray();
+    w.name("e").beginObject().endObject().field("f", "x").name("g").nullable(null).endObject();
+    assert(w.finish() == `{"b":1,"a":[1,{"c":true,"d":false},[]],"e":{},"f":"x","g":null}`);
 }

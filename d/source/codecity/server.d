@@ -38,18 +38,21 @@ import std.utf : validate;
 /// Larger source files are not sent to the viewer (a placeholder comment is sent instead).
 private enum maxSourceBytes = 4UL * 1024 * 1024;
 
-/// One open event stream: a queue the broadcaster appends to and the connection thread drains.
-/// Both fields are guarded by `CityServer.lock`.
+/// One open event stream: a queue the broadcaster appends to and the connection thread drains; `closed` is set by
+/// `CityServer.close` to end the stream. Both fields are guarded by `CityServer.lock`.
 private final class EventClient
 {
     string[] queue;
     bool closed;
 }
 
-/// The local viewer server. Construct it (which binds the port), then call `run`, which never returns.
+/// The local viewer server. Construct it (which binds the port), then call `run`, which serves until `close`; the
+/// program itself never calls `close` (it ends with Ctrl+C), but tests do, so no server outlives its test.
 final class CityServer
 {
     private Socket listener;
+    /// Set by `close`; `run`, the heartbeat and the event streams end when they see it.
+    private shared bool stopped;
     private CityModel model_;
     private Mutex lock;
     /// Signalled (with `lock` held) whenever a message is queued for the event streams.
@@ -117,29 +120,52 @@ final class CityServer
         wake.notifyAll();
     }
 
-    /// Serves forever.
+    /// Serves until `close` is called (in the program: forever).
     void run()
     {
+        import core.atomic : atomicLoad;
+        import core.time : msecs;
         // Every 20 s an SSE comment line (": ping", ignored by EventSource) goes to every stream. This is also how a
         // stream thread notices a closed browser tab: the thread blocks until there is something to send, and only
-        // a failed send ends it.
+        // a failed send ends it. The wait is taken in short steps so that the thread ends soon after `close`.
         auto heartbeat = new Thread({
-            while (true)
+            while (!atomicLoad(stopped))
             {
-                Thread.sleep(20.seconds);
+                foreach (_; 0 .. 200)
+                {
+                    if (atomicLoad(stopped)) return;
+                    Thread.sleep(100.msecs);
+                }
                 broadcast(": ping\n\n");
             }
         });
         heartbeat.isDaemon = true;
         heartbeat.start();
-        while (true)
+        while (!atomicLoad(stopped))
         {
             Socket conn;
-            // A failed accept (e.g. a connection reset before it was accepted) must not stop the server.
+            // A failed accept (e.g. a connection reset before it was accepted) must not stop the server; one that
+            // fails because `close` shut the listener down does.
             try conn = listener.accept();
             catch (Exception) continue;
             serveInThread(conn);
         }
+    }
+
+    /// Stops the server: `run` returns, the heartbeat ends and every open event stream is closed. Shutting the
+    /// listening socket down (not just closing it) is what wakes a thread blocked in `accept` on Linux. Safe to call
+    /// more than once, and before `run`.
+    void close()
+    {
+        import core.atomic : atomicStore;
+        atomicStore(stopped, true);
+        lock.lock();
+        foreach (c; clients) c.closed = true;
+        wake.notifyAll();
+        lock.unlock();
+        try listener.shutdown(SocketShutdown.BOTH);
+        catch (Exception) {}
+        listener.close();
     }
 
     /// A separate function so each connection's thread gets its own closure frame (a closure created directly in the
@@ -173,6 +199,9 @@ final class CityServer
         while (request.indexOf("\r\n\r\n") < 0 && request.length < 65536)
         {
             const n = conn.receive(buf[]);
+            // The garbage collector's stop-the-world signals interrupt a blocked receive, and with a receive timeout
+            // set Linux does not restart it: that is no reason to drop the request.
+            if (n < 0 && interrupted) continue;
             if (n <= 0) return;
             request ~= buf[0 .. n].idup;
         }
@@ -225,6 +254,7 @@ final class CityServer
         while (data.length)
         {
             const n = conn.send(data);
+            if (n < 0 && interrupted) continue; // a signal, not the peer going away (see `handle`)
             if (n <= 0 || n == Socket.ERROR) return false;
             data = data[n .. $];
         }
@@ -241,12 +271,27 @@ final class CityServer
     /// to the root, never the absolute path. Invalid UTF-8 is replaced (`sanitize`) because the JSON writer needs valid UTF-8.
     private static void source(Socket conn, CityModel model, string query)
     {
-        // size_t.max means "missing or not a number" and fails the range check below.
-        size_t id = size_t.max;
+        // The first `id=` parameter decides. A missing or malformed id (anything but decimal digits, e.g. `-1`, `+1`
+        // or `abc`) is a bad request; a well-formed one that names no building is not found. The Java and Rust
+        // editions answer the same.
+        import std.ascii : isDigit;
+        import std.algorithm : all;
+        bool found;
+        size_t id;
         foreach (kv; query.split("&"))
             if (kv.startsWith("id="))
-                try id = kv[3 .. $].to!size_t;
-                catch (Exception) {}
+            {
+                const v = kv[3 .. $];
+                if (v.length && v.all!isDigit)
+                    try id = v.to!size_t, found = true;
+                    catch (Exception) {} // too large for size_t
+                break;
+            }
+        if (!found)
+        {
+            send(conn, 400, "text/plain", "bad id");
+            return;
+        }
         if (id >= model.buildings.length)
         {
             send(conn, 404, "text/plain", "unknown type");
@@ -283,9 +328,11 @@ final class CityServer
     /// `retry: 2000` tells EventSource to reconnect after 2 s if the stream breaks, e.g. when the server restarts.
     private void events(Socket conn)
     {
+        import core.atomic : atomicLoad;
         auto client = new EventClient;
         lock.lock();
         clients ~= client;
+        client.closed = atomicLoad(stopped); // a stream that arrives while the server closes ends at once
         lock.unlock();
         scope (exit)
         {
@@ -302,7 +349,12 @@ final class CityServer
             string[] batch;
             lock.lock();
             // Loop because wake is shared by all streams (notifyAll) and waits can wake spuriously.
-            while (client.queue.length == 0) wake.wait();
+            while (client.queue.length == 0 && !client.closed) wake.wait();
+            if (client.closed)
+            {
+                lock.unlock();
+                return; // the server is closing
+            }
             batch = client.queue;
             client.queue = null;
             lock.unlock();
@@ -310,6 +362,13 @@ final class CityServer
                 if (!sendAll(conn, m)) return; // browser went away
         }
     }
+}
+
+/// True when the last socket call failed only because a signal interrupted it (EINTR); it can simply be repeated.
+private bool interrupted()
+{
+    import core.stdc.errno : EINTR, errno;
+    return errno == EINTR;
 }
 
 /// True for a `Host` header naming this server by a loopback name: `localhost`, `127.0.0.1` or `[::1]`, either alone or
@@ -367,6 +426,7 @@ version (Posix) unittest
     write(buildPath(root, "A.java"), "class A {}");
     write(buildPath(tmp, "secret.txt"), "TOP SECRET");
     auto server = new CityServer(CityModel.build(new SourceAnalyzer, root, true, false, false, GitHubInfo.init), 0);
+    scope (exit) server.close();
     auto t = new Thread({ server.run(); });
     t.isDaemon = true;
     t.start();
@@ -376,10 +436,11 @@ version (Posix) unittest
     {
         auto s = new TcpSocket(new InternetAddress("127.0.0.1", server.port));
         scope (exit) s.close();
+        s.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, 20.seconds); // a stuck server fails the test
         s.send("GET " ~ path ~ " HTTP/1.1\r\n" ~ (host is null ? "" : "Host: " ~ host ~ "\r\n") ~ "Connection: close\r\n\r\n");
         char[4096] buf;
         string r;
-        for (ptrdiff_t n; (n = s.receive(buf[])) > 0;) r ~= buf[0 .. n].idup;
+        for (ptrdiff_t n; (n = receiveRetrying(s, buf[])) > 0;) r ~= buf[0 .. n].idup;
         return r;
     }
     const p = format(":%d", server.port);
@@ -395,4 +456,260 @@ version (Posix) unittest
     assert(!r.canFind("TOP SECRET"), r);
     assert(r.canFind("unable to read A.java"), r);
     assert(!r.canFind(tmp), r);
+}
+
+version (unittest)
+{
+    /// `s.receive(buf)`, retried when a signal interrupts it. With a receive timeout set, Linux does not restart an
+    /// interrupted receive, and the garbage collector's stop-the-world signals interrupt blocked threads routinely; a
+    /// test would otherwise take that for the end of the stream. Returns the byte count, 0 at the end of the stream
+    /// and -1 on an error or timeout.
+    ptrdiff_t receiveRetrying(Socket s, void[] buf)
+    {
+        import core.stdc.errno : EINTR, errno;
+        while (true)
+        {
+            const n = s.receive(buf);
+            if (n >= 0 || errno != EINTR) return n;
+        }
+    }
+
+    /// Analyses `root` without git or GitHub and serves it on a port the system picks, on a daemon thread. The caller
+    /// closes the server (`scope (exit) server.close()`).
+    private CityServer serveForTest(string root)
+    {
+        import codecity.analysis : SourceAnalyzer;
+        import codecity.git : realPath;
+        import codecity.github : GitHubInfo;
+        auto server = new CityServer(CityModel.build(new SourceAnalyzer, realPath(root), true, false, false, GitHubInfo.init), 0);
+        auto t = new Thread({ server.run(); });
+        t.isDaemon = true;
+        t.start();
+        return server;
+    }
+
+    /// Sends a raw GET (so the Host header is fully controlled; null leaves it out) and returns the whole response.
+    private string httpGet(ushort port, string path, string host)
+    {
+        auto s = new TcpSocket(new InternetAddress("127.0.0.1", port));
+        scope (exit) s.close();
+        // A stuck server makes the receive fail after this long instead of hanging the test run.
+        s.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, 20.seconds);
+        s.send("GET " ~ path ~ " HTTP/1.1\r\n" ~ (host is null ? "" : "Host: " ~ host ~ "\r\n") ~ "Connection: close\r\n\r\n");
+        char[65_536] buf;
+        string r;
+        for (ptrdiff_t n; (n = receiveRetrying(s, buf[])) > 0;) r ~= buf[0 .. n].idup;
+        return r;
+    }
+
+    /// The value of header `name` in a raw response (lower case; names compared case-insensitively), or null.
+    private string headerOf(string response, string name)
+    {
+        return headerValue(response, name);
+    }
+
+    /// The body of a raw response (everything after the blank line).
+    private string bodyOf(string response)
+    {
+        const at = response.indexOf("\r\n\r\n");
+        return at < 0 ? "" : response[at + 4 .. $];
+    }
+
+    /// A fresh temporary directory for one test; the caller removes it.
+    private string serverTestDir()
+    {
+        import std.file : mkdirRecurse, tempDir;
+        import std.path : buildPath;
+        import std.uuid : randomUUID;
+        const d = buildPath(tempDir, "codecity-server-test-" ~ randomUUID.toString);
+        mkdirRecurse(d);
+        return d;
+    }
+}
+
+/// The viewer's files are served with their content types and `no-store`; the page carries its Content-Security-Policy
+/// with the inline scripts' hashes filled in. Paths that are not viewer files or endpoints, including paths below an
+/// endpoint and paths that try to leave the asset list, are 404s. The Java and Rust editions have the same test.
+unittest
+{
+    import std.algorithm : canFind;
+    import std.file : rmdirRecurse, write;
+    import std.path : buildPath;
+    const d = serverTestDir();
+    scope (exit) rmdirRecurse(d);
+    write(buildPath(d, "A.java"), "class A {}");
+    auto server = serveForTest(d);
+    scope (exit) server.close();
+    const port = server.port, host = format("localhost:%d", port);
+    foreach (path; ["/", "/index.html"])
+    {
+        const r = httpGet(port, path, host);
+        assert(r.startsWith("HTTP/1.1 200"), r);
+        assert(headerOf(r, "content-type") == "text/html; charset=utf-8");
+        assert(headerOf(r, "cache-control") == "no-store");
+        assert(r.canFind(`<meta http-equiv="Content-Security-Policy"`), path);
+        assert(r.canFind("'sha256-"), path);
+        assert(!r.canFind("{{inline-script-hashes}}"), path);
+    }
+    assert(headerOf(httpGet(port, "/app.js", host), "content-type") == "text/javascript; charset=utf-8");
+    assert(headerOf(httpGet(port, "/style.css", host), "content-type") == "text/css; charset=utf-8");
+    assert(headerOf(httpGet(port, "/favicon.svg", host), "content-type") == "image/svg+xml");
+    const city = httpGet(port, "/api/city", host);
+    assert(headerOf(city, "content-type") == "application/json; charset=utf-8");
+    assert(headerOf(city, "cache-control") == "no-store");
+    assert(bodyOf(city).startsWith("{") && bodyOf(city).canFind(`"A"`), city);
+    foreach (path; ["/nope", "/web/app.js", "/../pom.xml", "/index.htm", "/api", "/api/", "/api/city/x", "/api/source/x",
+            "/api/events/x", "/api/cities"])
+    {
+        const r = httpGet(port, path, host);
+        assert(r.startsWith("HTTP/1.1 404"), path ~ ": " ~ r);
+        assert(headerOf(r, "content-type") == "text/plain", path);
+        assert(bodyOf(r) == "not found", path);
+    }
+}
+
+/// `/api/source`: a missing or malformed id is a 400, a well-formed id that names no building a 404; neither answer
+/// mentions a path. A valid id answers the file (relative), the type's line range and the code.
+unittest
+{
+    import std.file : mkdirRecurse, rmdirRecurse, write;
+    import std.path : buildPath;
+    const d = serverTestDir();
+    scope (exit) rmdirRecurse(d);
+    mkdirRecurse(buildPath(d, "p"));
+    write(buildPath(d, "p", "A.java"), "package p;\n\nclass A {\n}\n");
+    auto server = serveForTest(d);
+    scope (exit) server.close();
+    const port = server.port, host = format("localhost:%d", port);
+    foreach (query; ["", "?", "?id=", "?id=abc", "?id=-1", "?id=+0", "?id=0x1", "?id=1.0", "?x=1", "?id=99999999999999999999999"])
+    {
+        const r = httpGet(port, "/api/source" ~ query, host);
+        assert(r.startsWith("HTTP/1.1 400"), query ~ ": " ~ r);
+        assert(bodyOf(r) == "bad id", query);
+    }
+    foreach (query; ["?id=1", "?id=999", "?id=4294967296"])
+    {
+        const r = httpGet(port, "/api/source" ~ query, host);
+        assert(r.startsWith("HTTP/1.1 404"), query ~ ": " ~ r);
+        assert(bodyOf(r) == "unknown type", query);
+    }
+    const r = httpGet(port, "/api/source?x=1&id=0", host);
+    assert(r.startsWith("HTTP/1.1 200"), r);
+    assert(headerOf(r, "content-type") == "application/json; charset=utf-8");
+    assert(bodyOf(r) == `{"file":"p/A.java","line":3,"endLine":4,"code":"package p;\n\nclass A {\n}\n"}`, bodyOf(r));
+}
+
+/// Files over 4 MiB are not sent (a placeholder comment is), a file of exactly 4 MiB is; a FIFO swapped in after the
+/// analysis is reported as unreadable without blocking the request.
+version (Posix) unittest
+{
+    import core.time : MonoTime;
+    import std.algorithm : canFind;
+    import std.array : replicate;
+    import std.file : remove, rmdirRecurse, write;
+    import std.path : buildPath;
+    import std.process : execute;
+    import std.stdio : File;
+    const d = serverTestDir();
+    scope (exit) rmdirRecurse(d);
+    const a = buildPath(d, "A.java");
+    write(a, "class A {}");
+    auto server = serveForTest(d);
+    scope (exit) server.close();
+    const port = server.port, host = format("localhost:%d", port);
+    {
+        auto f = File(a, "r+");
+        f.seek(maxSourceBytes);
+        f.rawWrite("x"); // sparse, maxSourceBytes + 1 bytes
+    }
+    assert(httpGet(port, "/api/source?id=0", host).canFind(`"code":"// file too large to display"`));
+    write(a, "x".replicate(maxSourceBytes));
+    const r = httpGet(port, "/api/source?id=0", host);
+    assert(r.canFind(`"code":"xxxx`), r[0 .. min($, 300)]);
+    assert(!r.canFind("too large"));
+
+    remove(a);
+    assert(execute(["mkfifo", a]).status == 0);
+    const start = MonoTime.currTime;
+    const fifo = httpGet(port, "/api/source?id=0", host);
+    assert(MonoTime.currTime - start < 10.seconds, "the request blocked on the FIFO");
+    assert(fifo.canFind(`"code":"// unable to read A.java"`), fifo);
+}
+
+/// `/api/events`: a stream opens with the event-stream headers and a `retry` line; swapping in a new model sends one
+/// `update` event with the new type count, after which `/api/city` serves the new model. A foreign host gets no stream.
+unittest
+{
+    import codecity.analysis : SourceAnalyzer;
+    import codecity.git : realPath;
+    import codecity.github : GitHubInfo;
+    import std.algorithm : canFind, endsWith;
+    import std.file : rmdirRecurse, write;
+    import std.path : buildPath;
+    const d = serverTestDir();
+    scope (exit) rmdirRecurse(d);
+    write(buildPath(d, "A.java"), "class A {}");
+    auto server = serveForTest(d);
+    scope (exit) server.close();
+    const port = server.port, host = format("localhost:%d", port);
+    assert(httpGet(port, "/api/events", format("evil.example:%d", port)).startsWith("HTTP/1.1 403"));
+
+    auto s = new TcpSocket(new InternetAddress("127.0.0.1", port));
+    scope (exit) s.close();
+    s.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, 20.seconds);
+    s.send("GET /api/events HTTP/1.1\r\nHost: " ~ host ~ "\r\n\r\n");
+    // Reads until what was read ends with `marker`; fails at the end of the stream (or after the timeout).
+    string readUntil(string marker)
+    {
+        string got;
+        char[1] c;
+        while (!got.endsWith(marker))
+        {
+            assert(receiveRetrying(s, c[]) == 1, "stream ended before " ~ marker ~ ": " ~ got);
+            got ~= c[0];
+        }
+        return got;
+    }
+    const head = readUntil("retry: 2000\n\n");
+    assert(head.startsWith("HTTP/1.1 200"), head);
+    assert(headerOf(head, "content-type") == "text/event-stream; charset=utf-8");
+    assert(headerOf(head, "cache-control") == "no-cache");
+
+    write(buildPath(d, "Brand.java"), "class Brand {}");
+    server.update(CityModel.build(new SourceAnalyzer, realPath(d), true, false, false, GitHubInfo.init));
+    readUntil("event: update\ndata: {\"types\":2}\n\n");
+    assert(httpGet(port, "/api/city", host).canFind(`"Brand"`));
+
+    // Closing the server ends the open stream (and `run`), so nothing outlives the test.
+    server.close();
+    char[1] c;
+    assert(receiveRetrying(s, c[]) == 0, "the event stream stayed open after close");
+}
+
+/// When the preferred port is taken, the server binds one of the next ones (the Java and Rust editions search the same
+/// 20 ports) and reports the port it got in its URL; port 0 lets the system choose.
+unittest
+{
+    import codecity.analysis : SourceAnalyzer;
+    import codecity.github : GitHubInfo;
+    import std.file : rmdirRecurse, write;
+    import std.path : buildPath;
+    const d = serverTestDir();
+    scope (exit) rmdirRecurse(d);
+    write(buildPath(d, "A.java"), "class A {}");
+    auto taken = new TcpSocket(AddressFamily.INET);
+    scope (exit) taken.close();
+    taken.bind(new InternetAddress("127.0.0.1", 0));
+    taken.listen(1);
+    const busy = (cast(InternetAddress) taken.localAddress).port;
+    auto server = new CityServer(CityModel.build(new SourceAnalyzer, d, true, false, false, GitHubInfo.init), busy);
+    scope (exit) server.close();
+    const port = server.port;
+    assert(server.url == format("http://localhost:%d/", port));
+    assert(port != busy, "bound the busy port");
+    if (busy <= 65_535 - 19) assert(port > busy && port <= busy + 19, format("%d -> %d", busy, port));
+    auto t = new Thread({ server.run(); });
+    t.isDaemon = true;
+    t.start();
+    assert(httpGet(port, "/api/city", format("localhost:%d", port)).startsWith("HTTP/1.1 200"));
 }

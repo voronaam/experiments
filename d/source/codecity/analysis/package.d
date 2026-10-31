@@ -297,6 +297,9 @@ final class SourceAnalyzer
             return ParsedFile(null, null, true);
         try
         {
+            // Test-only seam: lets the tests crash an analyser on purpose (see `crashOnPurpose`).
+            version (unittest)
+                if (file.baseName.startsWith(crashOnPurpose)) throw new Error("deliberate analyser crash (test)");
             final switch (lang)
             {
             case Language.java: return java.parse(root, file, code);
@@ -404,4 +407,60 @@ version (Posix) unittest
     assert(fqns == ["A", "src/B.ts:B"], fqns.to!string);
     assert(a.files == 3, a.files.to!string); // A.java, B.ts and Big.java
     assert(a.failedFiles == 1); // Big.java is too large to parse
+}
+
+/// Files whose name starts with this make the analyser throw an `Error` (unittest builds only, see `parseFile`).
+version (unittest) private enum crashOnPurpose = "CrashOnPurpose";
+
+/// A crash in an analyser fails only the file it happened in, and the analysis as a whole goes on (like Java's
+/// `stackOverflowInAnAnalyserFailsOnlyThatFile` and Rust's `a_crash_in_an_analyser_fails_only_that_file`).
+unittest
+{
+    import std.algorithm : sort;
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, write;
+    import std.path : buildPath;
+    import std.uuid : randomUUID;
+    const tmp = buildPath(tempDir, "codecity-crash-test-" ~ randomUUID.toString);
+    mkdirRecurse(tmp);
+    scope (exit) rmdirRecurse(tmp);
+    write(buildPath(tmp, "CrashOnPurpose1.java"), "class Bad1 {}");
+    write(buildPath(tmp, "CrashOnPurpose2.ts"), "export class Bad2 {}");
+    write(buildPath(tmp, "Good.java"), "class Good {}");
+    write(buildPath(tmp, "good.ts"), "export class Fine {}");
+    auto a = new SourceAnalyzer().analyze(tmp, true);
+    string[] fqns;
+    foreach (t; a.types) fqns ~= t.fqn;
+    fqns.sort();
+    assert(fqns == ["Good", "good.ts:Fine"], fqns.to!string);
+    assert(a.files == 4);
+    assert(a.failedFiles == 2);
+}
+
+/// A file that is not valid UTF-8 is read as ISO-8859-1 (every byte one character), so legacy sources still yield
+/// their types, with the accented names decoded, and none counts as failed. The Java and Rust editions have the same
+/// test.
+unittest
+{
+    import std.algorithm : any, endsWith;
+    import std.file : mkdirRecurse, rmdirRecurse, tempDir, write;
+    import std.path : buildPath;
+    import std.uuid : randomUUID;
+    const tmp = buildPath(tempDir, "codecity-latin1-test-" ~ randomUUID.toString);
+    const src = buildPath(tmp, "src");
+    mkdirRecurse(src);
+    scope (exit) rmdirRecurse(tmp);
+    write(buildPath(src, "Legacy.java"), cast(const(ubyte)[]) "// Gr\xfc\xdfe \xa9 2001\nclass Caf\xe9 {\n    String s = \"\xe9\";\n    void m\xfc() {}\n}\n");
+    write(buildPath(src, "legacy.ts"), cast(const(ubyte)[]) "export class Caf\xe9 { n = \"\xe9\"; f\xfc() {} }\n");
+    write(buildPath(src, "lib.rs"), cast(const(ubyte)[]) "// \xa9\npub struct Caf\xe9 { s: u8 }\nimpl Caf\xe9 { fn f\xfc(&self) {} }\n");
+    auto a = new SourceAnalyzer().analyze(tmp, true);
+    assert(a.failedFiles == 0);
+    assert(a.types.length == 3);
+    foreach (t; a.types)
+    {
+        assert(t.name == "Café", t.fqn);
+        assert(t.methods.length == 1, t.fqn);
+        assert(t.methods[0].name.endsWith("ü"), t.fqn);
+    }
+    assert(a.types.any!(t => t.fqn == "Café"));
+    assert(a.types.any!(t => t.fqn == "src/legacy.ts:Café"));
 }

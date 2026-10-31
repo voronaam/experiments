@@ -35,14 +35,28 @@
 mod look;
 mod material;
 mod png;
+mod prefs;
 mod replay;
+mod rules;
 mod scene;
 mod source;
 mod walk;
 
+// Tests of the viewer's logic (see the files for what each covers); the Java and D editions mirror them.
+#[cfg(test)]
+mod look_tests;
+#[cfg(test)]
+mod prefs_tests;
+#[cfg(test)]
+mod rules_tests;
+#[cfg(test)]
+mod source_tests;
+
 use crate::city::CityModel;
 use crate::github::GitHubInfo;
 use look::{ColorMetric, HeightMetric, Scale, Theme};
+use prefs::Prefs;
+use rules::{Orbit, Walking};
 use replay::Replay;
 use scene::{Hit, Scene};
 use source::SourceView;
@@ -289,93 +303,7 @@ impl Capture {
     }
 }
 
-// ------------------------------------------------------------------ preferences
-
-/// View settings that survive restarts, stored as JSON in `$XDG_CONFIG_HOME/codecity/desktop.json` (or
-/// `~/.config/codecity/desktop.json`). They are saved whenever the user changes one.
-struct Prefs {
-    height: HeightMetric,
-    /// The colour metric the user last picked. `None` means "never chosen": [`App::set_model`] then picks a default
-    /// that suits the model (churn with git history, complexity without).
-    color: Option<ColorMetric>,
-    theme: Theme,
-    show_tests: bool,
-    labels: bool,
-    beacons: bool,
-    shadows: bool,
-}
-
-impl Prefs {
-    fn path() -> PathBuf {
-        let base = std::env::var_os("XDG_CONFIG_HOME")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
-        base.join("codecity").join("desktop.json")
-    }
-
-    /// Reads the settings file. A missing or malformed file, or a missing or unknown key, silently falls back to the
-    /// default for that setting, so old or hand-edited files never stop the viewer from starting.
-    fn load() -> Prefs {
-        // A missing/unparsable file gives Value::Null, and indexing Null yields Null, so every lookup below falls
-        // through to its default.
-        let v: serde_json::Value = std::fs::read_to_string(Self::path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
-        let b = |k: &str, d: bool| v[k].as_bool().unwrap_or(d);
-        Prefs {
-            // Metrics are stored by their Debug name ("Nom", "Commits", …), matching what save() writes.
-            height: HeightMetric::ALL.into_iter().find(|m| format!("{m:?}") == s("height")).unwrap_or(HeightMetric::Nom),
-            color: ColorMetric::ALL.into_iter().find(|m| format!("{m:?}") == s("color")),
-            theme: if s("theme") == "night" { Theme::Night } else { Theme::Day },
-            show_tests: b("tests", true),
-            labels: b("labels", true),
-            beacons: b("beacons", true),
-            shadows: b("shadows", true),
-        }
-    }
-
-    /// Writes the settings file, creating its directory if needed. Errors are ignored: losing a view preference is not
-    /// worth interrupting the user for.
-    fn save(&self) {
-        let v = serde_json::json!({
-            "height": format!("{:?}", self.height),
-            "color": self.color.map(|c| format!("{c:?}")),
-            "theme": self.theme.name(),
-            "tests": self.show_tests,
-            "labels": self.labels,
-            "beacons": self.beacons,
-            "shadows": self.shadows,
-        });
-        let path = Self::path();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(path, v.to_string());
-    }
-}
-
 // ------------------------------------------------------------------ camera
-
-/// An orbit camera: the eye sits on a sphere of radius `distance` around `target` and always looks at it.
-///
-/// `yaw` is the angle around the vertical axis (radians; 0 puts the eye on the `+z` side, i.e. in front of the
-/// city), `pitch` the elevation above the ground plane (0 is level, π/2 straight down from above). Mouse handling
-/// keeps pitch in `0.07..=1.5`: never quite level with the ground and never exactly overhead, where the view
-/// direction would be parallel to the up vector and the view matrix degenerate.
-#[derive(Clone, Copy)]
-struct Orbit {
-    target: Vec3,
-    yaw: f32,
-    pitch: f32,
-    distance: f32,
-}
-
-impl Orbit {
-    /// Eye position: spherical to Cartesian coordinates around the target.
-    fn position(&self) -> Vec3 {
-        self.target + vec3(self.pitch.cos() * self.yaw.sin(), self.pitch.sin(), self.pitch.cos() * self.yaw.cos()) * self.distance
-    }
-}
 
 /// A camera move in progress. The target and the distance are animated, and the pitch when a near-level view is tilted
 /// up; yaw stays where it is, so a flight zooms and slides but never swings the view around. Times are in seconds of
@@ -422,15 +350,6 @@ struct Actions {
     walk: bool,
     /// Enter or leave the history replay (the Replay and Now buttons, R, Esc).
     replay: bool,
-}
-
-/// First-person walk mode in progress (see [`walk`]).
-struct Walking {
-    walker: walk::Walker,
-    /// The orbit camera when walking started, restored exactly on leaving.
-    saved: Orbit,
-    /// When walking started, in [`App::time`] seconds, for fading out the key hint.
-    since: f64,
 }
 
 // ------------------------------------------------------------------ the app
@@ -597,10 +516,7 @@ impl App {
         self.sides = self.model.buildings.iter().map(|b| b.lot.side as f32).collect();
         self.district_shown = self.present_districts();
         // The saved metric if this model supports it, else churn when there is git history, else complexity.
-        self.color_metric = match self.prefs.color {
-            Some(c) if c.unavailable(&self.model).is_none() => c,
-            _ => if self.model.has_git() { ColorMetric::Commits } else { ColorMetric::Cx },
-        };
+        self.color_metric = rules::effective_color(self.prefs.color, self.model.has_git(), self.model.has_pulls());
         let n = self.model.buildings.len();
         let types = self.model.types();
         self.heights = self.model.buildings.iter().map(|b| old.get(&types[b.index].fqn).copied().unwrap_or(0.0)).collect();
@@ -632,29 +548,12 @@ impl App {
         }
     }
 
-    /// Chooses which districts get a floating name label.
-    ///
-    /// Labelling every district would bury the city in text, so only districts at nesting depth 1 and 2 (modules and
-    /// top-level packages; depth 0 is the city itself) that contain at least one type are candidates. The 24 largest
-    /// by area are considered, biggest first, and a label is skipped if its anchor is within 8 units sideways and
-    /// 3 units in depth of one already placed, since the two would overlap on screen. At most 16 labels are kept.
-    ///
-    /// Each label is anchored at the middle of the district's front edge (`z + d/2`, as `z` runs back to front), just
-    /// above its platform: a district at depth `n` has its top at `(n + 1) * PLATFORM`, as in the layout.
+    /// Chooses the district labels ([`rules::labels`]) and keeps their text, anchor and district.
     fn build_labels(&mut self) {
-        let mut candidates: Vec<_> = self.model.districts.iter().enumerate().filter(|(_, d)| (1..=2).contains(&d.depth) && d.types > 0).collect();
-        candidates.sort_by(|(_, a), (_, b)| (b.w * b.d).total_cmp(&(a.w * a.d)));
-        let mut anchors: Vec<(f64, f64)> = vec![];
-        self.labels.clear();
-        for (index, d) in candidates.into_iter().take(24) {
-            let front = d.z + d.d / 2.0;
-            if anchors.len() >= 16 || anchors.iter().any(|(x, z)| (x - d.x).abs() < 8.0 && (z - front).abs() < 3.0) {
-                continue;
-            }
-            anchors.push((d.x, front));
-            let y = (d.depth + 1) as f64 * crate::layout::PLATFORM + 0.2;
-            self.labels.push((d.label.clone(), vec3(d.x as f32, y as f32, front as f32), index));
-        }
+        self.labels = rules::labels(&self.model.districts)
+            .into_iter()
+            .map(|l| (l.text, vec3(l.at[0] as f32, l.at[1] as f32, l.at[2] as f32), l.district))
+            .collect();
     }
 
     /// Computes every building's height for the current height metric and starts animating towards it.
@@ -679,9 +578,7 @@ impl App {
             return;
         }
         let r = self.scene.radius as f64;
-        let to: Vec<f32> = (0..types.len())
-            .map(|i| if self.visible(i) { (0.35 + metric.value(&types[i]) * scale).min(r * 0.75) as f32 } else { 0.0 })
-            .collect();
+        let to: Vec<f32> = (0..types.len()).map(|i| if self.visible(i) { rules::height(metric.value(&types[i]), scale, r) as f32 } else { 0.0 }).collect();
         // A morph starts from the current, possibly mid-animation, heights, so interrupting an animation is smooth.
         let from = if rise { vec![0.0; to.len()] } else { self.heights.clone() };
         self.animation = Some(Animation { from, to, start: self.time, duration: if rise { 1.4 } else { 0.65 } });
@@ -692,11 +589,8 @@ impl App {
     fn height_scale(&self) -> f64 {
         let metric = self.prefs.height;
         let types = self.model.types();
-        let mut values: Vec<f64> = (0..types.len()).filter(|&i| self.present(i)).map(|i| metric.value(&types[i])).collect();
-        values.sort_by(f64::total_cmp);
-        // Nearest-rank percentile; at least 1 so an all-zero metric does not divide by zero.
-        let p95 = if values.is_empty() { 1.0 } else { values[((0.95 * (values.len() - 1) as f64) as usize).min(values.len() - 1)] }.max(1.0);
-        (self.scene.radius as f64 * 0.2).clamp(8.0, 16.0) / p95
+        let values: Vec<f64> = (0..types.len()).filter(|&i| self.present(i)).map(|i| metric.value(&types[i])).collect();
+        rules::height_scale(values, self.scene.radius as f64)
     }
 
     /// Recomputes every building's colour from the colour metric, then layers on the interaction state:
@@ -719,30 +613,19 @@ impl App {
         // keeps it in step after a model or metric change.
         self.scale = Scale::of(metric, m);
         let palette = self.prefs.theme.palette();
-        let mut related = HashSet::new();
-        if let Some(s) = self.selected {
-            related.insert(s);
-            related.extend(m.buildings[s].deps.iter().copied());
-            related.extend(m.buildings[s].incoming.iter().copied());
-        }
+        let selected = self.selected.map(|s| &m.buildings[s]);
         self.colors = m
             .buildings
             .iter()
             .map(|b| {
                 let t = &m.types()[b.index];
-                let mut c = match (at, &b.hist) {
+                let c = match (at, &b.hist) {
                     (Some((k, snapshots)), Some(h)) => self.scale.color_of(replay::color_value(metric, h, k, &snapshots[k]), t.kind),
                     _ => self.scale.color(t, b),
                 };
                 let out_of_search = self.matches.as_ref().is_some_and(|ms| !ms.contains(&b.index));
-                let out_of_focus = self.selected.is_some() && !related.contains(&b.index);
-                if out_of_search || out_of_focus {
-                    c = look::mix(c, palette.dim, 0.8);
-                }
-                if Some(b.index) == self.hovered && Some(b.index) != self.selected {
-                    c = look::mix(c, Srgba::WHITE, 0.3);
-                }
-                c
+                let hovered = Some(b.index) == self.hovered && Some(b.index) != self.selected;
+                rules::shade(c, palette.dim, out_of_search, !rules::related(selected, b.index), hovered)
             })
             .collect();
         self.buildings_dirty = true;
@@ -786,7 +669,7 @@ impl App {
     /// [`Flight`]).
     fn frame_all(&mut self, animate: bool) {
         let r = self.scene.radius;
-        let target = Orbit { target: Vec3::zero(), yaw: 0.6, pitch: 0.62, distance: r * 2.6 };
+        let target = Orbit::framing(r);
         if animate {
             self.fly(target.target, target.distance);
         } else {
@@ -820,42 +703,12 @@ impl App {
         self.fly(t, (d.w.max(d.d) * 1.25 + 10.0) as f32);
     }
 
-    /// Searches the visible types for the query (case-insensitive) and updates `matches`/`results` and the colours.
-    ///
-    /// Ranking, best first: exact simple name (0), name prefix (1), name substring (2), match anywhere in the fully
-    /// qualified name (3); within a rank, shorter names come first. The sort is
-    /// stable, so equal entries keep model order. Every match is highlighted in the city; only the top 12 are listed.
-    /// Queries shorter than two characters clear the search.
+    /// Searches the visible types for the query ([`rules::search`]) and updates `matches`/`results` and the colours:
+    /// every match is highlighted in the city, the best [`rules::MAX_RESULTS`] are listed.
     fn run_search(&mut self) {
-        let q = self.search.trim().to_lowercase();
-        if q.chars().count() < 2 {
-            self.matches = None;
-            self.results.clear();
-            self.recolor();
-            return;
-        }
-        let mut scored: Vec<(usize, u8, usize)> = vec![];
-        for (i, t) in self.model.types().iter().enumerate() {
-            if !self.visible(i) {
-                continue;
-            }
-            let name = t.name.to_lowercase();
-            let score = if name == q {
-                0
-            } else if name.starts_with(&q) {
-                1
-            } else if name.contains(&q) {
-                2
-            } else if t.fqn.to_lowercase().contains(&q) {
-                3
-            } else {
-                continue;
-            };
-            scored.push((i, score, name.len()));
-        }
-        scored.sort_by_key(|&(_, s, l)| (s, l));
-        self.matches = Some(scored.iter().map(|s| s.0).collect());
-        self.results = scored.iter().take(12).map(|s| s.0).collect();
+        let ranked = rules::search(&self.search, self.model.types(), |i| self.visible(i));
+        self.results = ranked.iter().flatten().take(rules::MAX_RESULTS).copied().collect();
+        self.matches = ranked.map(|r| r.into_iter().collect());
         self.recolor();
     }
 
@@ -890,20 +743,10 @@ impl App {
         });
     }
 
-    /// GitHub web URL for type `i`'s file: `kind` is the URL segment, `blob` (file view), `blame` or `commits`
-    /// (history), giving `https://<host>/<owner>/<repo>/<kind>/<ref>/<prefix><file>`.
-    ///
-    /// `gh.prefix` is the analysed root's path inside the repository with a trailing slash (empty when the root is
-    /// the repository's top level),
-    /// since `Building::file` is relative to the analysed root. Each path segment is percent-encoded separately so
-    /// the slashes survive. File and blame views get a `#Lstart-Lend` anchor that highlights the type's lines; the
-    /// history page has no line anchors.
+    /// GitHub web URL for type `i`'s file (see [`rules::github_link`]).
     fn github_link(gh: &GitHubInfo, kind: &str, model: &CityModel, i: usize) -> String {
         let t = &model.types()[i];
-        let enc = |p: &str| p.split('/').map(url_encode).collect::<Vec<_>>().join("/");
-        let path = enc(&format!("{}{}", gh.prefix, model.buildings[i].file));
-        let url = format!("{}/{}/{}/{}", gh.repo.web_url(), kind, enc(&gh.git_ref), path);
-        if kind == "commits" { url } else { format!("{url}#L{}-L{}", t.line, t.end_line) }
+        rules::github_link(gh, kind, &model.buildings[i].file, t.line, t.end_line)
     }
 
     // -------------------------------------------------------------- per frame
@@ -1069,8 +912,7 @@ impl App {
     /// The districts of the present-day view: all of them, except in a history city those whose `types` is 0, which
     /// hold only gone types (and so would be empty platforms today).
     fn present_districts(&self) -> Vec<bool> {
-        let history = self.model.history.is_some();
-        self.model.districts.iter().map(|d| !history || d.types > 0).collect()
+        rules::present_districts(&self.model.districts, self.model.history.is_some())
     }
 
     /// Starts the replay at the first snapshot, playing (the Replay button or R). The present-day height scale is
@@ -1168,15 +1010,8 @@ impl App {
         }
         self.flight = None;
         let world = walk::World::from_model(&self.model, &self.heights, &self.sides, &self.district_shown);
-        let (x, z, yaw) = match self.selected {
-            Some(i) => {
-                let lot = &self.model.buildings[i].lot;
-                (lot.x as f32, lot.z as f32 + lot.side as f32 / 2.0 + walk::RADIUS + 0.2, 0.0)
-            }
-            // The orbit yaw uses the walker's convention (see walk), so the view direction carries over.
-            None => (self.orbit.target.x, self.orbit.target.z, self.orbit.yaw),
-        };
-        self.walk = Some(Walking { walker: walk::Walker::spawn(&world, x, z, yaw), saved: self.orbit, since: self.time });
+        let lot = self.selected.map(|i| &self.model.buildings[i].lot);
+        self.walk = Some(Walking::begin(&world, lot, self.orbit, self.time));
         // Motion and clicks from before walking started must not turn the view or select anything.
         self.raw.mouse = (0.0, 0.0);
         self.raw.clicks = 0;
@@ -1188,7 +1023,7 @@ impl App {
     /// Stops walking and puts the orbit camera back exactly where it was. The selection stays.
     fn exit_walk(&mut self) {
         if let Some(w) = self.walk.take() {
-            self.orbit = w.saved;
+            self.orbit = w.end();
             self.flight = None;
             self.hovered_district = None;
             if self.hovered.take().is_some() {
@@ -1825,10 +1660,8 @@ impl App {
             let c = look::ramp(k as f64 / (steps - 1) as f64);
             ui.painter().rect_filled(egui::Rect::from_x_y_ranges(x0..=x1, rect.y_range()), CornerRadius::ZERO, look::egui_rgb(c));
         }
-        let s = &self.scale;
-        let (lo, hi) = (s.show(s.lo), format!("{}+", s.show(s.hi)));
-        let (left, right) = if s.metric == ColorMetric::Age { (hi, lo) } else { (lo, hi) };
-        let (wl, wr) = s.metric.words();
+        let (left, right) = self.scale.ends();
+        let (wl, wr) = self.scale.metric.words();
         for (a, b) in [(left, right), (wl.to_string(), wr.to_string())] {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(a).small().weak());
@@ -1856,9 +1689,7 @@ impl App {
                         ui.vertical(|ui| {
                             ui.set_max_width(280.0);
                             ui.label(RichText::new(&t.name).strong().size(17.0));
-                            let pkg = if t.package.is_empty() { if t.language == crate::model::Language::Java { "(default package)" } else { "(root)" } } else { &t.package };
-                            let module = if t.module.is_empty() { String::new() } else { format!(" · {}", t.module) };
-                            ui.label(RichText::new(format!("{pkg}{module}")).monospace().small().weak());
+                            ui.label(RichText::new(rules::package_line(t)).monospace().small().weak());
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                             if ui.button("×").on_hover_text("Close (Esc)").clicked() {
@@ -1876,40 +1707,33 @@ impl App {
                     // A gone type, and during a replay the snapshot's own numbers above the present-day ones.
                     if b.gone {
                         ui.add_space(4.0);
-                        ui.label(RichText::new("Removed before today").small().strong().weak());
+                        ui.label(RichText::new(rules::REMOVED).small().strong().weak());
                     }
                     if let (Some(r), Some(h), Some(snapshots)) = (&self.replay, &b.hist, &model.history) {
                         let k = r.snapshot();
                         ui.add_space(4.0);
-                        ui.label(RichText::new(format!("Replaying — values at {}", replay::local_date(snapshots[k].time))).small().strong());
-                        let v = |x: i32| if h.exists(k) { look::fmt(x as f64) } else { "—".into() };
-                        egui::Grid::new("replay-metrics").num_columns(4).spacing([6.0, 4.0]).show(ui, |ui| {
-                            for (value, label) in [(v(h.nom[k]), "methods"), (v(h.noa[k]), "attributes"), (v(h.loc[k]), "LOC"), (v(h.cx[k]), "complexity")] {
-                                ui.vertical(|ui| {
-                                    ui.label(RichText::new(value).strong());
-                                    ui.label(RichText::new(label).small().weak());
+                        ui.label(RichText::new(rules::replay_heading(&replay::local_date(snapshots[k].time))).small().strong());
+                        match rules::replay_cells(h, k) {
+                            Some(cells) => {
+                                egui::Grid::new("replay-metrics").num_columns(4).spacing([6.0, 4.0]).show(ui, |ui| {
+                                    for (value, label) in cells {
+                                        ui.vertical(|ui| {
+                                            ui.label(RichText::new(value).strong());
+                                            ui.label(RichText::new(label).small().weak());
+                                        });
+                                    }
                                 });
                             }
-                        });
+                            None => {
+                                ui.label(RichText::new(rules::NOT_IN_SNAPSHOT).small().weak());
+                            }
+                        }
                     }
                     ui.add_space(6.0);
                     let visible = |j: &&usize| self.visible(**j);
                     let out: Vec<usize> = b.deps.iter().filter(visible).copied().collect();
                     let inc: Vec<usize> = b.incoming.iter().filter(visible).copied().collect();
-                    let mut cells: Vec<(String, &str)> = vec![
-                        (t.nom().to_string(), "methods"),
-                        (t.noa.to_string(), "attributes"),
-                        (look::fmt(t.loc as f64), "lines of code"),
-                        (t.complexity().to_string(), "complexity"),
-                        (if t.nom() == 0 { "0".into() } else { format!("{:.1}", t.complexity() as f64 / t.nom() as f64) }, "cx / method"),
-                        (format!("{} / {}", out.len(), inc.len()), "uses / used by"),
-                    ];
-                    if model.has_git() {
-                        let h = b.history;
-                        cells.push((h.map(|h| h.commits.to_string()).unwrap_or("0".into()), "commits"));
-                        cells.push((h.map(|h| h.authors.to_string()).unwrap_or("0".into()), "authors"));
-                        cells.push((h.map(|h| look::rel_time(h.last_commit)).unwrap_or("—".into()), "last change"));
-                    }
+                    let cells = rules::metric_cells(t, b, model.has_git(), out.len(), inc.len(), look::now());
                     egui::Grid::new("metrics").num_columns(3).spacing([6.0, 6.0]).min_col_width(100.0).show(ui, |ui| {
                         for (n, (value, label)) in cells.iter().enumerate() {
                             Frame::new().fill(ui.visuals().faint_bg_color).corner_radius(CornerRadius::same(10)).inner_margin(Margin::symmetric(9, 7)).show(ui, |ui| {
@@ -1949,23 +1773,13 @@ impl App {
                             section(ui, "OPEN PULL REQUESTS", b.prs.len());
                             for &k in &b.prs {
                                 let pr = &pulls[k];
-                                let updated = parse_iso(&pr.updated_at).map(look::rel_time).unwrap_or_default();
-                                let text = format!(
-                                    "#{}  {}\n{} · {} · {} files{}",
-                                    pr.number,
-                                    pr.title,
-                                    pr.author.as_deref().unwrap_or("ghost"),
-                                    updated,
-                                    pr.files.len(),
-                                    if pr.draft { " · draft" } else { "" }
-                                );
+                                let text = format!("#{}  {}\n{}", pr.number, pr.title, rules::pr_meta(pr, look::now()));
                                 if ui.add(egui::Button::new(RichText::new(text).size(12.0)).min_size(Vec2::new(ui.available_width(), 0.0))).on_hover_text(&pr.url).clicked() {
                                     actions.open_url = Some(pr.url.clone());
                                 }
                             }
                             if b.prs.is_empty() {
-                                let src = gh.pulls_source.clone().unwrap_or_default();
-                                ui.label(RichText::new(if src.starts_with("all") { "none".to_string() } else { format!("none among the {src}") }).small().weak());
+                                ui.label(RichText::new(rules::no_pulls(gh.pulls_source.as_deref())).small().weak());
                             }
                         }
                     }
@@ -1974,9 +1788,9 @@ impl App {
                         // counts all of the type's methods.
                         section(ui, "METHODS BY COMPLEXITY", t.methods.len());
                         let max_cx = b.methods.iter().map(|m| m.complexity).max().unwrap_or(1).max(1);
-                        for m in b.methods.iter().take(15) {
+                        for m in b.methods.iter().take(rules::INSPECTOR_METHODS) {
                             ui.horizontal(|ui| {
-                                ui.add(egui::Label::new(RichText::new(format!("{}({})", m.name, if m.parameters > 0 { "…" } else { "" })).monospace().size(11.5)).truncate());
+                                ui.add(egui::Label::new(RichText::new(rules::method_name(&m.name, m.parameters)).monospace().size(11.5)).truncate());
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     ui.label(RichText::new(format!("cx {} · {} loc", m.complexity, m.loc)).small().weak());
                                 });
@@ -1991,8 +1805,8 @@ impl App {
                             ui.painter().rect_filled(fill, CornerRadius::same(2), look::egui_rgb(look::ramp(m.complexity as f64 / max_cx.max(10) as f64)));
                         }
                         // Counted on all of the type's methods like the header, not on the capped b.methods.
-                        if t.methods.len() > 15 {
-                            ui.label(RichText::new(format!("+ {} more", t.methods.len() - 15)).small().weak());
+                        if let Some(more) = rules::more_methods(t.methods.len()) {
+                            ui.label(RichText::new(more).small().weak());
                         }
                     }
                     for (title, list, color) in [("USES", &out, look::OUT), ("USED BY", &inc, look::IN)] {
@@ -2030,28 +1844,15 @@ impl App {
         let text = if let Some(i) = self.hovered {
             let t = &self.model.types()[i];
             let b = &self.model.buildings[i];
-            let mut row = format!("{} methods · {} attrs · {} loc · cx {}", t.nom(), t.noa, look::fmt(t.loc as f64), t.complexity());
-            if let Some(h) = b.history {
-                row.push_str(&format!(" · {} commits", h.commits));
-            }
+            let mut row = rules::tooltip_row(t, b);
             // During a replay: the snapshot's numbers instead, and no PRs (they belong to today).
             if let (Some(r), Some(h), Some(snapshots)) = (&self.replay, &b.hist, &self.model.history) {
                 let k = r.snapshot();
-                let date = replay::local_date(snapshots[k].time);
-                row = if h.exists(k) {
-                    format!("{} methods · {} attrs · {} loc · cx {} · {} commits · at {date}", h.nom[k], h.noa[k], look::fmt(h.loc[k] as f64), h.cx[k], h.commits[k])
-                } else {
-                    format!("not in this snapshot · at {date}")
-                };
-            } else if !b.prs.is_empty() {
-                row.push_str(&format!(" · {} open PR{}", b.prs.len(), if b.prs.len() > 1 { "s" } else { "" }));
+                row = rules::replay_tooltip_row(b, h, k, &replay::local_date(snapshots[k].time));
             }
             Some((format!("{}  ·  {}", t.name, t.kind), t.package.clone(), row))
         } else if let Some(d) = self.hovered_district {
-            let d = &self.model.districts[d];
-            // Module district ids carry a "module:" prefix in the layout to keep them apart from packages; it is
-            // not meant for display.
-            (d.depth > 0).then(|| (d.label.clone(), d.id.trim_start_matches("module:").to_string(), format!("{} types{}", d.types, if self.walk.is_some() { "" } else { " · double-click to zoom" })))
+            rules::district_tooltip(&self.model.districts[d], self.walk.is_some())
         } else {
             None
         };
@@ -2186,64 +1987,5 @@ fn logo(ui: &mut egui::Ui) {
     for (x, y, w, h, c) in bars {
         let r = egui::Rect::from_min_size(rect.min + Vec2::new(x * 30.0 / 32.0, y * 30.0 / 32.0), Vec2::new(w * 30.0 / 32.0, h * 30.0 / 32.0));
         ui.painter().rect_filled(r, CornerRadius::same(1), look::egui_rgb(look::rgb(c)));
-    }
-}
-
-/// Percent-encodes one URL path segment: everything except RFC 3986 unreserved characters (`A–Z a–z 0–9 - _ . ~`) is
-/// written as `%XX` per UTF-8 byte. `/` is encoded too, so callers encode segment by segment.
-fn url_encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
-}
-
-/// Seconds since the epoch for an ISO-8601 timestamp such as `2026-09-30T12:00:00Z` or `2026-09-30T14:00:00+02:00`.
-///
-/// Used for pull requests' `updated_at` from the GitHub API, which comes in UTC with a `Z` suffix. Fractional
-/// seconds are accepted and truncated, and missing seconds count as 0. A `±hh:mm`, `±hhmm` or `±hh` offset is
-/// subtracted to get UTC; a time without `Z` or offset is taken as UTC. Returns `None` if the date, the hours and
-/// minutes or the offset do not parse.
-fn parse_iso(s: &str) -> Option<i64> {
-    let (date, time) = s.split_once('T')?;
-    let mut d = date.split('-').map(|x| x.parse::<i64>());
-    let (y, m, day) = (d.next()?.ok()?, d.next()?.ok()?, d.next()?.ok()?);
-    // The time part contains no '+' or '-' of its own, so one of them starts the offset.
-    let (time, offset) = match time.find(|c| c == '+' || c == '-') {
-        Some(p) => {
-            let (time, zone) = time.split_at(p);
-            let digits = zone[1..].replace(':', "");
-            let hours: i64 = digits.get(..2)?.parse().ok()?;
-            let minutes: i64 = if digits.len() > 2 { digits[2..].parse().ok()? } else { 0 };
-            (time, if zone.starts_with('-') { -1 } else { 1 } * (hours * 3600 + minutes * 60))
-        }
-        None => (time.trim_end_matches('Z'), 0),
-    };
-    let mut t = time.split(':').map(|x| x.parse::<f64>());
-    let (hh, mm, ss) = (t.next()?.ok()?, t.next()?.ok()?, t.next().and_then(|x| x.ok()).unwrap_or(0.0));
-    // days-from-civil (Howard Hinnant): proleptic Gregorian date to days since 1970-01-01. Shifting the year to start
-    // in March puts the leap day at the end, so the day of the year (doy) follows from the month by a closed formula:
-    // (153 * month + 2) / 5 counts the days of the months before it with March = 0. An era is a 400-year Gregorian
-    // cycle of 146097 days, and 719468 is the day number of 1970-01-01 counted from 0000-03-01.
-    let y2 = if m <= 2 { y - 1 } else { y };
-    let era = y2.div_euclid(400);
-    let yoe = y2 - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    Some(days * 86400 + (hh * 3600.0 + mm * 60.0 + ss) as i64 - offset)
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn parse_iso_offsets() {
-        let utc = super::parse_iso("2026-09-30T12:00:00Z");
-        assert_eq!(utc, Some(1_790_769_600));
-        assert_eq!(super::parse_iso("2026-09-30T14:00:00+02:00"), utc);
-        assert_eq!(super::parse_iso("2026-09-30T06:30:00.5-0530"), utc);
-        assert_eq!(super::parse_iso("2026-09-30T12:00"), utc);
     }
 }

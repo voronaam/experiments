@@ -6,6 +6,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -15,6 +16,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Function;
 
 /**
  * Runs short git commands and captures their output. Every failure (git missing, non-zero exit, not a repository)
@@ -28,7 +30,7 @@ import java.util.concurrent.TimeoutException;
 public final class Git {
 
     /** Time limit of {@link #runCommand} (and so of {@link #run}), after which the command is killed. */
-    private static final long TIMEOUT_SECONDS = 30;
+    private static final Duration TIMEOUT = Duration.ofSeconds(30);
 
     /**
      * Configuration that every git command on an analysed repository gets on its command line. {@code -c} beats every
@@ -71,13 +73,22 @@ public final class Git {
         if (known != null) {
             return Optional.of(known);
         }
-        boolean windows = System.getProperty("os.name", "").startsWith("Windows");
-        String pathext = System.getenv("PATHEXT");
-        List<String> extensions = !windows ? List.of("")
-                : List.of((pathext == null || pathext.isBlank() ? ".COM;.EXE;.BAT;.CMD" : pathext).split(";"));
-        Optional<Path> found = find(name, System.getenv("PATH"), File.pathSeparator, extensions, windows);
+        Optional<Path> found = lookup(name, System::getenv);
         found.ifPresent(p -> EXECUTABLES.put(name, p));
         return found;
+    }
+
+    /**
+     * {@link #executable} without the cache, with {@code PATH} and {@code PATHEXT} (Windows) read from {@code env}.
+     * Test seam: the tests resolve fake programs ({@code gh}, a hanging {@code git}) on a {@code PATH} of their own
+     * with the production rules, without touching the process environment or the cache.
+     */
+    static Optional<Path> lookup(String name, Function<String, String> env) {
+        boolean windows = System.getProperty("os.name", "").startsWith("Windows");
+        String pathext = env.apply("PATHEXT");
+        List<String> extensions = !windows ? List.of("")
+                : List.of((pathext == null || pathext.isBlank() ? ".COM;.EXE;.BAT;.CMD" : pathext).split(";"));
+        return find(name, env.apply("PATH"), File.pathSeparator, extensions, windows);
     }
 
     /**
@@ -158,21 +169,29 @@ public final class Git {
     }
 
     /**
-     * Output of a command, or empty if it fails, is not installed or takes longer than 30 seconds.
+     * Output of a command, or empty if it fails, is not installed or takes longer than 30 seconds ({@link #TIMEOUT}).
      *
      * <p>stderr should be discarded (as {@link #command} does) rather than piped, so a chatty command cannot fill an
      * unread pipe and stall. stdout is read on a separate thread, so the limit also covers a command that hangs while
      * keeping stdout open: when it runs out the process is killed, which closes the pipe and ends the read.
      */
     static Optional<String> runCommand(ProcessBuilder command) {
+        return runCommand(command, TIMEOUT);
+    }
+
+    /**
+     * {@link #runCommand(ProcessBuilder)} with the time limit {@code timeout} instead of 30 seconds. Test seam: the
+     * tests check the kill with a limit of a fraction of a second.
+     */
+    static Optional<String> runCommand(ProcessBuilder command, Duration timeout) {
         Process p = null;
         try {
             p = command.start();
             InputStream stdout = p.getInputStream();
             FutureTask<byte[]> read = new FutureTask<>(stdout::readAllBytes);
             Thread.ofVirtual().start(read);
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
-            String out = new String(read.get(TIMEOUT_SECONDS, TimeUnit.SECONDS), StandardCharsets.UTF_8).strip();
+            long deadline = System.nanoTime() + timeout.toNanos();
+            String out = new String(read.get(timeout.toNanos(), TimeUnit.NANOSECONDS), StandardCharsets.UTF_8).strip();
             if (!p.waitFor(deadline - System.nanoTime(), TimeUnit.NANOSECONDS)) {
                 p.destroyForcibly();
                 return Optional.empty();

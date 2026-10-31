@@ -77,6 +77,17 @@ pub fn executable(name: &str) -> Option<PathBuf> {
     Some(p)
 }
 
+/// [`executable`] without the cache, with `PATH` and `PATHEXT` (Windows) read from `env`. Test seam: the tests resolve
+/// fake programs (`gh`, a hanging `git`) on a `PATH` of their own with the production rules, without touching the
+/// process environment or the cache.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn lookup(name: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let windows = cfg!(windows);
+    let pathext = env("PATHEXT").filter(|e| !e.trim().is_empty()).unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+    let extensions: Vec<&str> = if windows { pathext.split(';').collect() } else { vec![""] };
+    find(name, env("PATH").map(std::ffi::OsString::from).as_deref(), &extensions, windows)
+}
+
 /// The first `<dir>/<name><extension>` that is a regular file (and, unless `windows`, executable), for the entries
 /// `dir` of `path` (split like the `PATH` variable of this system) in order and each of `extensions`. Empty and
 /// relative entries (".", "bin", "") are skipped, so the current directory is never searched. The other editions
@@ -127,6 +138,12 @@ pub fn run(dir: &Path, args: &[&str]) -> Option<String> {
 /// so a chatty command cannot fill an unread pipe. stdout is read on a separate thread, so the limit also covers a
 /// command that hangs while keeping stdout open: it is then killed.
 pub fn output(cmd: &mut Command) -> Option<String> {
+    output_within(cmd, TIMEOUT)
+}
+
+/// [`output`] with the time limit `timeout` instead of [`TIMEOUT`]. Test seam: the tests check the kill with a limit
+/// of a fraction of a second.
+pub(crate) fn output_within(cmd: &mut Command, timeout: Duration) -> Option<String> {
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
     let mut stdout = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::channel();
@@ -135,7 +152,7 @@ pub fn output(cmd: &mut Command) -> Option<String> {
         let _ = stdout.read_to_end(&mut buf);
         let _ = tx.send(buf);
     });
-    let deadline = Instant::now() + TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let kill = |child: &mut std::process::Child| {
         let _ = child.kill();
         let _ = child.wait();
@@ -487,5 +504,104 @@ git -c commit.gpgsign=false commit -q -m b --author="$(printf 'x <x\377@example.
         assert_eq!(history.len(), 2);
         assert_eq!(history[&top.join("A.java")].commits, 1);
         assert_eq!(history[&top.join("B\u{FFFD}.java")].authors, 1);
+    }
+    // ------------------------------------------------------------------ mining, on git-log-repo.sh (shared with the
+    // Java GitHistoryTest and the D git.d unittests, with the same expectations)
+
+    /// Author time of commit `n` (1-based) of git-log-repo.sh: midnight UTC, one day apart from 2020-01-01.
+    fn day(n: i64) -> i64 {
+        1_577_836_800 + (n - 1) * 86_400
+    }
+
+    /// Builds the shared git-log-repo.sh history in a new temporary directory; returns it and its canonical path.
+    fn mined() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../src/test/resources/git-log-repo.sh");
+        assert!(Command::new("sh").arg(script).current_dir(dir.path()).status().unwrap().success());
+        let top = std::fs::canonicalize(dir.path()).unwrap();
+        (dir, top)
+    }
+
+    /// (commits, authors, last commit, first commit) of one file, to compare in one assertion.
+    fn stats(h: &FileHistory) -> (u32, u32, i64, i64) {
+        (h.commits, h.authors, h.last_commit, h.first_commit)
+    }
+
+    /// Per file: non-merge commits, distinct authors, and the newest and oldest author time. A.java is changed by Ann,
+    /// Bob, Ann under an old address (which .mailmap maps back to her) and, on a side branch, Cid: four commits by three
+    /// authors, the last one the side-branch commit (the merge that brought it in does not count).
+    #[test]
+    fn counts_commits_authors_and_first_and_last_author_time() {
+        let (_dir, top) = mined();
+        let h = load(&top);
+        assert_eq!(stats(&h[&top.join("A.java")]), (4, 3, day(4), day(1)));
+        assert_eq!(stats(&h[&top.join("r/lib.rs")]), (3, 2, day(5), day(1)));
+    }
+
+    /// `%aE` applies .mailmap: Ann's old address counts as Ann, so A.java has three authors, not four. The replay's
+    /// per-file events see the same three authors.
+    #[test]
+    fn mailmap_merges_an_authors_addresses() {
+        let (_dir, top) = mined();
+        let (totals, events) = load_with_events(&top);
+        assert_eq!(totals[&top.join("A.java")].authors, 3);
+        let e = &events[&top.join("A.java")];
+        assert_eq!((e.times.clone(), e.distinct.clone()), (vec![day(1), day(2), day(3), day(4)], vec![1, 2, 2, 3]));
+    }
+
+    /// M.java is changed only by the merge commit (an "evil merge"), which does not count: one commit, from day 1.
+    #[test]
+    fn merge_commits_are_excluded() {
+        let (_dir, top) = mined();
+        assert_eq!(stats(&load(&top)[&top.join("M.java")]), (1, 1, day(1), day(1)));
+    }
+
+    /// Renames are not followed: the old path keeps its commits (the add and the deletion by the rename) and the new
+    /// path starts afresh with the rename.
+    #[test]
+    fn renames_start_a_fresh_history() {
+        let (_dir, top) = mined();
+        let h = load(&top);
+        assert_eq!(stats(&h[&top.join("web/c.ts")]), (2, 2, day(7), day(1)));
+        assert_eq!(stats(&h[&top.join("web/d.ts")]), (1, 1, day(7), day(7)));
+    }
+
+    /// Only files of the analysed languages are listed: notes.txt and .mailmap are not.
+    #[test]
+    fn only_source_files_are_listed() {
+        let (_dir, top) = mined();
+        let mut keys: Vec<PathBuf> = load(&top).into_keys().collect();
+        keys.sort();
+        let want: Vec<PathBuf> = ["A.java", "M.java", "r/lib.rs", "web/c.ts", "web/d.ts"].iter().map(|p| top.join(p)).collect();
+        assert_eq!(keys, want);
+    }
+
+    /// Analysing a sub-directory logs only its files, keyed by their absolute path below the top of the work tree.
+    /// The times are author times (the committer's are an hour later).
+    #[test]
+    fn a_sub_directory_logs_only_its_own_files() {
+        let (_dir, top) = mined();
+        let h = load(&top.join("web"));
+        let mut keys: Vec<&PathBuf> = h.keys().collect();
+        keys.sort();
+        assert_eq!(keys, [&top.join("web/c.ts"), &top.join("web/d.ts")]);
+        assert_eq!(h[&top.join("web/d.ts")].last_commit, day(7));
+    }
+
+    /// Outside a work tree, and in a repository without commits, there is no history (and no error).
+    #[test]
+    fn no_history_outside_git_or_without_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let plain = std::fs::canonicalize(plain).unwrap();
+        std::fs::write(plain.join("A.java"), "class A {}").unwrap();
+        assert!(load(&plain).is_empty());
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let empty = std::fs::canonicalize(empty).unwrap();
+        assert!(Command::new("git").args(["init", "-q", "--template=", "."]).current_dir(&empty).status().unwrap().success());
+        std::fs::write(empty.join("A.java"), "class A {}").unwrap();
+        assert!(load(&empty).is_empty());
     }
 }

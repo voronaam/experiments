@@ -260,4 +260,30 @@ class AdversarialInputTest {
         assertEquals(java.util.Set.of("Good"), byFqn(a).keySet());
         assertEquals(1, a.failedFiles());
     }
+
+    /**
+     * A file that is not valid UTF-8 is read as ISO-8859-1 (every byte one character), so legacy sources still yield
+     * their types, with the accented names decoded, and none counts as failed. The Rust ({@code analysis/mod.rs}) and
+     * D ({@code analysis/package.d}) editions have the same test.
+     */
+    @Test
+    void invalidUtf8IsReadAsLatin1() throws IOException {
+        Files.createDirectories(root.resolve("src"));
+        java.nio.charset.Charset latin1 = java.nio.charset.StandardCharsets.ISO_8859_1;
+        Files.write(root.resolve("src/Legacy.java"),
+                "// Grüße © 2001\nclass Café {\n    String s = \"é\";\n    void mü() {}\n}\n".getBytes(latin1));
+        Files.write(root.resolve("src/legacy.ts"), "export class Café { n = \"é\"; fü() {} }\n".getBytes(latin1));
+        Files.write(root.resolve("src/lib.rs"), "// ©\npub struct Café { s: u8 }\nimpl Café { fn fü(&self) {} }\n"
+                .getBytes(latin1));
+        Analysis a = analyze();
+        assertEquals(0, a.failedFiles());
+        assertEquals(3, a.types().size());
+        for (TypeInfo t : a.types()) {
+            assertEquals("Café", t.name(), t.fqn());
+            assertEquals(1, t.methods().size(), t.fqn());
+            assertTrue(t.methods().getFirst().name().endsWith("ü"), t.fqn());
+        }
+        assertEquals("Café", byFqn(a).get("Café").fqn());
+        assertTrue(byFqn(a).containsKey("src/legacy.ts:Café"));
+    }
 }

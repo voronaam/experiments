@@ -1,0 +1,29 @@
+CodeCity — explore a Java, TypeScript or Rust code base as an interactive 3D city
+
+Usage: codecity [options] [path | github-url]
+
+  path              source tree to analyse (default: current directory)
+  github-url        clone and analyse a GitHub repository, e.g.
+                      https://github.com/google/gson
+                      https://github.com/owner/repo/tree/branch
+                      github:owner/repo[@branch]
+  -g, --gui         open a native desktop window instead of the browser viewer
+  -p, --port N      port for the local viewer (default: 7070)
+  -w, --watch       re-analyse and live-update the viewer when files change
+  --no-tests        leave test code out of the city
+  --no-git          skip mining git history (churn, authors, recency)
+  --no-github       no GitHub links or pull-request overlay
+  --history[=N]     replay the city's growth over N sampled commits (default 60)
+  --no-open         don't open a browser
+  --export FILE     write a self-contained HTML file and exit
+  -h, --help        show this help
+
+Metaphor: packages / directories / modules are districts; classes, interfaces, structs,
+traits and enums are buildings (plus one "module" building per file of free functions).
+  height    = number of methods     (switchable: LOC, complexity, attributes)
+  footprint = number of attributes
+  colour    = git churn / complexity / recency / authors / open PRs / type kind
+
+GitHub: repositories with a GitHub remote get links to files, blame and history, and an
+overlay of the open pull requests touching each class. Set GH_TOKEN (or log in with the
+gh CLI) to fetch every open PR; without a token only the most recent ~30 are loaded.

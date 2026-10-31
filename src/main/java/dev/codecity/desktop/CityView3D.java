@@ -273,7 +273,7 @@ final class CityView3D {
 
         // Everything scales with the city's radius: the ground slab reaches 7 radii out in every direction, the zoom
         // limit is 6 radii and the far plane, at 30 radii, lies beyond both.
-        radius = Math.max(20, Math.hypot(next.width(), next.depth()) / 2);
+        radius = ViewRules.radius(next.width(), next.depth());
         camera.setFarClip(radius * 30);
         ground.setWidth(radius * 14);
         ground.setDepth(radius * 14);
@@ -574,26 +574,14 @@ final class CityView3D {
     private void buildLabels() {
         labels.forEach(l -> labelLayer.getChildren().remove(l.label()));
         labels.clear();
-        List<CityLayout.District> candidates = model.districts().stream()
-                .filter(d -> d.depth() >= 1 && d.depth() <= 2 && d.types() > 0)
-                .sorted((a, b) -> Double.compare(b.w() * b.d(), a.w() * a.d()))
-                .limit(24)
-                .toList();
-        List<double[]> anchors = new ArrayList<>();
-        for (CityLayout.District d : candidates) {
-            double front = d.z() + d.d() / 2;
-            boolean crowded = anchors.stream().anyMatch(a -> Math.abs(a[0] - d.x()) < 8 && Math.abs(a[1] - front) < 3);
-            if (crowded || anchors.size() >= 16) {
-                continue;
-            }
-            anchors.add(new double[]{d.x(), front});
-            Label label = new Label(d.label());
+        // Which districts get a label, and where: see ViewRules.labels.
+        for (ViewRules.Label l : ViewRules.labels(model.districts())) {
+            Label label = new Label(l.text());
             label.getStyleClass().add("district-label");
             label.setManaged(false);
             label.setMouseTransparent(true);
             labelLayer.getChildren().add(label);
-            labels.add(new LabelAnchor(label, toScene(d.x(), (d.depth() + 1) * CityLayout.PLATFORM + 0.2, front),
-                    model.districts().indexOf(d)));
+            labels.add(new LabelAnchor(label, toScene(l.x(), l.y(), l.z()), l.district()));
         }
     }
 
@@ -634,24 +622,15 @@ final class CityView3D {
      */
     void showArcs(int selected, IntPredicate visible) {
         clearArcs();
-        if (selected < 0 || !visible.test(selected)) {
+        if (selected < 0) {
             return;
         }
         Building b = model.buildings().get(selected);
         int total = b.deps().length + b.incoming().length;
         List<double[]> outRings = new ArrayList<>();
         List<double[]> inRings = new ArrayList<>();
-        int count = 0;
-        for (int j : b.deps()) {
-            if (visible.test(j) && count++ < 200) {
-                addArc(selected, j, Look.OUT, outRings, total);
-            }
-        }
-        count = 0;
-        for (int j : b.incoming()) {
-            if (visible.test(j) && count++ < 200) {
-                addArc(j, selected, Look.IN, inRings, total);
-            }
+        for (ViewRules.ArcEnds a : ViewRules.arcs(b, visible)) {
+            addArc(a.from(), a.to(), a.outgoing() ? Look.OUT : Look.IN, a.outgoing() ? outRings : inRings, total);
         }
         addTubes(outRings, Look.OUT);
         addTubes(inRings, Look.IN);
@@ -675,14 +654,14 @@ final class CityView3D {
         Point3D p2 = topOf(to);
         double dist = p0.distance(p2);
         Point3D mid = p0.midpoint(p2);
-        // Math.min of y is the taller roof, and subtracting moves up, because y points down.
-        Point3D p1 = new Point3D(mid.getX(), Math.min(p0.getY(), p2.getY()) - dist * 0.35 - 2, mid.getZ());
+        // The scene's y points down, so heights are negated on the way into and out of the layout's rule.
+        Point3D p1 = new Point3D(mid.getX(), -ViewRules.arcControlHeight(-p0.getY(), -p2.getY(), dist), mid.getZ());
         curves.add(new double[]{p0.getX(), p0.getY(), p0.getZ(), p1.getX(), p1.getY(), p1.getZ(),
-                p2.getX(), p2.getY(), p2.getZ(), (total > 40 ? 0.03 : 0.055) + dist * 0.0005});
+                p2.getX(), p2.getY(), p2.getZ(), ViewRules.arcRadius(total, dist)});
         Sphere dot = new Sphere(0.18 + dist * 0.002, 8);
         dot.setMaterial(glow(color));
         arcGroup.getChildren().add(dot);
-        arcs.add(new Arc(p0, p1, p2, dot, 14 / Math.max(5, dist * 1.2), new double[]{Math.random()}));
+        arcs.add(new Arc(p0, p1, p2, dot, ViewRules.particleSpeed(dist), new double[]{Math.random()}));
     }
 
     /** Point at {@code t} on the quadratic Bézier curve: (1-t)²·p0 + 2(1-t)t·p1 + t²·p2. */
@@ -976,13 +955,10 @@ final class CityView3D {
                 dolly.getZ()};
         Walker.World world = Walker.World.of(model, heights, sides, districtShown);
         walker = new Walker();
-        if (selected >= 0 && selected < model.buildings().size()) {
-            CityLayout.Lot lot = model.buildings().get(selected).lot();
-            walker.spawn(lot.x(), lot.z() + lot.side() / 2 + Walker.RADIUS + 0.2, 0, world);
-        } else {
-            // The orbit camera looks along (sin a, −cos a) on the layout's ground (see placeWalkCamera), so yaw = −a.
-            walker.spawn(target.getX(), -target.getZ(), -Math.toRadians(yaw.getAngle()), world);
-        }
+        CityLayout.Lot lot = selected >= 0 && selected < model.buildings().size() ? model.buildings().get(selected).lot() : null;
+        // The orbit camera looks along (sin a, −cos a) on the layout's ground (see placeWalkCamera), so yaw = −a.
+        double[] start = ViewRules.walkStart(lot, target.getX(), -target.getZ(), -Math.toRadians(yaw.getAngle()));
+        walker.spawn(start[0], start[1], start[2], world);
         camera.setFieldOfView(Walker.FOV);
         camera.setNearClip(Walker.NEAR);
         if (robot == null) {

@@ -3,7 +3,6 @@ package dev.codecity.desktop;
 import dev.codecity.CityModel;
 import dev.codecity.CityModel.Building;
 import dev.codecity.history.Snapshot;
-import dev.codecity.history.TypeHistory;
 import dev.codecity.layout.CityLayout;
 import javafx.animation.AnimationTimer;
 import javafx.animation.FadeTransition;
@@ -63,9 +62,6 @@ import java.util.BitSet;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Locale;
-import java.time.Instant;
-import java.time.LocalDate;
-import java.time.ZoneId;
 import java.util.prefs.Preferences;
 
 /**
@@ -145,6 +141,9 @@ public final class DesktopApp extends Application {
     private Look.ColorMetric colorMetric;
     private Look.Theme theme;
     private boolean showTests;
+    /** The saved state of the labels and beacons check boxes, read in {@link #start} before the boxes are built. */
+    private boolean savedLabels;
+    private boolean savedBeacons;
     /** Selected and hovered building, -1 for none. */
     private int selected = -1;
     private int hovered = -1;
@@ -234,11 +233,14 @@ public final class DesktopApp extends Application {
             showNo3D(stage);
             return;
         }
-        heightMetric = enumPref("height", Look.HeightMetric.NOM);
+        DesktopPrefs saved = DesktopPrefs.read(prefs);
+        heightMetric = saved.height();
         // No default here: setModel picks churn or complexity depending on whether git history is available.
-        colorMetric = enumPref("color", null);
-        theme = enumPref("theme", Look.Theme.DAY);
-        showTests = prefs.getBoolean("tests", true);
+        colorMetric = saved.color();
+        theme = saved.theme();
+        showTests = saved.tests();
+        savedLabels = saved.labels();
+        savedBeacons = saved.beacons();
 
         Pane labelLayer = new Pane();
         labelLayer.setMouseTransparent(true);
@@ -384,9 +386,8 @@ public final class DesktopApp extends Application {
         hovered = -1;
         stage.setTitle(next.name() + " · CodeCity");
         projectName.setText(next.name());
-        if (colorMetric == null || !colorMetric.available(next)) {
-            colorMetric = next.hasGit() ? Look.ColorMetric.COMMITS : Look.ColorMetric.CX;
-        }
+        colorMetric = ViewRules.effectiveColor(colorMetric, next.hasGit(),
+                next.github() != null && next.github().pulls() != null);
         heightBox.getSelectionModel().select(heightMetric);
         colorBox.getSelectionModel().select(colorMetric);
         replayButton.setVisible(next.hasHistory());
@@ -457,7 +458,7 @@ public final class DesktopApp extends Application {
         double[] heights = new double[buildings.size()];
         for (Building b : buildings) {
             heights[b.index()] = visible(b.index())
-                    ? Math.min(0.35 + heightMetric.value.applyAsDouble(b) * scale[0], scale[1]) : 0;
+                    ? ViewRules.height(heightMetric.value.applyAsDouble(b), scale[0], city.radius()) : 0;
         }
         city.setHeights(heights, rise);
         if (selected >= 0) {
@@ -471,10 +472,9 @@ public final class DesktopApp extends Application {
      */
     private double[] heightScale() {
         double[] values = model.buildings().stream().filter(b -> presentVisible(b.index()))
-                .mapToDouble(heightMetric.value).sorted().toArray();
-        double p95 = Math.max(1, values.length == 0 ? 1 : values[Math.min(values.length - 1, (int) (0.95 * (values.length - 1)))]);
+                .mapToDouble(heightMetric.value).toArray();
         double r = city.radius();
-        return new double[]{Math.min(16, Math.max(8, r * 0.2)) / p95, r * 0.75};
+        return new double[]{ViewRules.heightScale(values, r), r * 0.75};
     }
 
     /**
@@ -492,26 +492,13 @@ public final class DesktopApp extends Application {
         Look.Scale scale = Look.Scale.of(metric, buildings);
         int k = replay == null ? -1 : replay.snapshot();
         long time = replay == null ? 0 : model.history().get(k).time();
-        BitSet related = new BitSet();
-        if (selected >= 0) {
-            Building s = buildings.get(selected);
-            related.set(selected);
-            Arrays.stream(s.deps()).forEach(related::set);
-            Arrays.stream(s.incoming()).forEach(related::set);
-        }
+        Building focus = selected >= 0 ? buildings.get(selected) : null;
         Color[] colors = new Color[buildings.size()];
         for (Building b : buildings) {
             int i = b.index();
             Color c = replay == null ? scale.color(b) : scale.color(b, metric.replayValue(b, k, time));
             boolean outOfSearch = matches != null && !matches.get(i);
-            boolean outOfFocus = selected >= 0 && !related.get(i);
-            if (outOfSearch || outOfFocus) {
-                c = c.interpolate(theme.dim, 0.8);
-            }
-            if (i == hovered && i != selected) {
-                c = c.interpolate(Color.WHITE, 0.3);
-            }
-            colors[i] = c;
+            colors[i] = ViewRules.shade(c, theme.dim, outOfSearch, !ViewRules.related(focus, i), i == hovered && i != selected);
         }
         city.setColors(colors);
         renderLegend(scale);
@@ -676,13 +663,13 @@ public final class DesktopApp extends Application {
                 runSearch(search.getText());
             }
         });
-        labelsBox.setSelected(prefs.getBoolean("labels", true));
+        labelsBox.setSelected(savedLabels);
         city.setLabelsVisible(labelsBox.isSelected());
         labelsBox.setOnAction(e -> {
             prefs.putBoolean("labels", labelsBox.isSelected());
             city.setLabelsVisible(labelsBox.isSelected());
         });
-        beaconsBox.setSelected(prefs.getBoolean("beacons", true));
+        beaconsBox.setSelected(savedBeacons);
         beaconsBox.setOnAction(e -> {
             prefs.putBoolean("beacons", beaconsBox.isSelected());
             // Beacons stay off during replay; leaving it applies the box.
@@ -800,18 +787,8 @@ public final class DesktopApp extends Application {
         Rectangle bar = new Rectangle(204, 8, new LinearGradient(0, 0, 1, 0, true, CycleMethod.NO_CYCLE, stops));
         bar.setArcWidth(8);
         bar.setArcHeight(8);
-        String lo = show(m, scale.lo());
-        String hi = show(m, scale.hi()) + "+";
-        legend.getChildren().addAll(bar,
-                ends(m.invert ? hi : lo, m.invert ? lo : hi),
-                ends(m.lo, m.hi));
-    }
-
-    private static String show(Look.ColorMetric m, double v) {
-        if (m == Look.ColorMetric.AGE) {
-            return Math.round(v) + "d ago";
-        }
-        return v == Math.rint(v) ? Look.fmt(v) : String.format("%.1f", v);
+        String[] values = scale.ends();
+        legend.getChildren().addAll(bar, ends(values[0], values[1]), ends(m.lo, m.hi));
     }
 
     private static Node ends(String left, String right) {
@@ -843,30 +820,19 @@ public final class DesktopApp extends Application {
             StringBuilder sb = new StringBuilder(t.name()).append("  ·  ").append(t.kind()).append('\n')
                     .append(t.packageName()).append('\n');
             if (replay != null) {
-                // The nearest snapshot's values; "—" while the type does not exist in it (growing in or fading out).
+                // The nearest snapshot's values (0 while the type does not exist in it).
                 int k = replay.snapshot();
-                TypeHistory h = b.hist();
-                sb.append(orDash(h.nom[k])).append(" methods · ").append(orDash(h.noa[k])).append(" attrs · ")
-                        .append(orDash(h.loc[k])).append(" loc · cx ").append(orDash(h.cx[k]))
-                        .append(" · ").append(h.commits[k]).append(" commits")
-                        .append(" · at ").append(day(model.history().get(k).time()));
+                sb.append(ViewRules.replayTooltipRow(b, k, day(model.history().get(k).time())));
             } else {
-                sb.append(t.nom()).append(" methods · ").append(t.noa()).append(" attrs · ")
-                        .append(Look.fmt(t.loc())).append(" loc · cx ").append(t.complexity());
-                if (b.history() != null) {
-                    sb.append(" · ").append(b.history().commits()).append(" commits");
-                }
-            }
-            if (b.prs().length > 0 && replay == null) {
-                sb.append(" · ").append(b.prs().length).append(" open PR").append(b.prs().length > 1 ? "s" : "");
+                sb.append(ViewRules.tooltipRow(b));
             }
             text = sb.toString();
         } else if (district >= 0) {
             CityLayout.District d = model.districts().get(district);
-            if (d.depth() > 0) {
-                // Double-click zooming is off while walking, so only offer it when orbiting.
-                text = d.label() + "\n" + d.id().replaceFirst("^module:", "") + "\n" + d.types() + " types"
-                        + (city.walking() ? "" : " · double-click to zoom");
+            // Double-click zooming is off while walking, so it is only offered when orbiting.
+            String[] card = ViewRules.districtTooltip(d, city.walking());
+            if (card != null) {
+                text = String.join("\n", card);
             }
         }
         if (text == null) {
@@ -893,32 +859,17 @@ public final class DesktopApp extends Application {
      * search field has focus.
      */
     private void runSearch(String text) {
-        String q = text.strip().toLowerCase(Locale.ROOT);
-        if (q.length() < 2) {
+        int[] ranked = ViewRules.search(text, model.types(), this::visible);
+        if (ranked == null) {
             matches = null;
             results = List.of();
             resultPopup.hide();
             recolor();
             return;
         }
-        record Scored(int i, int score, int len) {
-        }
-        List<Scored> scored = new ArrayList<>();
-        for (Building b : model.buildings()) {
-            if (!visible(b.index())) {
-                continue;
-            }
-            String name = b.type().name().toLowerCase(Locale.ROOT);
-            int score = name.equals(q) ? 0 : name.startsWith(q) ? 1 : name.contains(q) ? 2
-                    : b.type().fqn().toLowerCase(Locale.ROOT).contains(q) ? 3 : -1;
-            if (score >= 0) {
-                scored.add(new Scored(b.index(), score, name.length()));
-            }
-        }
-        scored.sort((a, b) -> a.score() != b.score() ? Integer.compare(a.score(), b.score()) : Integer.compare(a.len(), b.len()));
         matches = new BitSet();
-        scored.forEach(s -> matches.set(s.i()));
-        results = scored.stream().limit(12).map(Scored::i).toList();
+        Arrays.stream(ranked).forEach(matches::set);
+        results = Arrays.stream(ranked).limit(ViewRules.MAX_RESULTS).boxed().toList();
         resultList.getItems().setAll(results);
         // About 44 px per two-line result cell plus padding.
         resultList.setPrefHeight(Math.min(300, results.size() * 44 + 12));
@@ -1212,12 +1163,8 @@ public final class DesktopApp extends Application {
         syncingSlider = true;
         slider.setValue(replay.position());
         syncingSlider = false;
-        Snapshot s = model.history().get(replay.snapshot());
-        String subject = s.subject().length() > 60 ? s.subject().substring(0, 59) + "…" : s.subject();
-        timelineText.setText(day(s.time()) + " · " + s.commit().substring(0, Math.min(7, s.commit().length()))
-                + " · " + subject + " — " + s.author());
-        double speed = replay.speed();
-        speedButton.setText((speed == Math.rint(speed) ? String.valueOf((int) speed) : String.valueOf(speed)) + "×");
+        timelineText.setText(Replay.caption(model.history().get(replay.snapshot())));
+        speedButton.setText(replay.speedLabel());
     }
 
     /** The inspector for the selected building, with the replayed snapshot's values while replaying. */
@@ -1230,11 +1177,7 @@ public final class DesktopApp extends Application {
 
     /** A date as {@code YYYY-MM-DD} in the local time zone. */
     private static String day(long epochSeconds) {
-        return LocalDate.ofInstant(Instant.ofEpochSecond(epochSeconds), ZoneId.systemDefault()).toString();
-    }
-
-    private static String orDash(int v) {
-        return v < 0 ? "—" : Look.fmt(v);
+        return Replay.day(epochSeconds);
     }
 
     private void snapshot() {
@@ -1311,25 +1254,6 @@ public final class DesktopApp extends Application {
     }
 
     // ------------------------------------------------------------------ helpers
-
-    /**
-     * Reads an enum constant stored by name. With a null fallback the enum type cannot be taken from it, so it is
-     * assumed to be {@link Look.ColorMetric}, the only preference read that way. Unknown names (e.g. from an older
-     * version) yield the fallback.
-     */
-    private <E extends Enum<E>> E enumPref(String key, E fallback) {
-        String v = prefs.get(key, null);
-        if (v == null) {
-            return fallback;
-        }
-        try {
-            @SuppressWarnings("unchecked")
-            Class<E> type = (Class<E>) (fallback != null ? fallback.getDeclaringClass() : Look.ColorMetric.class);
-            return Enum.valueOf(type, v);
-        } catch (IllegalArgumentException e) {
-            return fallback;
-        }
-    }
 
     private static <T extends Node> T styled(T node, String style) {
         node.getStyleClass().add(style);

@@ -8,6 +8,7 @@ import javafx.scene.paint.Color;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.function.Function;
 import java.util.function.ToDoubleFunction;
@@ -197,10 +198,15 @@ final class Look {
         }
 
         boolean available(CityModel model) {
+            return available(model.hasGit(), model.github() != null && model.github().pulls() != null);
+        }
+
+        /** Whether a model with or without git history and fetched pull requests can colour by this metric. */
+        boolean available(boolean hasGit, boolean hasPulls) {
             return switch (requires) {
                 case NOTHING -> true;
-                case GIT -> model.hasGit();
-                case PULLS -> model.github() != null && model.github().pulls() != null;
+                case GIT -> hasGit;
+                case PULLS -> hasPulls;
             };
         }
 
@@ -248,8 +254,15 @@ final class Look {
          * number on a linear one, which avoids dividing by zero.
          */
         static Scale of(ColorMetric metric, List<Building> buildings) {
-            double[] finite = buildings.stream().filter(b -> !b.gone()).mapToDouble(metric.value)
-                    .filter(Double::isFinite).sorted().toArray();
+            return over(metric, buildings.stream().filter(b -> !b.gone()).mapToDouble(metric.value).toArray());
+        }
+
+        /**
+         * The scale for {@code metric} over the raw metric {@code values} of the buildings it is measured on; infinite
+         * values are left out.
+         */
+        static Scale over(ColorMetric metric, double[] values) {
+            double[] finite = Arrays.stream(values).filter(Double::isFinite).sorted().toArray();
             double p98 = finite.length == 0 ? 0 : finite[Math.min(finite.length - 1, (int) (0.98 * (finite.length - 1)))];
             double hi = Math.max(metric.linear ? 1e-6 : 1, p98);
             double lo = finite.length == 0 ? 0 : Math.min(finite[0], hi);
@@ -263,8 +276,13 @@ final class Look {
 
         /** Like {@link #color(Building)}, but for the value {@code v} instead of the building's present one. */
         Color color(Building b, double v) {
+            return color(v, b.type().kind());
+        }
+
+        /** The colour of the raw value {@code v} for a type of kind {@code kind} (its kind colour for KIND). */
+        Color color(double v, String kind) {
             if (metric == ColorMetric.KIND) {
-                return kind(b.type().kind());
+                return kind(kind);
             }
             double t;
             if (!Double.isFinite(v)) {
@@ -277,25 +295,74 @@ final class Look {
             }
             return ramp(t);
         }
+
+        /**
+         * The legend's texts under the two ends of the ramp: the formatted {@code lo} and {@code hi} with a "+" (values
+         * above {@code hi} are clipped there). For inverted metrics the values swap sides, because the ramp's hot end
+         * then means the lowest value.
+         */
+        String[] ends() {
+            String l = show(lo);
+            String h = show(hi) + "+";
+            return metric.invert ? new String[]{h, l} : new String[]{l, h};
+        }
+
+        /** A metric value formatted for the legend: days for recency, whole numbers via {@link #fmt}, else one place. */
+        String show(double v) {
+            if (metric == ColorMetric.AGE) {
+                return Math.round(v) + "d ago";
+            }
+            return v == Math.rint(v) ? fmt(v) : oneDecimal(v);
+        }
     }
 
-    /** Compact number for the HUD: {@code 1,234}, {@code 12.3k}, {@code 123k}. */
+    /**
+     * Compact number for the HUD: {@code 1,234}, {@code 12.3k}, {@code 123k}. Always with a comma for thousands and a
+     * point for decimals, whatever the system locale, like the other viewers.
+     */
     static String fmt(double n) {
+        // Rounded half up to a whole number first; thousands and tenths of thousands then follow in integers, so a
+        // tie (12,250 → 12.3k) rounds up exactly as in the other viewers, whatever the binary value of n / 1000.
+        long v = (long) Math.floor(n + 0.5);
         if (n >= 100_000) {
-            return Math.round(n / 1000) + "k";
+            return (v + 500) / 1000 + "k";
         }
         if (n >= 10_000) {
-            return String.format("%.1fk", n / 1000);
+            return tenths((v + 50) / 100) + "k";
         }
-        return String.format("%,d", Math.round(n));
+        return String.format(Locale.ROOT, "%,d", v);
+    }
+
+    /**
+     * Tenths as a number with one decimal: 123 → "12.3", -5 → "-0.5". Every one-decimal number the viewers show is
+     * rounded to tenths first (half up) and then written by this, the same way in every edition.
+     */
+    static String tenths(long t) {
+        long a = Math.abs(t);
+        return (t < 0 ? "-" : "") + a / 10 + "." + a % 10;
+    }
+
+    /** {@code x} with one decimal, rounded half up: {@code floor(10x + 0.5)} tenths. */
+    static String oneDecimal(double x) {
+        return tenths((long) Math.floor(x * 10 + 0.5));
+    }
+
+    /** The ratio {@code a / b} (b > 0) with one decimal, rounded half up in integers: 5 / 4 → "1.3". */
+    static String ratio(long a, long b) {
+        return tenths(Math.floorDiv(20 * a + b, 2 * b));
     }
 
     /** "today", "5d ago", "3mo ago" or "1.2y ago" (months of 30 days, years of 365); "—" when unknown (≤ 0). */
     static String relTime(long epochSeconds) {
+        return relTime(epochSeconds, System.currentTimeMillis() / 1000);
+    }
+
+    /** {@link #relTime(long)} measured at {@code now} (Unix seconds) instead of the current time. */
+    static String relTime(long epochSeconds, long now) {
         if (epochSeconds <= 0) {
             return "—";
         }
-        double days = (System.currentTimeMillis() / 1000.0 - epochSeconds) / 86400;
+        double days = (double) (now - epochSeconds) / 86400;
         if (days < 1) {
             return "today";
         }
@@ -305,7 +372,8 @@ final class Look {
         if (days < 365) {
             return Math.round(days / 30) + "mo ago";
         }
-        return String.format("%.1fy ago", days / 365);
+        // Tenths of years in integers: half up of (seconds · 10) / (seconds per 365 days).
+        return ratio(now - epochSeconds, 365L * 86400) + "y ago";
     }
 
     /**

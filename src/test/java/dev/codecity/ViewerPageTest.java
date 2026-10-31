@@ -26,7 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * The browser viewer's Content-Security-Policy (a meta tag in {@code index.html}) allows inline scripts only by hash.
  * {@code index.html} has a placeholder for them, filled in by the server for the page it serves (one inline script: the
- * import map) and by the exporter for the page it writes (two: the import map with walk.js and replay.js spliced in,
+ * import map) and by the exporter for the page it writes (two: the import map with app.js's modules spliced in,
  * and app.js inline). This checks that each emitted policy lists exactly the hashes of that page's inline scripts, so
  * editing any of those files cannot break the page. The JSON data block is not a script and needs no hash. The Rust
  * and D editions have the same test.
@@ -77,6 +77,44 @@ class ViewerPageTest {
                     MessageDigest.getInstance("SHA-256").digest(m.group(1).getBytes(StandardCharsets.UTF_8))) + "'");
         }
         return hashes;
+    }
+
+    /**
+     * app.js imports its sibling modules ({@code import … from './name.js'}); each must be served and must be inlined
+     * into the exported page's import map, and none may import anything itself (a {@code data:} module cannot resolve
+     * a relative import). The Rust and D editions have the same test.
+     */
+    @Test
+    void everyModuleAppJsImportsIsServedAndInlinedInTheExport(@TempDir Path dir) throws Exception {
+        String app = new String(CityServer.resource("app.js"), StandardCharsets.UTF_8);
+        List<String> imported = new ArrayList<>();
+        Matcher m = Pattern.compile("from '\\./([\\w-]+\\.js)'").matcher(app);
+        while (m.find()) {
+            imported.add(m.group(1));
+        }
+        assertEquals(CityServer.MODULES, imported, "app.js imports exactly the listed modules, in that order");
+
+        Files.writeString(dir.resolve("A.java"), "class A { void f() {} }\n");
+        CityModel model = CityModel.build(new SourceAnalyzer(), dir, true, false, null);
+        Path out = dir.resolve("out/city.html");
+        HtmlExporter.export(model, out);
+        String exported = Files.readString(out);
+        try (CityServer server = new CityServer(model, 0)) {
+            server.start();
+            int port = URI.create(server.url()).getPort();
+            for (String module : imported) {
+                byte[] source = CityServer.resource(module);
+                HttpResponse<byte[]> r = HttpClient.newHttpClient().send(HttpRequest.newBuilder(
+                        URI.create("http://localhost:" + port + "/" + module)).build(), HttpResponse.BodyHandlers.ofByteArray());
+                assertEquals(200, r.statusCode(), module);
+                assertEquals("text/javascript; charset=utf-8", r.headers().firstValue("Content-Type").orElse(""), module);
+                assertTrue(java.util.Arrays.equals(source, r.body()), module);
+                assertTrue(exported.contains("\"./" + module + "\": \"data:text/javascript;base64,"
+                        + Base64.getEncoder().encodeToString(source) + "\""), module);
+                assertFalse(Pattern.compile("^\\s*import\\b|\\bfrom\\s*['\"]", Pattern.MULTILINE)
+                        .matcher(new String(source, StandardCharsets.UTF_8)).find(), module + " imports nothing");
+            }
+        }
     }
 
     @Test
